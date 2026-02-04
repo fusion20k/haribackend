@@ -2,7 +2,7 @@
 
 ## Overview
 
-The backend now includes a **global caching system** that stores translations in a PostgreSQL database. This dramatically reduces Lara API costs over time because:
+The backend includes a **global caching system** that stores translations in a PostgreSQL database (Supabase). This dramatically reduces Lara API costs over time because:
 
 - **First time any user** translates a sentence: Lara API is called and result is cached
 - **Subsequent requests** from any user: Translation is served from cache (no Lara API call)
@@ -48,54 +48,50 @@ CREATE TABLE translations (
 CREATE INDEX idx_translations_key ON translations(key);
 ```
 
-## Setup on Render
+## Setup with Supabase (Free Forever)
 
-### 1. Create PostgreSQL Database
+### 1. Create Supabase Project
 
-1. Go to your Render dashboard
-2. Click **New +** → **PostgreSQL**
-3. Configure:
-   - **Name**: `haribackend-db` (or your choice)
-   - **Database**: `haridb`
-   - **User**: `hariuser`
-   - **Region**: Same as your web service
-   - **Plan**: Free (or higher for production)
-4. Click **Create Database**
+1. Go to [supabase.com](https://supabase.com) and sign up/sign in
+2. Click **New Project**
+3. Fill in details:
+   - **Name**: `haribackend` (or your choice)
+   - **Database Password**: Create a strong password (save it!)
+   - **Region**: Choose closest to your users
+   - **Plan**: Free (stays free forever, no expiration)
+4. Click **Create new project**
+5. Wait ~2 minutes for database to provision
 
-### 2. Get Database URL
+### 2. Get Database Connection String
 
-After creation, Render will show:
-- **Internal Database URL**: Use this (faster, within Render network)
-- **External Database URL**: For external connections
+1. In your Supabase project dashboard, go to **Settings** (gear icon)
+2. Go to **Database** section
+3. Scroll to **Connection string** → **URI**
+4. Copy the connection string, it looks like:
+   ```
+   postgresql://postgres:[YOUR-PASSWORD]@db.xxx.supabase.co:5432/postgres
+   ```
+5. Replace `[YOUR-PASSWORD]` with the password you created in step 1
 
-Copy the **Internal Database URL** - it looks like:
+**Example:**
 ```
-postgresql://hariuser:password@dpg-xxxxx/haridb
+postgresql://postgres:myStrongP@ssw0rd@db.abcdefghijk.supabase.co:5432/postgres
 ```
 
-### 3. Add Environment Variable to Web Service
+### 3. Add to Render Environment Variables
 
-1. Go to your web service (haribackend)
+1. Go to your Render web service dashboard
 2. Go to **Environment** tab
-3. Add new variable:
+3. Add/update variable:
    - **Key**: `DATABASE_URL`
-   - **Value**: (paste the Internal Database URL from step 2)
+   - **Value**: (paste the Supabase connection string from step 2)
 4. Save changes
 
-### 4. Deploy
+Render will automatically redeploy with the new database connection.
 
-Render will automatically redeploy your service with the database connected.
+### 4. Verify Database Connection
 
-**On first deployment**, the backend will automatically:
-1. Create the `translations` table
-2. Create the index on `key` column
-3. Start caching translations
-
-## Verification
-
-### Check Logs
-
-In Render dashboard → your web service → **Logs**, you should see:
+After deployment, check your Render logs. You should see:
 
 ```
 Initializing database...
@@ -104,48 +100,87 @@ Database ready
 Server running on port 10000
 ```
 
+The backend automatically creates the `translations` table and index on first startup.
+
+## Supabase Dashboard Features
+
+### View Cached Translations
+
+1. In Supabase dashboard → **Table Editor**
+2. You'll see the `translations` table
+3. Click it to browse cached translations
+
+### Run SQL Queries
+
+In Supabase → **SQL Editor**, you can run queries:
+
+**Count total cached translations:**
+```sql
+SELECT COUNT(*) FROM translations;
+```
+
+**Most frequently used translations:**
+```sql
+SELECT original_text, translated_text, hit_count
+FROM translations
+ORDER BY hit_count DESC
+LIMIT 20;
+```
+
+**Recent translations:**
+```sql
+SELECT original_text, translated_text, created_at
+FROM translations
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**Cache by language pair:**
+```sql
+SELECT source_lang, target_lang, COUNT(*) as count
+FROM translations
+GROUP BY source_lang, target_lang;
+```
+
+## Verification
+
 ### Test Caching
 
-First request (cache miss):
+**First request (cache miss):**
 ```bash
 curl -X POST https://haribackend.onrender.com/translate \
   -H "Content-Type: application/json" \
   -d '{"sourceLang": "en", "targetLang": "tl", "sentences": ["Hello"]}'
 ```
 
-Logs will show:
+Check Render logs:
 ```
 Cache: 0 hits, 1 misses (1 total)
 Inserted 1 new translations into cache
 ```
 
-Second identical request (cache hit):
+**Second identical request (cache hit):**
 ```bash
 curl -X POST https://haribackend.onrender.com/translate \
   -H "Content-Type: application/json" \
   -d '{"sourceLang": "en", "targetLang": "tl", "sentences": ["Hello"]}'
 ```
 
-Logs will show:
+Check Render logs:
 ```
 Cache: 1 hits, 0 misses (1 total)
 ```
 
 **No Lara API call on second request!**
 
+Then check Supabase Table Editor → you'll see the cached entry.
+
 ## Frontend Integration
 
-The frontend should implement its own local cache using `chrome.storage.local` as described in the original specification. This creates a two-tier caching system:
-
-1. **Frontend local cache**: Instant, per-user, no network request
-2. **Backend global cache**: Shared across all users, no Lara API call
-
-### Frontend Hash Implementation
-
-Copy `hash.js` to your frontend and use the same `simpleHash` function:
+Copy the hash function from `hash.js` to your Chrome extension:
 
 ```javascript
-// In your Chrome extension
+// Same hash function on frontend ensures cache key consistency
 function simpleHash(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -162,6 +197,10 @@ function makeCacheKey(sourceLang, targetLang, originalText) {
   return `hari:v1:${sourceLang}:${targetLang}:${hash}`;
 }
 ```
+
+**Two-tier caching:**
+1. **Frontend `chrome.storage.local`** → Instant (no network request)
+2. **Backend Supabase PostgreSQL** → Fast (no Lara API call)
 
 ## Performance Impact
 
@@ -188,20 +227,23 @@ function makeCacheKey(sourceLang, targetLang, originalText) {
 ### Monitor Cache Size
 
 ```sql
-SELECT COUNT(*) FROM translations;
-SELECT pg_size_pretty(pg_total_relation_size('translations'));
+SELECT 
+  COUNT(*) as total_entries,
+  SUM(hit_count) as total_hits,
+  AVG(hit_count) as avg_hits_per_entry
+FROM translations;
 ```
 
-### Top Cached Translations
+### Storage Usage
 
-```sql
-SELECT original_text, translated_text, hit_count
-FROM translations
-ORDER BY hit_count DESC
-LIMIT 20;
-```
+Supabase free tier includes:
+- **500 MB database storage** (plenty for millions of translations)
+- **Unlimited API requests**
+- **No time limit** (free forever)
 
 ### Clean Old Unused Entries
+
+Run periodically to keep database lean:
 
 ```sql
 DELETE FROM translations
@@ -211,23 +253,40 @@ WHERE hit_count < 2
 
 ## Troubleshooting
 
-### Database Connection Fails
+### Connection Error: "password authentication failed"
 
-Check:
-1. `DATABASE_URL` environment variable is set correctly
-2. Database is in same region as web service
-3. Using Internal Database URL (not External)
+Double-check:
+1. Password in connection string is correct
+2. No special characters are URL-encoded (e.g., `@` becomes `%40`)
+
+### Error: "SSL required"
+
+The code already enables SSL automatically. If you see this error, verify `DATABASE_URL` is set correctly in Render environment variables.
 
 ### Logs show "running without cache"
 
-This means `DATABASE_URL` is not set. Add it in Render Environment variables.
+This means `DATABASE_URL` environment variable is not set in Render. Add it in **Environment** tab.
 
-### Cache not working (same request calls Lara twice)
+### Database initialization fails
 
-Check:
-1. Hash function is identical on frontend/backend
-2. Text is trimmed consistently
-3. No leading/trailing whitespace differences
+Check Supabase dashboard → **Database** → **Connection pooling** is enabled. The backend uses connection pooling by default.
+
+## Why Supabase?
+
+**vs Render PostgreSQL:**
+- ✅ **Free forever** (Render free DB expires in 90 days)
+- ✅ **500 MB storage** (Render free: 1 GB, but temporary)
+- ✅ **Web dashboard** with SQL editor and table browser
+- ✅ **Automatic backups** (Render free: no backups)
+- ✅ **Better performance** (dedicated DB, not shared)
+
+**Supabase Free Tier Limits:**
+- 500 MB database storage
+- 2 GB bandwidth/month (plenty for cache queries)
+- No time limit
+- Up to 500 MB database size
+
+Perfect for Hari's caching needs!
 
 ## Cost Savings Example
 
@@ -241,4 +300,4 @@ Check:
 - Month 2: ~60,000 calls (80% hit rate)
 - Month 3+: ~30,000 calls (90% hit rate)
 
-**Savings**: 90% reduction in API costs
+**Savings**: 90% reduction in API costs + $0 database cost (Supabase free tier)
