@@ -1,0 +1,24 @@
+{
+  "name": "haribackend",
+  "version": "1.0.0",
+  "description": "Translation backend service for Hari Chrome extension",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "translation",
+    "tagalog",
+    "chrome-extension"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@translated/lara": "^1.7.4",
+    "axios": "^1.13.4",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2"
+  }
+}
