@@ -1,5 +1,15 @@
 const { Pool } = require("pg");
 
+if (process.env.DATABASE_URL) {
+  const urlForLog = process.env.DATABASE_URL.replace(
+    /(:\/\/[^:]+:)([^@]+)(@)/,
+    "$1****$3"
+  );
+  console.log("DATABASE_URL is set:", urlForLog);
+} else {
+  console.log("DATABASE_URL is NOT set");
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
