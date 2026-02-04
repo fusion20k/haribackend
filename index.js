@@ -3,6 +3,12 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Credentials, Translator } = require("@translated/lara");
+const {
+  initDatabase,
+  findTranslationsByKeys,
+  insertTranslations,
+  makeBackendKey,
+} = require("./db");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -42,29 +48,75 @@ app.post("/translate", async (req, res) => {
         .json({ error: "Request too large (over 8000 characters)" });
     }
 
-    const result = await lara.translate(sentences, sourceLang, targetLang);
+    const keys = sentences.map((text) =>
+      makeBackendKey(sourceLang, targetLang, text)
+    );
 
-    if (!Array.isArray(result.translation)) {
-      return res.status(500).json({ error: "Unexpected Lara response shape" });
-    }
+    const existingRows = await findTranslationsByKeys(keys);
+    const existingMap = new Map();
+    existingRows.forEach((row) => {
+      existingMap.set(row.key, row.translated_text);
+    });
 
-    const translations = result.translation;
+    const translations = new Array(sentences.length).fill(null);
+    const toLookupForLara = [];
 
-    if (translations.length !== sentences.length) {
-      console.error(
-        "Length mismatch",
-        sentences.length,
-        translations.length
-      );
-      return res
-        .status(500)
-        .json({ error: "Translation length mismatch" });
+    keys.forEach((key, index) => {
+      const cached = existingMap.get(key);
+      if (cached) {
+        translations[index] = cached;
+      } else {
+        toLookupForLara.push({ index, text: sentences[index], key });
+      }
+    });
+
+    const cacheHits = sentences.length - toLookupForLara.length;
+    console.log(
+      `Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${sentences.length} total)`
+    );
+
+    if (toLookupForLara.length > 0) {
+      const textsForLara = toLookupForLara.map((item) => item.text);
+
+      const result = await lara.translate(textsForLara, sourceLang, targetLang);
+
+      if (!Array.isArray(result.translation)) {
+        return res.status(500).json({ error: "Unexpected Lara response shape" });
+      }
+
+      const newTranslations = result.translation;
+
+      if (newTranslations.length !== textsForLara.length) {
+        console.error(
+          "Length mismatch from Lara",
+          textsForLara.length,
+          newTranslations.length
+        );
+        return res
+          .status(500)
+          .json({ error: "Translation length mismatch" });
+      }
+
+      const rowsToInsert = [];
+      newTranslations.forEach((tl, i) => {
+        const { index, key } = toLookupForLara[i];
+        translations[index] = tl;
+        rowsToInsert.push({
+          key,
+          source_lang: sourceLang,
+          target_lang: targetLang,
+          original_text: sentences[index],
+          translated_text: tl,
+        });
+      });
+
+      await insertTranslations(rowsToInsert);
     }
 
     return res.json({ translations });
   } catch (err) {
     console.error("Internal /translate error", err);
-    
+
     if (err.constructor.name === "LaraApiError") {
       return res.status(502).json({
         error: "Upstream translation error",
@@ -76,6 +128,25 @@ app.post("/translate", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+async function startServer() {
+  try {
+    if (process.env.DATABASE_URL) {
+      console.log("Initializing database...");
+      await initDatabase();
+      console.log("Database ready");
+    } else {
+      console.warn(
+        "WARNING: DATABASE_URL not set - running without cache (will use Lara for every request)"
+      );
+    }
+
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();

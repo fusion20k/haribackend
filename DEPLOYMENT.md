@@ -1,5 +1,13 @@
 # Deployment Guide for Hari Backend
 
+## Features
+
+- **Translation API**: Translates text using Lara AI
+- **Global Cache System**: PostgreSQL-based caching reduces API costs by 90%+ over time
+- **CORS Enabled**: Works with Chrome extensions
+
+**See [CACHE_SETUP.md](./CACHE_SETUP.md) for detailed cache system documentation.**
+
 ## Local Development
 
 ### Setup
@@ -49,14 +57,30 @@ The server will run on http://localhost:10000
    - **Start Command**: `npm start`
    - **Plan**: Free (or your preferred plan)
 
-### Step 3: Set Environment Variables
+### Step 3: Create PostgreSQL Database (IMPORTANT!)
+
+**To enable the global cache system and reduce costs:**
+
+1. In Render dashboard, click **New +** → **PostgreSQL**
+2. Configure:
+   - **Name**: `haribackend-db`
+   - **Region**: Same as your web service
+   - **Plan**: Free
+3. After creation, copy the **Internal Database URL**
+
+### Step 4: Set Environment Variables
+
 In the Render dashboard, go to **Environment** and add:
 
 - `PORT` = `10000`
 - `LARA_ACCESS_KEY_ID` = `RB07SG7HF2BUI50ERS443R110S`
 - `LARA_ACCESS_KEY_SECRET` = `HIlazRssYp0y50bthnsbJ_ATWmoM1UPy-GgJ4eZIJ1o`
+- `DATABASE_URL` = (paste Internal Database URL from Step 3)
+- `NODE_ENV` = `production`
 
-### Step 4: Deploy
+**Note**: Without `DATABASE_URL`, the backend will work but won't cache (every request hits Lara API).
+
+### Step 5: Deploy
 1. Click **Create Web Service**
 2. Render will automatically build and deploy your app
 3. Note your public URL (e.g., `https://haribackend.onrender.com`)
