@@ -54,6 +54,40 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_translations_key ON translations(key)
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        stripe_customer_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        stripe_subscription_id VARCHAR(255) UNIQUE NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        current_period_end TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_id ON subscriptions(stripe_subscription_id)
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -133,10 +167,161 @@ async function insertTranslations(rows) {
   }
 }
 
+async function getUserById(userId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, email, password_hash, stripe_customer_id, created_at FROM users WHERE id = $1",
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting user by ID:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function getUserByEmail(email) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, email, password_hash, stripe_customer_id, created_at FROM users WHERE email = $1",
+      [email]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting user by email:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function createUser(email, passwordHash, stripeCustomerId = null) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "INSERT INTO users (email, password_hash, stripe_customer_id) VALUES ($1, $2, $3) RETURNING id, email, stripe_customer_id, created_at",
+      [email, passwordHash, stripeCustomerId]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error creating user:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateUserStripeCustomerId(userId, stripeCustomerId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE users SET stripe_customer_id = $1 WHERE id = $2",
+      [stripeCustomerId, userId]
+    );
+  } catch (error) {
+    console.error("Error updating Stripe customer ID:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getLatestSubscriptionForUser(userId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting subscription for user:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function createSubscription(userId, stripeSubscriptionId, status, currentPeriodEnd) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "INSERT INTO subscriptions (user_id, stripe_subscription_id, status, current_period_end) VALUES ($1, $2, $3, $4) RETURNING id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at",
+      [userId, stripeSubscriptionId, status, currentPeriodEnd]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error creating subscription:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateSubscription(stripeSubscriptionId, status, currentPeriodEnd) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "UPDATE subscriptions SET status = $1, current_period_end = $2, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = $3 RETURNING id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at",
+      [status, currentPeriodEnd, stripeSubscriptionId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error updating subscription:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getSubscriptionByStripeId(stripeSubscriptionId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at FROM subscriptions WHERE stripe_subscription_id = $1",
+      [stripeSubscriptionId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting subscription by Stripe ID:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
   insertTranslations,
   makeBackendKey,
   simpleHash,
+  getUserById,
+  getUserByEmail,
+  createUser,
+  updateUserStripeCustomerId,
+  getLatestSubscriptionForUser,
+  createSubscription,
+  updateSubscription,
+  getSubscriptionByStripeId,
 };
