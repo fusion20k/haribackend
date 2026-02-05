@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
 const { Credentials, Translator } = require("@translated/lara");
 const {
   initDatabase,
@@ -37,6 +37,10 @@ app.use(
 );
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: "Payment system not configured" });
+  }
+
   const sig = req.headers["stripe-signature"];
   let event;
 
@@ -126,6 +130,10 @@ async function userHasActiveSubscription(userId) {
 
 app.post("/auth/signup", async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
     const { email, password } = req.body;
 
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
@@ -219,6 +227,10 @@ app.get("/me", requireAuth, async (req, res) => {
 
 app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
     const user = await getUserById(req.userId);
     if (!user || !user.stripe_customer_id) {
       return res.status(400).json({ error: "Missing Stripe customer" });
