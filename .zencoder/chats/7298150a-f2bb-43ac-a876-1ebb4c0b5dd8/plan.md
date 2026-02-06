@@ -27,8 +27,17 @@
 
 ---
 
-## Subscriptions Table Structure
+## Access Control Methods
 
+### Method 1: Simple Checkbox (Recommended for Manual Grants)
+**Users table** - `has_access` field:
+- ✓ Check the box → Access granted
+- ☐ Uncheck the box → Access denied
+- **Priority**: This field overrides subscription status
+- **Use case**: Manual access grants, free trials, testing
+
+### Method 2: Subscriptions Table (Automatic via Stripe)
+**Subscriptions table** structure:
 ```sql
 CREATE TABLE subscriptions (
   id SERIAL PRIMARY KEY,
@@ -40,11 +49,8 @@ CREATE TABLE subscriptions (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
-
-**For Manual Access:**
-- Set `stripe_subscription_id` to something like `manual_grant_[timestamp]` to make it unique
-- Set `status` to `'active'`
-- Set `current_period_end` to far future date (e.g., 2099-12-31)
+- **Automatic**: Managed by Stripe webhooks
+- **Use case**: Paid subscriptions, recurring billing
 
 ---
 
