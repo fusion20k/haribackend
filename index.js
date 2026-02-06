@@ -120,6 +120,11 @@ function requireAuth(req, res, next) {
 }
 
 async function userHasActiveSubscription(userId) {
+  const user = await getUserById(userId);
+  if (user && user.has_access === true) {
+    return true;
+  }
+
   const row = await getLatestSubscriptionForUser(userId);
   if (!row) return false;
   if (!["active", "trialing"].includes(row.status)) return false;

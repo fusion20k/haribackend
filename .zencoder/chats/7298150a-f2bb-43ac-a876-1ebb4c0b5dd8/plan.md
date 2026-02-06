@@ -17,6 +17,8 @@
 - [x] Add script to manually create subscription entries in Supabase
 - [x] Document subscription table structure
 - [x] Create admin utility to grant/revoke access
+- [x] Create Supabase SQL Editor guide for direct database access
+- [x] Add `has_access` boolean field to users table for simple toggle access
 
 ### [ ] Phase 3: Test & Verify
 - Test signup flow end-to-end

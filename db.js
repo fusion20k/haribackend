@@ -60,12 +60,25 @@ async function initDatabase() {
         email VARCHAR(255) UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         stripe_customer_id VARCHAR(255),
+        has_access BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
+    `);
+
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'users' AND column_name = 'has_access'
+        ) THEN
+          ALTER TABLE users ADD COLUMN has_access BOOLEAN DEFAULT FALSE;
+        END IF;
+      END $$;
     `);
 
     await client.query(`
@@ -173,7 +186,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, created_at FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -191,7 +204,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, created_at FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
