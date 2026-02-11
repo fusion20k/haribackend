@@ -247,6 +247,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
       success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
+      allow_promotion_codes: true,
       metadata: { userId: user.id.toString() },
     });
 
