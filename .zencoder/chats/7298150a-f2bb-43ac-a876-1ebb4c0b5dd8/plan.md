@@ -20,6 +20,8 @@
 - [x] Create Supabase SQL Editor guide for direct database access
 - [x] Add `has_access` boolean field to users table for simple toggle access
 - [x] Set all database timestamps to EST timezone (America/New_York)
+- [x] Create migration script to convert existing timestamps from UTC to EST
+- [x] Provide SQL migration commands for Supabase SQL Editor
 
 ### [ ] Phase 3: Test & Verify
 - Test signup flow end-to-end
