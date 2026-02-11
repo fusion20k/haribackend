@@ -45,7 +45,7 @@ async function initDatabase() {
         target_lang VARCHAR(10) NOT NULL,
         original_text TEXT NOT NULL,
         translated_text TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'),
         hit_count INTEGER DEFAULT 0
       )
     `);
@@ -61,7 +61,7 @@ async function initDatabase() {
         password_hash TEXT NOT NULL,
         stripe_customer_id VARCHAR(255),
         has_access BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')
       )
     `);
 
@@ -88,8 +88,8 @@ async function initDatabase() {
         stripe_subscription_id VARCHAR(255) UNIQUE NOT NULL,
         status VARCHAR(50) NOT NULL,
         current_period_end TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'),
+        updated_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')
       )
     `);
 
