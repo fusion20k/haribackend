@@ -108,6 +108,14 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
 app.use(express.json());
 
+app.get("/health", (req, res) => {
+  res.status(200).json({ 
+    status: "ok", 
+    message: "Backend is healthy",
+    timestamp: new Date().toISOString()
+  });
+});
+
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
