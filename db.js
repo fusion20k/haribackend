@@ -28,10 +28,10 @@ function simpleHash(str) {
   return Math.abs(hash).toString(16);
 }
 
-function makeBackendKey(sourceLang, targetLang, originalText) {
-  const normalized = originalText.trim();
+function makeBackendKey(sourceLang, targetLang, originalText, domain = "default") {
+  const normalized = originalText.trim().replace(/\s+/g, " ");
   const hash = simpleHash(normalized);
-  return `${sourceLang}:${targetLang}:${hash}`;
+  return `${sourceLang}:${targetLang}:${domain}:${hash}`;
 }
 
 async function initDatabase() {
@@ -40,18 +40,39 @@ async function initDatabase() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS translations (
         id SERIAL PRIMARY KEY,
-        key VARCHAR(255) UNIQUE NOT NULL,
+        key VARCHAR(255) NOT NULL,
         source_lang VARCHAR(10) NOT NULL,
         target_lang VARCHAR(10) NOT NULL,
         original_text TEXT NOT NULL,
         translated_text TEXT NOT NULL,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        hit_count INTEGER DEFAULT 0
+        hit_count INTEGER DEFAULT 0,
+        domain VARCHAR(255) DEFAULT 'default' NOT NULL
       )
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_translations_key ON translations(key)
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'translations' AND column_name = 'domain'
+        ) THEN
+          ALTER TABLE translations ADD COLUMN domain VARCHAR(255) DEFAULT 'default' NOT NULL;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DROP INDEX IF EXISTS idx_translations_key
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_key_domain ON translations(key, domain)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_translations_domain ON translations(domain)
     `);
 
     await client.query(`
@@ -99,6 +120,32 @@ async function initDatabase() {
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_id ON subscriptions(stripe_subscription_id)
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS translation_usage (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        segment_text TEXT NOT NULL,
+        source_lang VARCHAR(10) NOT NULL,
+        target_lang VARCHAR(10) NOT NULL,
+        domain VARCHAR(255) NOT NULL,
+        was_cache_hit BOOLEAN NOT NULL,
+        character_count INTEGER NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_user_id ON translation_usage(user_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_domain ON translation_usage(domain)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_usage_created_at ON translation_usage(created_at)
     `);
 
     console.log("Database initialized successfully");
@@ -152,23 +199,24 @@ async function insertTranslations(rows) {
     const placeholders = [];
 
     rows.forEach((row, i) => {
-      const offset = i * 5;
+      const offset = i * 6;
       placeholders.push(
-        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`
+        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6})`
       );
       values.push(
         row.key,
         row.source_lang,
         row.target_lang,
         row.original_text,
-        row.translated_text
+        row.translated_text,
+        row.domain || "default"
       );
     });
 
     const query = `
-      INSERT INTO translations (key, source_lang, target_lang, original_text, translated_text)
+      INSERT INTO translations (key, source_lang, target_lang, original_text, translated_text, domain)
       VALUES ${placeholders.join(", ")}
-      ON CONFLICT (key) DO NOTHING
+      ON CONFLICT (key, domain) DO NOTHING
     `;
 
     await client.query(query, values);

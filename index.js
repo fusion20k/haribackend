@@ -20,6 +20,8 @@ const {
   updateSubscription,
   getSubscriptionByStripeId,
 } = require("./db");
+const { logTranslationUsage } = require("./analytics");
+const { normalizeSegment, validateSegment } = require("./segmentation");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -265,27 +267,46 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(402).json({ error: "Subscription required" });
     }
 
-    const { sourceLang, targetLang, sentences } = req.body;
+    const { sourceLang, targetLang, sentences, segments, domain } = req.body;
 
-    if (
-      typeof sourceLang !== "string" ||
-      typeof targetLang !== "string" ||
-      !Array.isArray(sentences) ||
-      sentences.length === 0 ||
-      !sentences.every((s) => typeof s === "string")
-    ) {
-      return res.status(400).json({ error: "Invalid request body" });
+    if (typeof sourceLang !== "string" || typeof targetLang !== "string") {
+      return res.status(400).json({ error: "sourceLang and targetLang are required" });
     }
 
-    const totalChars = sentences.reduce((sum, s) => sum + s.length, 0);
+    let textsToTranslate = [];
+    
+    if (segments && Array.isArray(segments) && segments.length > 0) {
+      if (!segments.every((s) => typeof s === "string")) {
+        return res.status(400).json({ error: "All segments must be strings" });
+      }
+      textsToTranslate = segments;
+    } else if (sentences && Array.isArray(sentences) && sentences.length > 0) {
+      if (!sentences.every((s) => typeof s === "string")) {
+        return res.status(400).json({ error: "All sentences must be strings" });
+      }
+      textsToTranslate = sentences;
+    } else {
+      return res.status(400).json({ error: "Either segments or sentences array is required" });
+    }
+
+    const validatedDomain = typeof domain === "string" && domain.length > 0 ? domain : "default";
+
+    const totalChars = textsToTranslate.reduce((sum, s) => sum + s.length, 0);
     if (totalChars > 8000) {
-      return res
-        .status(400)
-        .json({ error: "Request too large (over 8000 characters)" });
+      return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
 
-    const keys = sentences.map((text) =>
-      makeBackendKey(sourceLang, targetLang, text)
+    for (let i = 0; i < textsToTranslate.length; i++) {
+      const validation = validateSegment(textsToTranslate[i]);
+      if (!validation.valid) {
+        return res.status(400).json({ 
+          error: `Invalid segment at index ${i}: ${validation.error}` 
+        });
+      }
+    }
+
+    const keys = textsToTranslate.map((text) =>
+      makeBackendKey(sourceLang, targetLang, text, validatedDomain)
     );
 
     const existingRows = await findTranslationsByKeys(keys);
@@ -294,21 +315,23 @@ app.post("/translate", requireAuth, async (req, res) => {
       existingMap.set(row.key, row.translated_text);
     });
 
-    const translations = new Array(sentences.length).fill(null);
+    const translations = new Array(textsToTranslate.length).fill(null);
     const toLookupForLara = [];
+    const hitStatuses = new Array(textsToTranslate.length).fill(false);
 
     keys.forEach((key, index) => {
       const cached = existingMap.get(key);
       if (cached) {
         translations[index] = cached;
+        hitStatuses[index] = true;
       } else {
-        toLookupForLara.push({ index, text: sentences[index], key });
+        toLookupForLara.push({ index, text: textsToTranslate[index], key });
       }
     });
 
-    const cacheHits = sentences.length - toLookupForLara.length;
+    const cacheHits = textsToTranslate.length - toLookupForLara.length;
     console.log(
-      `Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${sentences.length} total)`
+      `[${validatedDomain}] Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${textsToTranslate.length} total)`
     );
 
     if (toLookupForLara.length > 0) {
@@ -328,9 +351,7 @@ app.post("/translate", requireAuth, async (req, res) => {
           textsForLara.length,
           newTranslations.length
         );
-        return res
-          .status(500)
-          .json({ error: "Translation length mismatch" });
+        return res.status(500).json({ error: "Translation length mismatch" });
       }
 
       const rowsToInsert = [];
@@ -341,13 +362,23 @@ app.post("/translate", requireAuth, async (req, res) => {
           key,
           source_lang: sourceLang,
           target_lang: targetLang,
-          original_text: sentences[index],
+          original_text: textsToTranslate[index],
           translated_text: tl,
+          domain: validatedDomain,
         });
       });
 
       await insertTranslations(rowsToInsert);
     }
+
+    logTranslationUsage(
+      req.userId,
+      textsToTranslate,
+      hitStatuses,
+      validatedDomain,
+      sourceLang,
+      targetLang
+    );
 
     return res.json({ translations });
   } catch (err) {
