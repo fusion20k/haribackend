@@ -76,7 +76,14 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             subscription.status,
             new Date(subscription.current_period_end * 1000)
           );
-          console.log(`Subscription created for user ${userId}`);
+
+          if (subscription.status === "trialing") {
+            await updateUserTrialStart(userId, subscription.id);
+            console.log(`Trial started for user ${userId}`);
+          } else if (subscription.status === "active") {
+            await updateUserPlanStatus(userId, "active", true, new Date());
+            console.log(`Subscription active for user ${userId}`);
+          }
         }
         break;
       }
@@ -425,6 +432,43 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
     res.json({ checkoutUrl: session.url });
   } catch (err) {
     console.error("Checkout session error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
+    const user = await getUserById(req.userId);
+    if (!user || !user.stripe_customer_id) {
+      return res.status(400).json({ error: "Missing Stripe customer" });
+    }
+
+    if (user.plan_status === "trialing" || user.plan_status === "active") {
+      return res.status(400).json({ error: "Trial or subscription already active" });
+    }
+
+    const trialEndTimestamp = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: user.stripe_customer_id,
+      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      subscription_data: {
+        trial_end: trialEndTimestamp,
+      },
+      success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
+      allow_promotion_codes: true,
+      metadata: { userId: user.id.toString() },
+    });
+
+    res.json({ checkoutUrl: session.url });
+  } catch (err) {
+    console.error("Trial checkout session error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
