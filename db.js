@@ -103,6 +103,78 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'plan_status'
+        ) THEN
+          ALTER TABLE users ADD COLUMN plan_status TEXT;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'trial_chars_used'
+        ) THEN
+          ALTER TABLE users ADD COLUMN trial_chars_used INTEGER NOT NULL DEFAULT 0;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'trial_chars_limit'
+        ) THEN
+          ALTER TABLE users ADD COLUMN trial_chars_limit INTEGER NOT NULL DEFAULT 10000;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'trial_started_at'
+        ) THEN
+          ALTER TABLE users ADD COLUMN trial_started_at TIMESTAMPTZ;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'trial_converted_at'
+        ) THEN
+          ALTER TABLE users ADD COLUMN trial_converted_at TIMESTAMPTZ;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'subscription_id'
+        ) THEN
+          ALTER TABLE users ADD COLUMN subscription_id VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -234,7 +306,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -252,7 +324,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
@@ -371,6 +443,98 @@ async function getSubscriptionByStripeId(stripeSubscriptionId) {
   }
 }
 
+async function updateUserTrialStart(userId, subscriptionId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = 'trialing',
+           trial_chars_used = 0,
+           trial_chars_limit = 10000,
+           trial_started_at = NOW(),
+           subscription_id = $1,
+           has_access = TRUE
+       WHERE id = $2
+       RETURNING id, email, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, has_access`,
+      [subscriptionId, userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error updating user trial start:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function incrementUserTrialChars(userId, chars) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET trial_chars_used = trial_chars_used + $1
+       WHERE id = $2
+       RETURNING id, trial_chars_used, trial_chars_limit, subscription_id, plan_status`,
+      [chars, userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error incrementing trial chars:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = $1,
+           has_access = $2,
+           trial_converted_at = $3
+       WHERE id = $4
+       RETURNING id, email, plan_status, has_access, trial_converted_at`,
+      [planStatus, hasAccess, convertedAt, userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error updating user plan status:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function cancelUserSubscription(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = 'canceled',
+           has_access = FALSE
+       WHERE id = $1
+       RETURNING id, email, plan_status, has_access`,
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error canceling user subscription:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -385,4 +549,8 @@ module.exports = {
   createSubscription,
   updateSubscription,
   getSubscriptionByStripeId,
+  updateUserTrialStart,
+  incrementUserTrialChars,
+  updateUserPlanStatus,
+  cancelUserSubscription,
 };

@@ -338,3 +338,16 @@ parts.forEach((sentenceText, index) => {
 - Test progressive loading on scroll
 - Verify no missing spaces in translations
 - Check cache hit rate on repeat visits (target: 70%+)
+
+---
+
+### [x] Step: Add Health Endpoint
+
+**Purpose:** Keep Render backend warm and allow health checks
+
+**Changes Made:**
+- Added GET `/health` endpoint to index.js
+- Returns: `{"status": "ok", "message": "Backend is healthy", "timestamp": "..."}`
+- Committed and pushed to GitHub
+
+**Test:** Visit https://haribackend-mitj.onrender.com/health (after deployment)
