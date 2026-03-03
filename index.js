@@ -388,6 +388,7 @@ app.get("/me", requireAuth, async (req, res) => {
     res.json({
       id: user.id,
       email: user.email,
+      hasAccess,
       has_access: hasAccess,
       plan_status: user.plan_status || null,
       trial_chars_used: user.trial_chars_used ?? 0,
