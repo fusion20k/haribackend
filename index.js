@@ -137,6 +137,31 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/debug/me", requireAuth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    const hasAccess = await userHasActiveSubscription(req.userId);
+    const sub = await getLatestSubscriptionForUser(req.userId);
+    res.json({
+      userId: req.userId,
+      userFound: !!user,
+      user: user ? {
+        id: user.id,
+        email: user.email,
+        has_access: user.has_access,
+        plan_status: user.plan_status,
+        trial_chars_used: user.trial_chars_used,
+        trial_chars_limit: user.trial_chars_limit,
+        subscription_id: user.subscription_id,
+      } : null,
+      hasAccessResult: hasAccess,
+      latestSubscription: sub || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
