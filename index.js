@@ -406,19 +406,17 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
 app.post("/translate", requireAuth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
-    if (!user) {
-      return res.status(401).json({ error: "User not found" });
-    }
 
-    const hasAccess = user.has_access || (await userHasActiveSubscription(req.userId));
+    const hasAccess = (user && user.has_access) || (await userHasActiveSubscription(req.userId));
     if (!hasAccess) {
       return res.status(402).json({ error: "Subscription required" });
     }
 
     if (
+      user &&
+      user.plan_status &&
       user.plan_status !== "trialing" &&
-      user.plan_status !== "active" &&
-      user.plan_status !== null
+      user.plan_status !== "active"
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -452,7 +450,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
 
-    if (user.plan_status === "trialing") {
+    if (user && user.plan_status === "trialing") {
       const charsUsed = user.trial_chars_used ?? 0;
       const charsLimit = user.trial_chars_limit ?? 10000;
       if (charsUsed >= charsLimit) {
@@ -549,7 +547,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       targetLang
     );
 
-    if (user.plan_status === "trialing") {
+    if (user && user.plan_status === "trialing") {
       const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
         if (stripe && updatedUser.subscription_id) {

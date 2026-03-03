@@ -89,7 +89,7 @@ Spec saved to `spec.md`. Complexity: **Hard**.
 
 ---
 
-### [ ] Phase 6: Commit and Push
+### [x] Phase 6: Commit and Push
 
-- [ ] `git add -A && git commit -m "feat: add 10k-character card-upfront free trial"`
-- [ ] `git push` to https://github.com/fusion20k/haribackend
+- [x] `git add -A && git commit -m "feat-free-trial"`
+- [x] `git push origin main` to https://github.com/fusion20k/haribackend
