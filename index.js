@@ -65,24 +65,64 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        const userId = parseInt(session.metadata.userId);
+        const userId = parseInt(session.metadata && session.metadata.userId);
         const subscriptionId = session.subscription;
+
+        if (!userId || isNaN(userId)) {
+          console.error("checkout.session.completed: missing userId in metadata", session.id);
+          break;
+        }
 
         if (subscriptionId) {
           const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-          await createSubscription(
-            userId,
-            subscription.id,
-            subscription.status,
-            new Date(subscription.current_period_end * 1000)
-          );
+
+          try {
+            await createSubscription(
+              userId,
+              subscription.id,
+              subscription.status,
+              new Date(subscription.current_period_end * 1000)
+            );
+          } catch (dbErr) {
+            console.error("checkout.session.completed: createSubscription error (non-fatal):", dbErr.message);
+          }
 
           if (subscription.status === "trialing") {
             await updateUserTrialStart(userId, subscription.id);
-            console.log(`Trial started for user ${userId}`);
+            console.log(`Trial started: user=${userId} sub=${subscription.id}`);
           } else if (subscription.status === "active") {
             await updateUserPlanStatus(userId, "active", true, new Date());
-            console.log(`Subscription active for user ${userId}`);
+            console.log(`Subscription active: user=${userId}`);
+          }
+        }
+        break;
+      }
+
+      case "customer.subscription.created": {
+        const subscription = event.data.object;
+        const meta = subscription.metadata || {};
+        const userId = meta.userId ? parseInt(meta.userId) : null;
+
+        console.log(`customer.subscription.created: sub=${subscription.id} status=${subscription.status} userId=${userId}`);
+
+        if (userId && !isNaN(userId)) {
+          try {
+            await createSubscription(
+              userId,
+              subscription.id,
+              subscription.status,
+              new Date(subscription.current_period_end * 1000)
+            );
+          } catch (dbErr) {
+            console.error("customer.subscription.created: createSubscription error (non-fatal):", dbErr.message);
+          }
+
+          if (subscription.status === "trialing") {
+            await updateUserTrialStart(userId, subscription.id);
+            console.log(`Trial started via subscription.created: user=${userId}`);
+          } else if (subscription.status === "active") {
+            await updateUserPlanStatus(userId, "active", true, new Date());
+            console.log(`Active via subscription.created: user=${userId}`);
           }
         }
         break;
@@ -99,7 +139,10 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
-          if (subscription.status === "active") {
+          if (subscription.status === "trialing") {
+            await updateUserTrialStart(subRow.user_id, subscription.id);
+            console.log(`User ${subRow.user_id} set to trialing via subscription.updated`);
+          } else if (subscription.status === "active") {
             await updateUserPlanStatus(subRow.user_id, "active", true, new Date());
             console.log(`User ${subRow.user_id} plan set to active`);
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
@@ -423,6 +466,9 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       mode: "subscription",
       customer: user.stripe_customer_id,
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      subscription_data: {
+        metadata: { userId: user.id.toString() },
+      },
       success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
       allow_promotion_codes: true,
@@ -459,6 +505,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
       subscription_data: {
         trial_end: trialEndTimestamp,
+        metadata: { userId: user.id.toString() },
       },
       success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
@@ -469,6 +516,72 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
     res.json({ checkoutUrl: session.url });
   } catch (err) {
     console.error("Trial checkout session error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/billing/verify-session", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
+    const { session_id } = req.body;
+    if (!session_id || typeof session_id !== "string") {
+      return res.status(400).json({ error: "session_id is required" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ["subscription"],
+    });
+
+    const sessionUserId = parseInt(session.metadata && session.metadata.userId);
+    if (!sessionUserId || isNaN(sessionUserId) || sessionUserId !== req.userId) {
+      return res.status(403).json({ error: "Session does not belong to this user" });
+    }
+
+    if (session.payment_status !== "paid" && session.status !== "complete") {
+      return res.status(402).json({ error: "Payment not completed" });
+    }
+
+    const subscription = session.subscription;
+    if (!subscription) {
+      return res.status(400).json({ error: "No subscription found in session" });
+    }
+
+    try {
+      await createSubscription(
+        req.userId,
+        subscription.id,
+        subscription.status,
+        new Date(subscription.current_period_end * 1000)
+      );
+    } catch (dbErr) {
+      console.error("verify-session: createSubscription error (non-fatal):", dbErr.message);
+    }
+
+    if (subscription.status === "trialing") {
+      await updateUserTrialStart(req.userId, subscription.id);
+      console.log(`verify-session: trial activated user=${req.userId} sub=${subscription.id}`);
+    } else if (subscription.status === "active") {
+      await updateUserPlanStatus(req.userId, "active", true, new Date());
+      console.log(`verify-session: active plan set user=${req.userId}`);
+    }
+
+    const updatedUser = await getUserById(req.userId);
+
+    res.json({
+      success: true,
+      plan_status: updatedUser ? updatedUser.plan_status : subscription.status,
+      has_access: updatedUser ? updatedUser.has_access : true,
+      trial_chars_used: updatedUser ? updatedUser.trial_chars_used : 0,
+      trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : 10000,
+    });
+  } catch (err) {
+    console.error("/billing/verify-session error:", err);
+    if (err.type && err.type.startsWith("Stripe")) {
+      return res.status(402).json({ error: err.message });
+    }
     res.status(500).json({ error: "Internal server error" });
   }
 });

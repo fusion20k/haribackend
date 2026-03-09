@@ -395,7 +395,13 @@ async function createSubscription(userId, stripeSubscriptionId, status, currentP
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "INSERT INTO subscriptions (user_id, stripe_subscription_id, status, current_period_end) VALUES ($1, $2, $3, $4) RETURNING id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at",
+      `INSERT INTO subscriptions (user_id, stripe_subscription_id, status, current_period_end)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         current_period_end = EXCLUDED.current_period_end,
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at`,
       [userId, stripeSubscriptionId, status, currentPeriodEnd]
     );
     return result.rows[0];
