@@ -385,7 +385,7 @@ app.post("/start-trial", async (req, res) => {
       invoice_settings: { default_payment_method: payment_method_id },
     });
 
-    const trialEndTimestamp = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+    const trialEndTimestamp = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
     const subscription = await stripe.subscriptions.create({
       customer: user.stripe_customer_id,
@@ -497,7 +497,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
-    const trialEndTimestamp = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+    const trialEndTimestamp = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
