@@ -24,7 +24,7 @@ const {
   updateUserPlanStatus,
   cancelUserSubscription,
 } = require("./db");
-const { logTranslationUsage } = require("./analytics");
+const { logTranslationUsage, getOverallStats, getStatsByDomain } = require("./analytics");
 const { normalizeSegment, validateSegment } = require("./segmentation");
 
 const app = express();
@@ -586,7 +586,41 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/stats", requireAuth, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
+    const domain = typeof req.query.domain === "string" && req.query.domain.length > 0
+      ? req.query.domain
+      : null;
+
+    if (domain) {
+      const domainStats = await getStatsByDomain(days);
+      const filtered = domainStats.filter((r) => r.domain === domain);
+      return res.json({
+        period_days: days,
+        domain,
+        stats: filtered[0] || null,
+      });
+    }
+
+    const [overall, byDomain] = await Promise.all([
+      getOverallStats(days),
+      getStatsByDomain(days),
+    ]);
+
+    res.json({
+      period_days: days,
+      overall: overall || null,
+      by_domain: byDomain,
+    });
+  } catch (err) {
+    console.error("/stats error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.post("/translate", requireAuth, async (req, res) => {
+  const requestStart = Date.now();
   try {
     const user = await getUserById(req.userId);
 
@@ -661,7 +695,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       makeBackendKey(sourceLang, targetLang, text, validatedDomain)
     );
 
+    const dbStart = Date.now();
     const existingRows = await findTranslationsByKeys(keys);
+    const dbMs = Date.now() - dbStart;
+
     const existingMap = new Map();
     existingRows.forEach((row) => {
       existingMap.set(row.key, row.translated_text);
@@ -681,15 +718,17 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
     });
 
-    const cacheHits = normalizedTexts.length - toLookupForLara.length;
-    console.log(
-      `[${validatedDomain}] Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${normalizedTexts.length} total)`
-    );
+    const totalChunks = normalizedTexts.length;
+    const cacheHits = totalChunks - toLookupForLara.length;
+    const mtCalls = toLookupForLara.length;
+    const hitRatePct = totalChunks > 0 ? ((cacheHits / totalChunks) * 100).toFixed(1) : "0.0";
 
     if (toLookupForLara.length > 0) {
       const textsForLara = toLookupForLara.map((item) => item.text);
 
+      const laraStart = Date.now();
       const result = await lara.translate(textsForLara, sourceLang, targetLang);
+      const laraMs = Date.now() - laraStart;
 
       if (!Array.isArray(result.translation)) {
         return res.status(500).json({ error: "Unexpected Lara response shape" });
@@ -721,6 +760,13 @@ app.post("/translate", requireAuth, async (req, res) => {
       });
 
       await insertTranslations(rowsToInsert);
+      console.log(
+        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} hit_rate=${hitRatePct}% db=${dbMs}ms lara=${laraMs}ms total=${Date.now() - requestStart}ms`
+      );
+    } else {
+      console.log(
+        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} hit_rate=${hitRatePct}% db=${dbMs}ms total=${Date.now() - requestStart}ms`
+      );
     }
 
     logTranslationUsage(

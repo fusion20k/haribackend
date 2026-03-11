@@ -118,8 +118,75 @@ async function getTopSegmentsByDomain(domain, limit = 20) {
   }
 }
 
+async function getOverallStats(daysBack = 7) {
+  if (!process.env.DATABASE_URL) {
+    return null;
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT
+        COUNT(*) AS total_chunks,
+        SUM(CASE WHEN was_cache_hit THEN 1 ELSE 0 END) AS cache_hits,
+        SUM(CASE WHEN NOT was_cache_hit THEN 1 ELSE 0 END) AS mt_calls,
+        ROUND(
+          100.0 * SUM(CASE WHEN was_cache_hit THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
+          2
+        ) AS hit_rate_pct,
+        ROUND(AVG(CASE WHEN NOT was_cache_hit THEN character_count END), 0) AS avg_chars_per_mt_call,
+        COUNT(DISTINCT domain) AS unique_domains,
+        COUNT(DISTINCT user_id) AS unique_users
+      FROM translation_usage
+      WHERE created_at > NOW() - ($1 || ' days')::INTERVAL
+    `, [daysBack]);
+
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error fetching overall stats:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function getStatsByDomain(daysBack = 7) {
+  if (!process.env.DATABASE_URL) {
+    return [];
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT
+        domain,
+        COUNT(*) AS total_chunks,
+        SUM(CASE WHEN was_cache_hit THEN 1 ELSE 0 END) AS cache_hits,
+        SUM(CASE WHEN NOT was_cache_hit THEN 1 ELSE 0 END) AS mt_calls,
+        ROUND(
+          100.0 * SUM(CASE WHEN was_cache_hit THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
+          2
+        ) AS hit_rate_pct,
+        ROUND(AVG(CASE WHEN NOT was_cache_hit THEN character_count END), 0) AS avg_chars_per_mt_call
+      FROM translation_usage
+      WHERE created_at > NOW() - ($1 || ' days')::INTERVAL
+      GROUP BY domain
+      ORDER BY total_chunks DESC
+    `, [daysBack]);
+
+    return result.rows;
+  } catch (error) {
+    console.error("Error fetching stats by domain:", error);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   logTranslationUsage,
   getCacheHitRateByDomain,
   getTopSegmentsByDomain,
+  getOverallStats,
+  getStatsByDomain,
 };
