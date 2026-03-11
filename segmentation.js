@@ -2,8 +2,16 @@ function normalizeSegment(text) {
   if (typeof text !== "string") {
     return "";
   }
-  
-  return text.trim().replace(/\s+/g, " ");
+
+  return text
+    .replace(/[\u200B\u200C\u200D\uFEFF\u00AD\u2060\u00A0]/g, " ")
+    .replace(/[\u201C\u201D\u201E\u201F\u275D\u275E]/g, '"')
+    .replace(/[\u2018\u2019\u201A\u201B\u275B\u275C]/g, "'")
+    .replace(/\u2026/g, "...")
+    .replace(/\u2013/g, "-")
+    .replace(/\u2014/g, "--")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function isUIString(segment) {

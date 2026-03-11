@@ -55,3 +55,25 @@ ALTER SEQUENCE translation_usage_id_seq RESTART WITH 1;
 -- 2. Check Supabase translations table - should show proper domain names
 -- 3. Monitor cache hit rates in Render logs
 -- ============================================
+
+-- ============================================
+-- OPTIONAL: Stale Entry Cleanup (LRU)
+-- ============================================
+-- Run periodically (e.g. monthly) to remove rarely-used cache entries.
+-- Removes translations not accessed in the last 90 days with low hit counts.
+-- Safe to run anytime - hot translations won't be deleted.
+-- ============================================
+
+-- Preview what would be deleted (dry run):
+SELECT COUNT(*) as stale_entries
+FROM translations
+WHERE last_used_at < NOW() - INTERVAL '90 days'
+  AND hit_count < 3;
+
+-- Actually delete stale entries (uncomment when ready):
+-- DELETE FROM translations
+-- WHERE last_used_at < NOW() - INTERVAL '90 days'
+--   AND hit_count < 3;
+
+-- Verify remaining entries after cleanup:
+-- SELECT COUNT(*) as remaining_entries FROM translations;

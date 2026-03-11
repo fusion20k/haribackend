@@ -28,10 +28,10 @@ function simpleHash(str) {
   return Math.abs(hash).toString(16);
 }
 
-function makeBackendKey(sourceLang, targetLang, originalText, domain = "default") {
-  const normalized = originalText.trim().replace(/\s+/g, " ");
-  const hash = simpleHash(normalized);
-  return `${sourceLang}:${targetLang}:${domain}:${hash}`;
+function makeBackendKey(sourceLang, targetLang, normalizedText, domain = "default") {
+  const input = `${sourceLang}|${targetLang}|${normalizedText}`;
+  const hash = simpleHash(input);
+  return `${domain}:${hash}`;
 }
 
 async function initDatabase() {
@@ -47,7 +47,8 @@ async function initDatabase() {
         translated_text TEXT NOT NULL,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
         hit_count INTEGER DEFAULT 0,
-        domain VARCHAR(255) DEFAULT 'default' NOT NULL
+        domain VARCHAR(255) DEFAULT 'default' NOT NULL,
+        last_used_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -64,6 +65,18 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'translations' AND column_name = 'last_used_at'
+        ) THEN
+          ALTER TABLE translations ADD COLUMN last_used_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       DROP INDEX IF EXISTS idx_translations_key
     `);
 
@@ -73,6 +86,10 @@ async function initDatabase() {
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_translations_domain ON translations(domain)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_translations_last_used_at ON translations(last_used_at)
     `);
 
     await client.query(`
@@ -235,22 +252,22 @@ async function findTranslationsByKeys(keys) {
 
   const client = await pool.connect();
   try {
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(",");
-    const query = `
-      SELECT key, translated_text, hit_count
-      FROM translations
-      WHERE key IN (${placeholders})
-    `;
+    const result = await client.query(
+      `SELECT key, translated_text, hit_count
+       FROM translations
+       WHERE key = ANY($1)`,
+      [keys]
+    );
 
-    const result = await client.query(query, keys);
-
-    const updatePromises = result.rows.map((row) => {
-      return client.query(
-        "UPDATE translations SET hit_count = hit_count + 1 WHERE key = $1",
-        [row.key]
+    if (result.rows.length > 0) {
+      const hitKeys = result.rows.map((row) => row.key);
+      await client.query(
+        `UPDATE translations
+         SET hit_count = hit_count + 1, last_used_at = NOW()
+         WHERE key = ANY($1)`,
+        [hitKeys]
       );
-    });
-    await Promise.all(updatePromises);
+    }
 
     return result.rows;
   } catch (error) {

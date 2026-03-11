@@ -628,7 +628,18 @@ app.post("/translate", requireAuth, async (req, res) => {
 
     const validatedDomain = typeof domain === "string" && domain.length > 0 ? domain : "default";
 
-    const totalChars = textsToTranslate.reduce((sum, s) => sum + s.length, 0);
+    const normalizedTexts = [];
+    for (let i = 0; i < textsToTranslate.length; i++) {
+      const validation = validateSegment(textsToTranslate[i]);
+      if (!validation.valid) {
+        return res.status(400).json({ 
+          error: `Invalid segment at index ${i}: ${validation.error}` 
+        });
+      }
+      normalizedTexts.push(validation.normalized);
+    }
+
+    const totalChars = normalizedTexts.reduce((sum, s) => sum + s.length, 0);
     if (totalChars > 8000) {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
@@ -646,16 +657,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
     }
 
-    for (let i = 0; i < textsToTranslate.length; i++) {
-      const validation = validateSegment(textsToTranslate[i]);
-      if (!validation.valid) {
-        return res.status(400).json({ 
-          error: `Invalid segment at index ${i}: ${validation.error}` 
-        });
-      }
-    }
-
-    const keys = textsToTranslate.map((text) =>
+    const keys = normalizedTexts.map((text) =>
       makeBackendKey(sourceLang, targetLang, text, validatedDomain)
     );
 
@@ -665,9 +667,9 @@ app.post("/translate", requireAuth, async (req, res) => {
       existingMap.set(row.key, row.translated_text);
     });
 
-    const translations = new Array(textsToTranslate.length).fill(null);
+    const translations = new Array(normalizedTexts.length).fill(null);
     const toLookupForLara = [];
-    const hitStatuses = new Array(textsToTranslate.length).fill(false);
+    const hitStatuses = new Array(normalizedTexts.length).fill(false);
 
     keys.forEach((key, index) => {
       const cached = existingMap.get(key);
@@ -675,13 +677,13 @@ app.post("/translate", requireAuth, async (req, res) => {
         translations[index] = cached;
         hitStatuses[index] = true;
       } else {
-        toLookupForLara.push({ index, text: textsToTranslate[index], key });
+        toLookupForLara.push({ index, text: normalizedTexts[index], key });
       }
     });
 
-    const cacheHits = textsToTranslate.length - toLookupForLara.length;
+    const cacheHits = normalizedTexts.length - toLookupForLara.length;
     console.log(
-      `[${validatedDomain}] Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${textsToTranslate.length} total)`
+      `[${validatedDomain}] Cache: ${cacheHits} hits, ${toLookupForLara.length} misses (${normalizedTexts.length} total)`
     );
 
     if (toLookupForLara.length > 0) {
@@ -712,7 +714,7 @@ app.post("/translate", requireAuth, async (req, res) => {
           key,
           source_lang: sourceLang,
           target_lang: targetLang,
-          original_text: textsToTranslate[index],
+          original_text: normalizedTexts[index],
           translated_text: tl,
           domain: validatedDomain,
         });
@@ -723,7 +725,7 @@ app.post("/translate", requireAuth, async (req, res) => {
 
     logTranslationUsage(
       req.userId,
-      textsToTranslate,
+      normalizedTexts,
       hitStatuses,
       validatedDomain,
       sourceLang,
