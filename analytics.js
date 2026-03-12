@@ -183,10 +183,39 @@ async function getStatsByDomain(daysBack = 7) {
   }
 }
 
+async function getMonthlyUsage() {
+  const total = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10000000;
+
+  if (!process.env.DATABASE_URL) {
+    return { used: 0, total, percentage: 0 };
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT COALESCE(SUM(character_count), 0) AS used
+      FROM translation_usage
+      WHERE was_cache_hit = false
+        AND created_at >= date_trunc('month', NOW())
+    `);
+
+    const used = parseInt(result.rows[0].used) || 0;
+    const percentage = parseFloat(((used / total) * 100).toFixed(2));
+
+    return { used, total, percentage };
+  } catch (error) {
+    console.error("Error fetching monthly usage:", error);
+    return { used: 0, total, percentage: 0 };
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   logTranslationUsage,
   getCacheHitRateByDomain,
   getTopSegmentsByDomain,
   getOverallStats,
   getStatsByDomain,
+  getMonthlyUsage,
 };

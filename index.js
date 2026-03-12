@@ -24,7 +24,7 @@ const {
   updateUserPlanStatus,
   cancelUserSubscription,
 } = require("./db");
-const { logTranslationUsage, getOverallStats, getStatsByDomain } = require("./analytics");
+const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment } = require("./segmentation");
 
 const app = express();
@@ -615,6 +615,16 @@ app.get("/stats", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("/stats error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/usage", requireAuth, async (req, res) => {
+  try {
+    const usage = await getMonthlyUsage();
+    res.json(usage);
+  } catch (err) {
+    console.error("/usage error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
