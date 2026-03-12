@@ -619,7 +619,7 @@ app.get("/stats", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/usage", requireAuth, async (req, res) => {
+app.get("/usage", async (req, res) => {
   try {
     const usage = await getMonthlyUsage();
     res.json(usage);
