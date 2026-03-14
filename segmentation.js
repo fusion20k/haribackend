@@ -1,3 +1,7 @@
+const EMOJI_REGEX = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2702}-\u{27B0}\u{200D}\u{20E3}\u{FE0F}]/gu;
+
+const PUNCT_TRIM_REGEX = /^[\s.,!?;:*#\-\u2013\u2014'"()\[\]{}]+|[\s.,!?;:*#\-\u2013\u2014'"()\[\]{}]+$/g;
+
 function normalizeSegment(text) {
   if (typeof text !== "string") {
     return "";
@@ -10,8 +14,10 @@ function normalizeSegment(text) {
     .replace(/\u2026/g, "...")
     .replace(/\u2013/g, "-")
     .replace(/\u2014/g, "--")
+    .toLowerCase()
     .trim()
-    .replace(/\s+/g, " ");
+    .replace(/\s+/g, " ")
+    .replace(/[.,!?;:*#\-'"()\[\]{}]+$/, "");
 }
 
 function isUIString(segment) {
@@ -95,10 +101,69 @@ function validateSegment(segment, maxLength = 1000) {
   return { valid: true, normalized };
 }
 
+function stripPunctuation(text) {
+  if (typeof text !== "string") return "";
+  return text.replace(PUNCT_TRIM_REGEX, "");
+}
+
+function stripEmojis(text) {
+  if (typeof text !== "string") return "";
+  return text.replace(EMOJI_REGEX, "").replace(/\s+/g, " ").trim();
+}
+
+function cleanSegment(text) {
+  if (typeof text !== "string") {
+    return { original: "", cleaned: "", leadingPunct: "", trailingPunct: "", emojis: [] };
+  }
+
+  const emojis = text.match(EMOJI_REGEX) || [];
+
+  const stripped = text.replace(EMOJI_REGEX, "");
+
+  const leadingMatch = stripped.match(/^[\s.,!?;:*#\-\u2013\u2014'"()\[\]{}]+/);
+  const trailingMatch = stripped.match(/[\s.,!?;:*#\-\u2013\u2014'"()\[\]{}]+$/);
+  const leadingPunct = leadingMatch ? leadingMatch[0] : "";
+  const trailingPunct = trailingMatch ? trailingMatch[0] : "";
+
+  const cleaned = stripped
+    .replace(PUNCT_TRIM_REGEX, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return { original: text, cleaned, leadingPunct, trailingPunct, emojis };
+}
+
+function isTranslatable(cleaned) {
+  if (typeof cleaned !== "string" || cleaned.length === 0) return false;
+  return /[a-zA-Z]/.test(cleaned);
+}
+
+function reattachDecorations(translatedClean, decorations) {
+  const { leadingPunct, trailingPunct, emojis } = decorations;
+  let result = (leadingPunct || "") + translatedClean + (trailingPunct || "");
+  if (emojis && emojis.length > 0) {
+    result = result.trimEnd() + " " + emojis.join("") ;
+  }
+  return result.trim();
+}
+
+function isEchoedTranslation(cleanInput, cleanOutput) {
+  if (typeof cleanInput !== "string" || typeof cleanOutput !== "string") return false;
+  const normIn = cleanInput.toLowerCase().trim().replace(/\s+/g, " ");
+  const normOut = cleanOutput.toLowerCase().trim().replace(/\s+/g, " ");
+  return normIn === normOut;
+}
+
 module.exports = {
   normalizeSegment,
   isUIString,
   splitIntoSegments,
   segmentBatch,
   validateSegment,
+  stripPunctuation,
+  stripEmojis,
+  cleanSegment,
+  isTranslatable,
+  reattachDecorations,
+  isEchoedTranslation,
 };

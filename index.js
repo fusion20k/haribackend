@@ -25,7 +25,7 @@ const {
   cancelUserSubscription,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
-const { normalizeSegment, validateSegment } = require("./segmentation");
+const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation } = require("./segmentation");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -648,7 +648,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(402).json({ error: "no_access" });
     }
 
-    const { sourceLang, targetLang, sentences, segments, domain } = req.body;
+    const { sourceLang, targetLang, sentences, segments, domain, isWordLevel } = req.body;
 
     if (typeof sourceLang !== "string" || typeof targetLang !== "string") {
       return res.status(400).json({ error: "sourceLang and targetLang are required" });
@@ -671,8 +671,12 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     const validatedDomain = typeof domain === "string" && domain.length > 0 ? domain : "default";
+    const wordLevel = isWordLevel === true;
 
     const normalizedTexts = [];
+    const cleanedData = [];
+    const skipIndices = new Set();
+
     for (let i = 0; i < textsToTranslate.length; i++) {
       const validation = validateSegment(textsToTranslate[i]);
       if (!validation.valid) {
@@ -681,6 +685,13 @@ app.post("/translate", requireAuth, async (req, res) => {
         });
       }
       normalizedTexts.push(validation.normalized);
+
+      const segClean = cleanSegment(textsToTranslate[i]);
+      cleanedData.push(segClean);
+
+      if (!isTranslatable(segClean.cleaned)) {
+        skipIndices.add(i);
+      }
     }
 
     const totalChars = normalizedTexts.reduce((sum, s) => sum + s.length, 0);
@@ -719,18 +730,29 @@ app.post("/translate", requireAuth, async (req, res) => {
     const hitStatuses = new Array(normalizedTexts.length).fill(false);
 
     keys.forEach((key, index) => {
+      if (skipIndices.has(index)) {
+        translations[index] = textsToTranslate[index];
+        hitStatuses[index] = true;
+        return;
+      }
+
       const cached = existingMap.get(key);
       if (cached) {
         translations[index] = cached;
         hitStatuses[index] = true;
       } else {
-        toLookupForLara.push({ index, text: normalizedTexts[index], key });
+        toLookupForLara.push({
+          index,
+          text: cleanedData[index].cleaned,
+          key,
+          decorations: cleanedData[index],
+        });
       }
     });
 
     const totalChunks = normalizedTexts.length;
     const cacheHits = totalChunks - toLookupForLara.length;
-    const mtCalls = toLookupForLara.length;
+    let mtCalls = toLookupForLara.length;
     const hitRatePct = totalChunks > 0 ? ((cacheHits / totalChunks) * 100).toFixed(1) : "0.0";
 
     if (toLookupForLara.length > 0) {
@@ -755,27 +777,79 @@ app.post("/translate", requireAuth, async (req, res) => {
         return res.status(500).json({ error: "Translation length mismatch" });
       }
 
+      const retryItems = [];
       const rowsToInsert = [];
+
       newTranslations.forEach((tl, i) => {
-        const { index, key } = toLookupForLara[i];
-        translations[index] = tl;
+        const { index, key, text, decorations } = toLookupForLara[i];
+        const echoed = isEchoedTranslation(text, tl);
+
+        if (echoed && wordLevel) {
+          retryItems.push({ i, index, key, text, decorations });
+          return;
+        }
+
+        if (echoed) {
+          translations[index] = textsToTranslate[index];
+          console.log(`[translate] echo detected, skipping cache: "${text}"`);
+          return;
+        }
+
+        const finalTranslation = reattachDecorations(tl, decorations);
+        translations[index] = finalTranslation;
         rowsToInsert.push({
           key,
           source_lang: sourceLang,
           target_lang: targetLang,
           original_text: normalizedTexts[index],
-          translated_text: tl,
+          translated_text: finalTranslation,
           domain: validatedDomain,
         });
       });
 
+      if (retryItems.length > 0) {
+        const retryTexts = retryItems.map((r) => r.text);
+        try {
+          const retryResult = await lara.translate(retryTexts, sourceLang, targetLang);
+          mtCalls += retryItems.length;
+          if (Array.isArray(retryResult.translation)) {
+            retryResult.translation.forEach((tl, ri) => {
+              const { index, key, text, decorations } = retryItems[ri];
+              const stillEchoed = isEchoedTranslation(text, tl);
+
+              if (stillEchoed) {
+                translations[index] = textsToTranslate[index];
+                console.log(`[translate] word retry still echoed, skipping: "${text}"`);
+                return;
+              }
+
+              const finalTranslation = reattachDecorations(tl, decorations);
+              translations[index] = finalTranslation;
+              rowsToInsert.push({
+                key,
+                source_lang: sourceLang,
+                target_lang: targetLang,
+                original_text: normalizedTexts[index],
+                translated_text: finalTranslation,
+                domain: validatedDomain,
+              });
+            });
+          }
+        } catch (retryErr) {
+          console.error("[translate] word retry failed:", retryErr.message);
+          retryItems.forEach(({ index }) => {
+            translations[index] = textsToTranslate[index];
+          });
+        }
+      }
+
       await insertTranslations(rowsToInsert);
       console.log(
-        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} hit_rate=${hitRatePct}% db=${dbMs}ms lara=${laraMs}ms total=${Date.now() - requestStart}ms`
+        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} skipped=${skipIndices.size} hit_rate=${hitRatePct}% db=${dbMs}ms lara=${laraMs}ms total=${Date.now() - requestStart}ms`
       );
     } else {
       console.log(
-        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} hit_rate=${hitRatePct}% db=${dbMs}ms total=${Date.now() - requestStart}ms`
+        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} skipped=${skipIndices.size} hit_rate=${hitRatePct}% db=${dbMs}ms total=${Date.now() - requestStart}ms`
       );
     }
 
