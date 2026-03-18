@@ -14,7 +14,7 @@ Do not make assumptions on important decisions — get clarification first.
 
 ## Workflow Steps
 
-### [x] Step: Technical Specification
+### [x] Step: Technical Specification (card-free trial)
 
 Assess the task's difficulty, as underestimating it leads to poor outcomes.
 
@@ -50,7 +50,7 @@ Save to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-9
 
 ---
 
-### [x] Step: Implementation
+### [ ] Step: Implementation (card-free trial)
 
 Implement the task according to the technical specification and general engineering best practices.
 

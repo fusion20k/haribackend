@@ -326,10 +326,6 @@ app.post("/start-trial", async (req, res) => {
 
     const { email, password, payment_method_id } = req.body;
 
-    if (!payment_method_id || typeof payment_method_id !== "string") {
-      return res.status(400).json({ error: "payment_method_id is required" });
-    }
-
     let userId;
     let user;
     let isNewUser = false;
@@ -379,22 +375,38 @@ app.post("/start-trial", async (req, res) => {
       user.stripe_customer_id = customer.id;
     }
 
-    await stripe.paymentMethods.attach(payment_method_id, {
-      customer: user.stripe_customer_id,
-    });
+    if (payment_method_id && typeof payment_method_id === "string") {
+      await stripe.paymentMethods.attach(payment_method_id, {
+        customer: user.stripe_customer_id,
+      });
 
-    await stripe.customers.update(user.stripe_customer_id, {
-      invoice_settings: { default_payment_method: payment_method_id },
-    });
+      await stripe.customers.update(user.stripe_customer_id, {
+        invoice_settings: { default_payment_method: payment_method_id },
+      });
+    }
 
     const trialEndTimestamp = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
-    const subscription = await stripe.subscriptions.create({
+    const subParams = {
       customer: user.stripe_customer_id,
       items: [{ price: process.env.STRIPE_PRICE_ID }],
       trial_end: trialEndTimestamp,
-      default_payment_method: payment_method_id,
-    });
+      trial_settings: {
+        end_behavior: {
+          missing_payment_method: "cancel",
+        },
+      },
+    };
+
+    if (payment_method_id && typeof payment_method_id === "string") {
+      subParams.default_payment_method = payment_method_id;
+    } else {
+      subParams.payment_settings = {
+        save_default_payment_method: "on_subscription",
+      };
+    }
+
+    const subscription = await stripe.subscriptions.create(subParams);
 
     await createSubscription(
       userId,
@@ -508,7 +520,13 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       subscription_data: {
         trial_end: trialEndTimestamp,
         metadata: { userId: user.id.toString() },
+        trial_settings: {
+          end_behavior: {
+            missing_payment_method: "cancel",
+          },
+        },
       },
+      payment_method_collection: "if_required",
       success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
       allow_promotion_codes: true,
