@@ -23,6 +23,8 @@ const {
   incrementUserTrialChars,
   updateUserPlanStatus,
   cancelUserSubscription,
+  getUsage,
+  incrementUsage,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation } = require("./segmentation");
@@ -621,8 +623,9 @@ app.get("/stats", requireAuth, async (req, res) => {
 
 app.get("/usage", async (req, res) => {
   try {
-    const usage = await getMonthlyUsage();
-    res.json(usage);
+    const QUOTA = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10_000_000;
+    const row = await getUsage();
+    res.json({ used: row.current_month_usage_chars, total: QUOTA });
   } catch (err) {
     console.error("/usage error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -710,6 +713,12 @@ app.post("/translate", requireAuth, async (req, res) => {
           trial_chars_limit: charsLimit,
         });
       }
+    }
+
+    const QUOTA = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10_000_000;
+    const usageRow = await getUsage();
+    if (usageRow.current_month_usage_chars + totalChars > QUOTA * 0.95) {
+      return res.status(503).json({ error: "usage_cap_reached" });
     }
 
     const keys = normalizedTexts.map((text) =>
@@ -844,6 +853,12 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
 
       await insertTranslations(rowsToInsert);
+
+      const laraChars = toLookupForLara.reduce((sum, item) => sum + item.text.length, 0);
+      if (laraChars > 0) {
+        await incrementUsage(laraChars);
+      }
+
       console.log(
         `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} skipped=${skipIndices.size} hit_rate=${hitRatePct}% db=${dbMs}ms lara=${laraMs}ms total=${Date.now() - requestStart}ms`
       );

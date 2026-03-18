@@ -96,17 +96,17 @@ Spec saved to `spec.md`. Complexity: **Hard**.
 
 ---
 
-### [ ] Phase 7: Stripe Checkout Trial Flow (extension uses hosted Checkout page)
+### [x] Phase 7: Stripe Checkout Trial Flow (extension uses hosted Checkout page)
 
 **Files**: `index.js`
 
-- [ ] Add `POST /billing/create-trial-checkout-session` endpoint:
+- [x] Add `POST /billing/create-trial-checkout-session` endpoint:
   - Requires auth
   - Creates Stripe Checkout session with `mode: 'subscription'`, `subscription_data.trial_end = now + 365 days` (usage-gated)
   - Passes `userId` in `metadata` so webhook can identify user
   - Returns `{ checkoutUrl }`
-- [ ] Update `checkout.session.completed` webhook handler:
+- [x] Update `checkout.session.completed` webhook handler:
   - Retrieve the subscription from Stripe
   - If `subscription.status === 'trialing'`: call `updateUserTrialStart(userId, subscriptionId)` (sets plan_status='trialing', has_access=true, trial_chars_used=0)
   - If `subscription.status === 'active'` (no trial): call `updateUserPlanStatus(userId, 'active', true, now())`
-- [ ] Commit and push
+- [x] Commit and push (`6c2f134`)

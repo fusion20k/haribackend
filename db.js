@@ -237,6 +237,27 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_usage_created_at ON translation_usage(created_at)
     `);
 
+    const resetDay = parseInt(process.env.LARA_BILLING_RESET_DAY) || 1;
+    const now = new Date();
+    let nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), resetDay));
+    if (nextReset <= now) {
+      nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, resetDay));
+    }
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS usage (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        current_month_usage_chars INTEGER NOT NULL DEFAULT 0,
+        usage_reset_date DATE NOT NULL
+      )
+    `);
+
+    await client.query(`
+      INSERT INTO usage (id, current_month_usage_chars, usage_reset_date)
+      VALUES (1, 0, $1)
+      ON CONFLICT (id) DO NOTHING
+    `, [nextReset.toISOString().split('T')[0]]);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -558,6 +579,63 @@ async function cancelUserSubscription(userId) {
   }
 }
 
+async function resetUsageIfNeeded() {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT current_month_usage_chars, usage_reset_date FROM usage WHERE id = 1"
+    );
+    if (result.rows.length === 0) return null;
+
+    const row = result.rows[0];
+    if (new Date() >= new Date(row.usage_reset_date)) {
+      const resetDay = parseInt(process.env.LARA_BILLING_RESET_DAY) || 1;
+      const now = new Date();
+      let nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), resetDay));
+      if (nextReset <= now) {
+        nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, resetDay));
+      }
+      await client.query(
+        "UPDATE usage SET current_month_usage_chars = 0, usage_reset_date = $1 WHERE id = 1",
+        [nextReset.toISOString().split("T")[0]]
+      );
+      return { current_month_usage_chars: 0, usage_reset_date: nextReset.toISOString().split("T")[0] };
+    }
+
+    return row;
+  } catch (error) {
+    console.error("Error in resetUsageIfNeeded:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function getUsage() {
+  if (!process.env.DATABASE_URL) return { current_month_usage_chars: 0 };
+
+  const row = await resetUsageIfNeeded();
+  return row || { current_month_usage_chars: 0 };
+}
+
+async function incrementUsage(chars) {
+  if (!process.env.DATABASE_URL) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE usage SET current_month_usage_chars = current_month_usage_chars + $1 WHERE id = 1",
+      [chars]
+    );
+  } catch (error) {
+    console.error("Error incrementing usage:", error);
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -576,4 +654,7 @@ module.exports = {
   incrementUserTrialChars,
   updateUserPlanStatus,
   cancelUserSubscription,
+  getUsage,
+  incrementUsage,
+  resetUsageIfNeeded,
 };
