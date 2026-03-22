@@ -50,7 +50,8 @@ Save to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-9
 
 ---
 
-### [ ] Step: Implementation (card-free trial)
+### [x] Step: Implementation (card-free trial)
+### [x] Step: Price update to $16.99
 
 Implement the task according to the technical specification and general engineering best practices.
 

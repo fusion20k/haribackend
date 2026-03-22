@@ -189,6 +189,30 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/checkout-success", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Hari - Success</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0}
+.card{text-align:center;padding:3rem;border-radius:16px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);max-width:420px}
+h1{color:#4ade80;margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
+.icon{font-size:3rem;margin-bottom:1rem}</style></head>
+<body><div class="card"><div class="icon">&#10003;</div><h1>You're all set!</h1>
+<p>Your free trial has started. You can close this tab and return to your browser — Hari is ready to use.</p>
+</div></body></html>`);
+});
+
+app.get("/checkout-cancel", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Hari - Canceled</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0}
+.card{text-align:center;padding:3rem;border-radius:16px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);max-width:420px}
+h1{margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
+.icon{font-size:3rem;margin-bottom:1rem}</style></head>
+<body><div class="card"><div class="icon">&#8617;</div><h1>Checkout canceled</h1>
+<p>No worries — nothing was charged. You can close this tab and try again whenever you're ready.</p>
+</div></body></html>`);
+});
+
 app.get("/debug/me", requireAuth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
@@ -483,8 +507,8 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       subscription_data: {
         metadata: { userId: user.id.toString() },
       },
-      success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
+      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
       allow_promotion_codes: true,
       metadata: { userId: user.id.toString() },
     });
@@ -527,8 +551,8 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
         },
       },
       payment_method_collection: "if_required",
-      success_url: `${process.env.FRONTEND_BASE_URL}/newtab-success.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_BASE_URL}/newtab-cancel.html`,
+      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
       allow_promotion_codes: true,
       metadata: { userId: user.id.toString() },
     });
