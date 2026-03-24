@@ -5,7 +5,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
-const { Credentials, Translator } = require("@translated/lara");
+const axios = require("axios");
 const {
   initDatabase,
   findTranslationsByKeys,
@@ -32,11 +32,35 @@ const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattac
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-const credentials = new Credentials(
-  process.env.LARA_ACCESS_KEY_ID,
-  process.env.LARA_ACCESS_KEY_SECRET
-);
-const lara = new Translator(credentials);
+function mapLangCode(lang) {
+  const MAP = { tl: "fil" };
+  return MAP[lang] || lang;
+}
+
+async function azureTranslate(texts, sourceLang, targetLang) {
+  const from = mapLangCode(sourceLang);
+  const to = mapLangCode(targetLang);
+  const endpoint = process.env.AZURE_ENDPOINT || "https://api.cognitive.microsofttranslator.com";
+  let response;
+  try {
+    response = await axios.post(
+      `${endpoint}/translate?api-version=3.0&from=${from}&to=${to}`,
+      texts.map((text) => ({ Text: text })),
+      {
+        headers: {
+          "Ocp-Apim-Subscription-Key": process.env.AZURE_API_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (axiosErr) {
+    const status = axiosErr.response ? axiosErr.response.status : null;
+    const azureErr = new Error(axiosErr.message);
+    azureErr.azureStatus = status;
+    throw azureErr;
+  }
+  return response.data.map((item) => item.translations[0].text);
+}
 
 app.use(
   cors({
@@ -665,7 +689,7 @@ app.get("/stats", requireAuth, async (req, res) => {
 
 app.get("/usage", async (req, res) => {
   try {
-    const QUOTA = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10_000_000;
+    const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
     const row = await getUsage();
     res.json({ used: row.current_month_usage_chars, total: QUOTA });
   } catch (err) {
@@ -757,7 +781,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
     }
 
-    const QUOTA = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10_000_000;
+    const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
     const usageRow = await getUsage();
     if (usageRow.current_month_usage_chars + totalChars > QUOTA * 0.95) {
       return res.status(503).json({ error: "usage_cap_reached" });
@@ -809,19 +833,13 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (toLookupForLara.length > 0) {
       const textsForLara = toLookupForLara.map((item) => item.text);
 
-      const laraStart = Date.now();
-      const result = await lara.translate(textsForLara, sourceLang, targetLang);
-      const laraMs = Date.now() - laraStart;
-
-      if (!Array.isArray(result.translation)) {
-        return res.status(500).json({ error: "Unexpected Lara response shape" });
-      }
-
-      const newTranslations = result.translation;
+      const azureStart = Date.now();
+      const newTranslations = await azureTranslate(textsForLara, sourceLang, targetLang);
+      const azureMs = Date.now() - azureStart;
 
       if (newTranslations.length !== textsForLara.length) {
         console.error(
-          "Length mismatch from Lara",
+          "Length mismatch from Azure",
           textsForLara.length,
           newTranslations.length
         );
@@ -861,10 +879,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       if (retryItems.length > 0) {
         const retryTexts = retryItems.map((r) => r.text);
         try {
-          const retryResult = await lara.translate(retryTexts, sourceLang, targetLang);
+          const retryTranslations = await azureTranslate(retryTexts, sourceLang, targetLang);
           mtCalls += retryItems.length;
-          if (Array.isArray(retryResult.translation)) {
-            retryResult.translation.forEach((tl, ri) => {
+          if (Array.isArray(retryTranslations)) {
+            retryTranslations.forEach((tl, ri) => {
               const { index, key, text, decorations } = retryItems[ri];
               const stillEchoed = isEchoedTranslation(text, tl);
 
@@ -902,7 +920,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
 
       console.log(
-        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} skipped=${skipIndices.size} hit_rate=${hitRatePct}% db=${dbMs}ms lara=${laraMs}ms total=${Date.now() - requestStart}ms`
+        `[translate] domain=${validatedDomain} total_chunks=${totalChunks} cache_hits=${cacheHits} mt_calls=${mtCalls} skipped=${skipIndices.size} hit_rate=${hitRatePct}% db=${dbMs}ms azure=${azureMs}ms total=${Date.now() - requestStart}ms`
       );
     } else {
       console.log(
@@ -944,11 +962,18 @@ app.post("/translate", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("Internal /translate error", err);
 
-    if (err.constructor.name === "LaraApiError") {
-      return res.status(502).json({
-        error: "Upstream translation error",
-        details: err.message,
-      });
+    if (err.azureStatus != null) {
+      const s = err.azureStatus;
+      if (s === 401 || s === 403) {
+        return res.status(401).json({ error: "Translation service authentication failed" });
+      }
+      if (s === 429) {
+        return res.status(503).json({ error: "Translation service rate limited" });
+      }
+      if (s >= 500 && s < 600) {
+        return res.status(500).json({ error: "Translation service error" });
+      }
+      return res.status(502).json({ error: "Upstream translation error", details: err.message });
     }
 
     return res.status(500).json({ error: "Internal server error" });
@@ -997,7 +1022,7 @@ async function startServer() {
       console.log("Database ready");
     } else {
       console.warn(
-        "WARNING: DATABASE_URL not set - running without cache (will use Lara for every request)"
+        "WARNING: DATABASE_URL not set - running without cache (will use Azure for every request)"
       );
     }
 

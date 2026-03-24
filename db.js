@@ -237,7 +237,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_usage_created_at ON translation_usage(created_at)
     `);
 
-    const resetDay = parseInt(process.env.LARA_BILLING_RESET_DAY) || 1;
+    const resetDay = parseInt(process.env.BILLING_RESET_DAY) || 1;
     const now = new Date();
     let nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), resetDay));
     if (nextReset <= now) {
@@ -591,7 +591,7 @@ async function resetUsageIfNeeded() {
 
     const row = result.rows[0];
     if (new Date() >= new Date(row.usage_reset_date)) {
-      const resetDay = parseInt(process.env.LARA_BILLING_RESET_DAY) || 1;
+      const resetDay = parseInt(process.env.BILLING_RESET_DAY) || 1;
       const now = new Date();
       let nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), resetDay));
       if (nextReset <= now) {

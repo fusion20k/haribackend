@@ -184,7 +184,7 @@ async function getStatsByDomain(daysBack = 7) {
 }
 
 async function getMonthlyUsage() {
-  const total = parseInt(process.env.LARA_MONTHLY_CHAR_LIMIT) || 10000000;
+  const total = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10000000;
 
   if (!process.env.DATABASE_URL) {
     return { used: 0, total, percentage: 0 };
