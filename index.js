@@ -49,6 +49,7 @@ async function azureTranslate(texts, sourceLang, targetLang) {
       {
         headers: {
           "Ocp-Apim-Subscription-Key": process.env.AZURE_API_KEY,
+          "Ocp-Apim-Subscription-Region": process.env.AZURE_REGION || "eastus",
           "Content-Type": "application/json",
         },
       }
