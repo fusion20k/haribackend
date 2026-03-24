@@ -801,7 +801,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     });
 
     const translations = new Array(normalizedTexts.length).fill(null);
-    const toLookupForLara = [];
+    const toTranslate = [];
     const hitStatuses = new Array(normalizedTexts.length).fill(false);
 
     keys.forEach((key, index) => {
@@ -816,7 +816,7 @@ app.post("/translate", requireAuth, async (req, res) => {
         translations[index] = cached;
         hitStatuses[index] = true;
       } else {
-        toLookupForLara.push({
+        toTranslate.push({
           index,
           text: cleanedData[index].cleaned,
           key,
@@ -826,21 +826,21 @@ app.post("/translate", requireAuth, async (req, res) => {
     });
 
     const totalChunks = normalizedTexts.length;
-    const cacheHits = totalChunks - toLookupForLara.length;
-    let mtCalls = toLookupForLara.length;
+    const cacheHits = totalChunks - toTranslate.length;
+    let mtCalls = toTranslate.length;
     const hitRatePct = totalChunks > 0 ? ((cacheHits / totalChunks) * 100).toFixed(1) : "0.0";
 
-    if (toLookupForLara.length > 0) {
-      const textsForLara = toLookupForLara.map((item) => item.text);
+    if (toTranslate.length > 0) {
+      const textsForAzure = toTranslate.map((item) => item.text);
 
       const azureStart = Date.now();
-      const newTranslations = await azureTranslate(textsForLara, sourceLang, targetLang);
+      const newTranslations = await azureTranslate(textsForAzure, sourceLang, targetLang);
       const azureMs = Date.now() - azureStart;
 
-      if (newTranslations.length !== textsForLara.length) {
+      if (newTranslations.length !== textsForAzure.length) {
         console.error(
           "Length mismatch from Azure",
-          textsForLara.length,
+          textsForAzure.length,
           newTranslations.length
         );
         return res.status(500).json({ error: "Translation length mismatch" });
@@ -850,7 +850,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       const rowsToInsert = [];
 
       newTranslations.forEach((tl, i) => {
-        const { index, key, text, decorations } = toLookupForLara[i];
+        const { index, key, text, decorations } = toTranslate[i];
         const echoed = isEchoedTranslation(text, tl);
 
         if (echoed && wordLevel) {
@@ -914,9 +914,9 @@ app.post("/translate", requireAuth, async (req, res) => {
 
       await insertTranslations(rowsToInsert);
 
-      const laraChars = toLookupForLara.reduce((sum, item) => sum + item.text.length, 0);
-      if (laraChars > 0) {
-        await incrementUsage(laraChars);
+      const azureChars = toTranslate.reduce((sum, item) => sum + item.text.length, 0);
+      if (azureChars > 0) {
+        await incrementUsage(azureChars);
       }
 
       console.log(
