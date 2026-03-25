@@ -1,4 +1,5 @@
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 if (process.env.DATABASE_URL) {
   const urlForLog = process.env.DATABASE_URL.replace(
@@ -19,13 +20,7 @@ const pool = new Pool({
 });
 
 function simpleHash(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(16);
+  return crypto.createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
 
 function makeBackendKey(sourceLang, targetLang, normalizedText, domain = "default") {
@@ -258,6 +253,16 @@ async function initDatabase() {
       ON CONFLICT (id) DO NOTHING
     `, [nextReset.toISOString().split('T')[0]]);
 
+    const oldKeyCheck = await client.query(`
+      SELECT 1 FROM translations
+      WHERE key ~ '^[^:]+:[0-9a-f]{1,8}$'
+      LIMIT 1
+    `);
+    if (oldKeyCheck.rows.length > 0) {
+      await client.query(`TRUNCATE translations`);
+      console.log("Cache purged: old-format (weak hash) keys detected and removed.");
+    }
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -274,7 +279,7 @@ async function findTranslationsByKeys(keys) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      `SELECT key, translated_text, hit_count
+      `SELECT key, translated_text, original_text, hit_count
        FROM translations
        WHERE key = ANY($1)`,
       [keys]
@@ -326,7 +331,11 @@ async function insertTranslations(rows) {
     const query = `
       INSERT INTO translations (key, source_lang, target_lang, original_text, translated_text, domain)
       VALUES ${placeholders.join(", ")}
-      ON CONFLICT (key, domain) DO NOTHING
+      ON CONFLICT (key, domain) DO UPDATE SET
+        translated_text = EXCLUDED.translated_text,
+        original_text = EXCLUDED.original_text,
+        hit_count = 0,
+        last_used_at = NOW()
     `;
 
     await client.query(query, values);

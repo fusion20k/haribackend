@@ -798,7 +798,7 @@ app.post("/translate", requireAuth, async (req, res) => {
 
     const existingMap = new Map();
     existingRows.forEach((row) => {
-      existingMap.set(row.key, row.translated_text);
+      existingMap.set(row.key, { translated_text: row.translated_text, original_text: row.original_text });
     });
 
     const translations = new Array(normalizedTexts.length).fill(null);
@@ -814,8 +814,18 @@ app.post("/translate", requireAuth, async (req, res) => {
 
       const cached = existingMap.get(key);
       if (cached) {
-        translations[index] = cached;
-        hitStatuses[index] = true;
+        if (cached.original_text !== normalizedTexts[index]) {
+          console.warn(`Cache original_text mismatch for key ${key}: expected "${normalizedTexts[index]}", got "${cached.original_text}". Treating as cache miss.`);
+          toTranslate.push({
+            index,
+            text: cleanedData[index].cleaned,
+            key,
+            decorations: cleanedData[index],
+          });
+        } else {
+          translations[index] = cached.translated_text;
+          hitStatuses[index] = true;
+        }
       } else {
         toTranslate.push({
           index,

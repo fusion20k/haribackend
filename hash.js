@@ -1,11 +1,7 @@
+const crypto = require("crypto");
+
 function simpleHash(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(16);
+  return crypto.createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
 
 module.exports = { simpleHash };

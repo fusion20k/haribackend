@@ -17,7 +17,8 @@ function normalizeSegment(text) {
     .toLowerCase()
     .trim()
     .replace(/\s+/g, " ")
-    .replace(/[.,!?;:*#\-'"()\[\]{}]+$/, "");
+    .replace(/[.,!?;:*#\-'"()\[\]{}]+$/, "")
+    .trim();
 }
 
 function isUIString(segment) {
