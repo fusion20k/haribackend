@@ -118,8 +118,18 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started: user=${userId} sub=${subscription.id}`);
           } else if (subscription.status === "active") {
+            const userBeforeUpdate = await getUserById(userId);
+            const previousSubscriptionId = userBeforeUpdate ? userBeforeUpdate.subscription_id : null;
             await updateUserPlanStatus(userId, "active", true, new Date(), subscription.id);
             console.log(`Subscription active: user=${userId}`);
+            if (previousSubscriptionId && previousSubscriptionId !== subscription.id) {
+              try {
+                await stripe.subscriptions.cancel(previousSubscriptionId);
+                console.log(`Canceled old sub ${previousSubscriptionId} after upgrade for user=${userId}`);
+              } catch (e) {
+                console.error("Failed to cancel old sub on upgrade:", e.message);
+              }
+            }
           }
         }
         break;
@@ -167,8 +177,14 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
           if (subscription.status === "trialing") {
-            await updateUserTrialStart(subRow.user_id, subscription.id);
-            console.log(`User ${subRow.user_id} set to trialing via subscription.updated`);
+            const prevAttrs = event.data.previous_attributes || {};
+            const statusChanged = prevAttrs.status !== undefined && prevAttrs.status !== "trialing";
+            if (statusChanged) {
+              await updateUserTrialStart(subRow.user_id, subscription.id);
+              console.log(`User ${subRow.user_id} set to trialing via subscription.updated`);
+            } else {
+              console.log(`Sub ${subscription.id} still trialing, skipping trial reset`);
+            }
           } else if (subscription.status === "active") {
             await updateUserPlanStatus(subRow.user_id, "active", true, new Date(), subscription.id);
             console.log(`User ${subRow.user_id} plan set to active`);
@@ -187,8 +203,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
-          await updateUserPlanStatus(subRow.user_id, "canceled", false, null);
-          console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
+          const currentUser = await getUserById(subRow.user_id);
+          if (currentUser && currentUser.subscription_id === subscription.id) {
+            await updateUserPlanStatus(subRow.user_id, "canceled", false, null);
+            console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
+          } else {
+            console.log(`Skipping revoke for user ${subRow.user_id}: current sub differs from deleted sub`);
+          }
         }
         break;
       }
@@ -414,7 +435,7 @@ app.post("/start-trial", async (req, res) => {
       isNewUser = true;
     }
 
-    if (user.plan_status === "trialing" || user.plan_status === "active") {
+    if (user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled") {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -560,7 +581,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (user.plan_status === "trialing" || user.plan_status === "active") {
+    if (user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled") {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
