@@ -118,7 +118,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started: user=${userId} sub=${subscription.id}`);
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(userId, "active", true, new Date());
+            await updateUserPlanStatus(userId, "active", true, new Date(), subscription.id);
             console.log(`Subscription active: user=${userId}`);
           }
         }
@@ -148,7 +148,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started via subscription.created: user=${userId}`);
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(userId, "active", true, new Date());
+            await updateUserPlanStatus(userId, "active", true, new Date(), subscription.id);
             console.log(`Active via subscription.created: user=${userId}`);
           }
         }
@@ -170,7 +170,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserTrialStart(subRow.user_id, subscription.id);
             console.log(`User ${subRow.user_id} set to trialing via subscription.updated`);
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(subRow.user_id, "active", true, new Date());
+            await updateUserPlanStatus(subRow.user_id, "active", true, new Date(), subscription.id);
             console.log(`User ${subRow.user_id} plan set to active`);
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             await updateUserPlanStatus(subRow.user_id, subscription.status, false, null);
@@ -525,6 +525,10 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
+    if (user.plan_status === "active") {
+      return res.status(400).json({ error: "Subscription already active" });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: user.stripe_customer_id,
@@ -633,7 +637,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       await updateUserTrialStart(req.userId, subscription.id);
       console.log(`verify-session: trial activated user=${req.userId} sub=${subscription.id}`);
     } else if (subscription.status === "active") {
-      await updateUserPlanStatus(req.userId, "active", true, new Date());
+      await updateUserPlanStatus(req.userId, "active", true, new Date(), subscription.id);
       console.log(`verify-session: active plan set user=${req.userId}`);
     }
 

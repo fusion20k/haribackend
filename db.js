@@ -543,7 +543,7 @@ async function incrementUserTrialChars(userId, chars) {
   }
 }
 
-async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt) {
+async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, subscriptionId) {
   if (!process.env.DATABASE_URL) throw new Error("Database not configured");
 
   const client = await pool.connect();
@@ -552,10 +552,11 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt) 
       `UPDATE users
        SET plan_status = $1,
            has_access = $2,
-           trial_converted_at = $3
+           trial_converted_at = $3,
+           subscription_id = COALESCE($5, subscription_id)
        WHERE id = $4
-       RETURNING id, email, plan_status, has_access, trial_converted_at`,
-      [planStatus, hasAccess, convertedAt, userId]
+       RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
+      [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
     );
     return result.rows[0] || null;
   } catch (error) {
