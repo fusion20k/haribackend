@@ -504,9 +504,9 @@ async function updateUserTrialStart(userId, subscriptionId) {
     const result = await client.query(
       `UPDATE users
        SET plan_status = 'trialing',
-           trial_chars_used = 0,
+           trial_chars_used = CASE WHEN subscription_id = $1 THEN trial_chars_used ELSE 0 END,
            trial_chars_limit = 10000,
-           trial_started_at = NOW(),
+           trial_started_at = CASE WHEN subscription_id = $1 THEN trial_started_at ELSE NOW() END,
            subscription_id = $1,
            has_access = TRUE
        WHERE id = $2

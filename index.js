@@ -189,8 +189,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserPlanStatus(subRow.user_id, "active", true, new Date(), subscription.id);
             console.log(`User ${subRow.user_id} plan set to active`);
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
-            await updateUserPlanStatus(subRow.user_id, subscription.status, false, null);
-            console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
+            const currentUser = await getUserById(subRow.user_id);
+            if (currentUser && currentUser.subscription_id === subscription.id) {
+              await updateUserPlanStatus(subRow.user_id, subscription.status, false, null);
+              console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
+            } else {
+              console.log(`Skipping revoke for user ${subRow.user_id}: current sub ${currentUser?.subscription_id} differs from updated sub ${subscription.id}`);
+            }
           }
         }
         break;
@@ -466,6 +471,7 @@ app.post("/start-trial", async (req, res) => {
           missing_payment_method: "cancel",
         },
       },
+      metadata: { userId: userId.toString() },
     };
 
     if (payment_method_id && typeof payment_method_id === "string") {
