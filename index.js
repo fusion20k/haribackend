@@ -25,6 +25,7 @@ const {
   cancelUserSubscription,
   getUsage,
   incrementUsage,
+  resetFreeUserCharsIfNeeded,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation } = require("./segmentation");
@@ -304,7 +305,7 @@ function requireAuth(req, res, next) {
 
 async function userHasActiveSubscription(userId) {
   const user = await getUserById(userId);
-  if (user && user.has_access === true) {
+  if (user && (user.has_access === true || user.plan_status === "free")) {
     return true;
   }
 
@@ -318,10 +319,6 @@ async function userHasActiveSubscription(userId) {
 
 app.post("/auth/signup", async (req, res) => {
   try {
-    if (!stripe) {
-      return res.status(503).json({ error: "Payment system not configured" });
-    }
-
     const { email, password } = req.body;
 
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
@@ -339,9 +336,17 @@ app.post("/auth/signup", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const customer = await stripe.customers.create({ email });
+    let stripeCustomerId = null;
+    if (stripe) {
+      try {
+        const customer = await stripe.customers.create({ email });
+        stripeCustomerId = customer.id;
+      } catch (stripeErr) {
+        console.error("Stripe customer creation failed (non-fatal):", stripeErr.message);
+      }
+    }
 
-    const user = await createUser(email, passwordHash, customer.id);
+    const user = await createUser(email, passwordHash, stripeCustomerId);
 
     const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
       expiresIn: "30d",
@@ -350,7 +355,10 @@ app.post("/auth/signup", async (req, res) => {
     res.json({
       token,
       user: { id: user.id, email: user.email },
-      hasAccess: false,
+      hasAccess: true,
+      plan_status: "free",
+      trial_chars_used: 0,
+      trial_chars_limit: 25000,
     });
   } catch (err) {
     console.error("Signup error:", err);
@@ -386,6 +394,9 @@ app.post("/auth/login", async (req, res) => {
       token,
       user: { id: user.id, email: user.email },
       hasAccess,
+      plan_status: user.plan_status || null,
+      trial_chars_used: user.trial_chars_used ?? 0,
+      trial_chars_limit: user.trial_chars_limit ?? 25000,
     });
   } catch (err) {
     console.error("Login error:", err);
@@ -518,12 +529,19 @@ app.post("/start-trial", async (req, res) => {
 
 app.get("/me", requireAuth, async (req, res) => {
   try {
-    const user = await getUserById(req.userId);
+    let user = await getUserById(req.userId);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const hasAccess = await userHasActiveSubscription(req.userId);
+    if (user.plan_status === "free") {
+      const reset = await resetFreeUserCharsIfNeeded(req.userId);
+      if (reset) {
+        user = await getUserById(req.userId);
+      }
+    }
+
+    const hasAccess = user.plan_status === "free" ? true : await userHasActiveSubscription(req.userId);
 
     res.json({
       id: user.id,
@@ -532,7 +550,7 @@ app.get("/me", requireAuth, async (req, res) => {
       has_access: hasAccess,
       plan_status: user.plan_status || null,
       trial_chars_used: user.trial_chars_used ?? 0,
-      trial_chars_limit: user.trial_chars_limit ?? 10000,
+      trial_chars_limit: user.trial_chars_limit ?? 25000,
       trial_started_at: user.trial_started_at || null,
     });
   } catch (err) {
@@ -675,7 +693,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       plan_status: updatedUser ? updatedUser.plan_status : subscription.status,
       has_access: updatedUser ? updatedUser.has_access : true,
       trial_chars_used: updatedUser ? updatedUser.trial_chars_used : 0,
-      trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : 10000,
+      trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : 25000,
     });
   } catch (err) {
     console.error("/billing/verify-session error:", err);
@@ -733,7 +751,7 @@ app.get("/usage", async (req, res) => {
 app.post("/translate", requireAuth, async (req, res) => {
   const requestStart = Date.now();
   try {
-    const user = await getUserById(req.userId);
+    let user = await getUserById(req.userId);
 
     const hasAccess = (user && user.has_access) || (await userHasActiveSubscription(req.userId));
     if (!hasAccess) {
@@ -743,8 +761,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      user.plan_status !== "trialing" &&
-      user.plan_status !== "active"
+      !["free", "trialing", "active"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -800,13 +817,19 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
 
-    if (user && user.plan_status === "trialing") {
+    if (user && ["free", "trialing"].includes(user.plan_status)) {
+      if (user.plan_status === "free") {
+        const reset = await resetFreeUserCharsIfNeeded(req.userId);
+        if (reset) {
+          user = await getUserById(req.userId);
+        }
+      }
       const charsUsed = user.trial_chars_used ?? 0;
-      const charsLimit = user.trial_chars_limit ?? 10000;
+      const charsLimit = user.trial_chars_limit ?? 25000;
       if (charsUsed >= charsLimit) {
         return res.status(402).json({
           error: "trial_exhausted",
-          message: "You have used your 10,000 free trial characters.",
+          message: "You have used your 25,000 free characters.",
           trial_chars_used: charsUsed,
           trial_chars_limit: charsLimit,
         });
@@ -979,10 +1002,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       targetLang
     );
 
-    if (user && user.plan_status === "trialing") {
+    if (user && ["free", "trialing"].includes(user.plan_status)) {
       const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
-        if (stripe && updatedUser.subscription_id) {
+        if (user.plan_status === "trialing" && stripe && updatedUser.subscription_id) {
           try {
             await stripe.subscriptions.update(updatedUser.subscription_id, {
               trial_end: "now",

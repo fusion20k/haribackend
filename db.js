@@ -187,6 +187,34 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'free_chars_reset_date'
+        ) THEN
+          ALTER TABLE users ADD COLUMN free_chars_reset_date DATE;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      UPDATE users
+      SET plan_status = 'free',
+          trial_chars_limit = 25000,
+          free_chars_reset_date = COALESCE(free_chars_reset_date, (NOW() + INTERVAL '30 days')::DATE)
+      WHERE plan_status = 'trialing'
+    `);
+    console.log("Migrated trialing users to free plan");
+
+    await client.query(`
+      UPDATE users
+      SET free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+      WHERE plan_status = 'free' AND free_chars_reset_date IS NULL
+    `);
+    console.log("Seeded free_chars_reset_date for existing free users");
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -353,7 +381,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -371,7 +399,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
@@ -389,7 +417,9 @@ async function createUser(email, passwordHash, stripeCustomerId = null) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "INSERT INTO users (email, password_hash, stripe_customer_id) VALUES ($1, $2, $3) RETURNING id, email, stripe_customer_id, created_at",
+      `INSERT INTO users (email, password_hash, stripe_customer_id, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date)
+       VALUES ($1, $2, $3, 'free', TRUE, 25000, 0, (NOW() + INTERVAL '30 days')::DATE)
+       RETURNING id, email, stripe_customer_id, created_at, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date`,
       [email, passwordHash, stripeCustomerId]
     );
     return result.rows[0];
@@ -505,7 +535,7 @@ async function updateUserTrialStart(userId, subscriptionId) {
       `UPDATE users
        SET plan_status = 'trialing',
            trial_chars_used = CASE WHEN subscription_id = $1 THEN trial_chars_used ELSE 0 END,
-           trial_chars_limit = 10000,
+           trial_chars_limit = 25000,
            trial_started_at = CASE WHEN subscription_id = $1 THEN trial_started_at ELSE NOW() END,
            subscription_id = $1,
            has_access = TRUE
@@ -623,6 +653,41 @@ async function resetUsageIfNeeded() {
   }
 }
 
+async function resetFreeUserCharsIfNeeded(userId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT free_chars_reset_date FROM users WHERE id = $1",
+      [userId]
+    );
+    if (result.rows.length === 0) return null;
+
+    const { free_chars_reset_date } = result.rows[0];
+    if (!free_chars_reset_date) return null;
+
+    if (new Date() >= new Date(free_chars_reset_date)) {
+      const updated = await client.query(
+        `UPDATE users
+         SET trial_chars_used = 0,
+             free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+         WHERE id = $1
+         RETURNING id, email, plan_status, trial_chars_used, trial_chars_limit, free_chars_reset_date, has_access, subscription_id`,
+        [userId]
+      );
+      return updated.rows[0] || null;
+    }
+
+    return null;
+  } catch (error) {
+    console.error("Error in resetFreeUserCharsIfNeeded:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
 async function getUsage() {
   if (!process.env.DATABASE_URL) return { current_month_usage_chars: 0 };
 
@@ -667,4 +732,5 @@ module.exports = {
   getUsage,
   incrementUsage,
   resetUsageIfNeeded,
+  resetFreeUserCharsIfNeeded,
 };
