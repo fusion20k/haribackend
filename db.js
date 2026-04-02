@@ -26,7 +26,7 @@ function simpleHash(str) {
 function makeBackendKey(sourceLang, targetLang, normalizedText, domain = "default") {
   const input = `${sourceLang}|${targetLang}|${normalizedText}`;
   const hash = simpleHash(input);
-  return `${domain}:${hash}`;
+  return `v2:${domain}:${hash}`;
 }
 
 async function initDatabase() {
@@ -289,6 +289,16 @@ async function initDatabase() {
     if (oldKeyCheck.rows.length > 0) {
       await client.query(`TRUNCATE translations`);
       console.log("Cache purged: old-format (weak hash) keys detected and removed.");
+    }
+
+    const preV2KeyCheck = await client.query(`
+      SELECT 1 FROM translations
+      WHERE key NOT LIKE 'v2:%'
+      LIMIT 1
+    `);
+    if (preV2KeyCheck.rows.length > 0) {
+      await client.query(`DELETE FROM translations WHERE key NOT LIKE 'v2:%'`);
+      console.log("Cache purged: pre-v2 keys (decorated cache entries) detected and removed.");
     }
 
     console.log("Database initialized successfully");

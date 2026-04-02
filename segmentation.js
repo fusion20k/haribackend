@@ -151,7 +151,7 @@ function reattachDecorations(translatedClean, decorations) {
 function isEchoedTranslation(cleanInput, cleanOutput) {
   if (typeof cleanInput !== "string" || typeof cleanOutput !== "string") return false;
   const normIn = cleanInput.toLowerCase().trim().replace(/\s+/g, " ");
-  const normOut = cleanOutput.toLowerCase().trim().replace(/\s+/g, " ");
+  const normOut = cleanOutput.replace(EMOJI_REGEX, "").replace(PUNCT_TRIM_REGEX, "").toLowerCase().trim().replace(/\s+/g, " ");
   return normIn === normOut;
 }
 

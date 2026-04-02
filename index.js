@@ -842,8 +842,8 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(503).json({ error: "usage_cap_reached" });
     }
 
-    const keys = normalizedTexts.map((text) =>
-      makeBackendKey(sourceLang, targetLang, text, validatedDomain)
+    const keys = cleanedData.map((cd) =>
+      makeBackendKey(sourceLang, targetLang, cd.cleaned.toLowerCase(), validatedDomain)
     );
 
     const dbStart = Date.now();
@@ -868,8 +868,8 @@ app.post("/translate", requireAuth, async (req, res) => {
 
       const cached = existingMap.get(key);
       if (cached) {
-        if (cached.original_text !== normalizedTexts[index]) {
-          console.warn(`Cache original_text mismatch for key ${key}: expected "${normalizedTexts[index]}", got "${cached.original_text}". Treating as cache miss.`);
+        if (cached.original_text !== cleanedData[index].cleaned.toLowerCase()) {
+          console.warn(`Cache original_text mismatch for key ${key}: expected "${cleanedData[index].cleaned.toLowerCase()}", got "${cached.original_text}". Treating as cache miss.`);
           toTranslate.push({
             index,
             text: cleanedData[index].cleaned,
@@ -877,7 +877,7 @@ app.post("/translate", requireAuth, async (req, res) => {
             decorations: cleanedData[index],
           });
         } else {
-          translations[index] = cached.translated_text;
+          translations[index] = reattachDecorations(cached.translated_text, cleanedData[index]);
           hitStatuses[index] = true;
         }
       } else {
@@ -935,8 +935,8 @@ app.post("/translate", requireAuth, async (req, res) => {
           key,
           source_lang: sourceLang,
           target_lang: targetLang,
-          original_text: normalizedTexts[index],
-          translated_text: finalTranslation,
+          original_text: decorations.cleaned.toLowerCase(),
+          translated_text: tl,
           domain: validatedDomain,
         });
       });
@@ -963,8 +963,8 @@ app.post("/translate", requireAuth, async (req, res) => {
                 key,
                 source_lang: sourceLang,
                 target_lang: targetLang,
-                original_text: normalizedTexts[index],
-                translated_text: finalTranslation,
+                original_text: decorations.cleaned.toLowerCase(),
+                translated_text: tl,
                 domain: validatedDomain,
               });
             });

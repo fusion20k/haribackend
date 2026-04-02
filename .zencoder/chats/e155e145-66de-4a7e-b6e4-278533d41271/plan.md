@@ -14,7 +14,7 @@ Do not make assumptions on important decisions — get clarification first.
 
 ## Workflow Steps
 
-### [x] Step: Technical Specification (card-free trial)
+### [x] Step: Technical Specification
 
 Assess the task's difficulty, as underestimating it leads to poor outcomes.
 
@@ -30,7 +30,7 @@ Create a technical specification for the task that is appropriate for the comple
 - Define any necessary data model, API, or interface changes.
 - Describe verification steps using the project's test and lint commands.
 
-Save the output to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-97f4-6fa3021ff4fd/spec.md` with:
+Save the output to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\e155e145-66de-4a7e-b6e4-278533d41271/spec.md` with:
 
 - Technical context (language, dependencies)
 - Implementation approach
@@ -38,7 +38,7 @@ Save the output to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-
 - Data model / API / interface changes
 - Verification approach
 
-If the task is complex enough, create a detailed implementation plan based on `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-97f4-6fa3021ff4fd/spec.md`:
+If the task is complex enough, create a detailed implementation plan based on `c:\Users\david\Desktop\HariBackend\.zencoder\chats\e155e145-66de-4a7e-b6e4-278533d41271/spec.md`:
 
 - Break down the work into concrete tasks (incrementable, testable milestones)
 - Each task should reference relevant contracts and include verification steps
@@ -46,13 +46,13 @@ If the task is complex enough, create a detailed implementation plan based on `c
 
 Rule of thumb for step size: each step should represent a coherent unit of work (e.g., implement a component, add an API endpoint, write tests for a module). Avoid steps that are too granular (single function).
 
-Save to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-97f4-6fa3021ff4fd/plan.md`. If the feature is trivial and doesn't warrant this breakdown, keep the Implementation step below as is.
+Save to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\e155e145-66de-4a7e-b6e4-278533d41271/plan.md`. If the feature is trivial and doesn't warrant this breakdown, keep the Implementation step below as is.
+
+**Stop here.** Present the specification (and plan, if created) to the user and wait for their confirmation before proceeding.
 
 ---
 
-### [x] Step: Implementation (card-free trial)
-### [x] Step: Price update to $16.99
-### [x] Step: Fix Stripe checkout redirect (DNS_PROBE error)
+### [x] Step: Implementation
 
 Implement the task according to the technical specification and general engineering best practices.
 
@@ -60,7 +60,7 @@ Implement the task according to the technical specification and general engineer
 2. Implement the required changes in the codebase.
 3. Add and run relevant tests and linters.
 4. Perform basic manual verification if applicable.
-5. After completion, write a report to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\6118cb22-55a4-41a9-97f4-6fa3021ff4fd/report.md` describing:
+5. After completion, write a report to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\e155e145-66de-4a7e-b6e4-278533d41271/report.md` describing:
    - What was implemented
    - How the solution was tested
    - The biggest issues or challenges encountered
