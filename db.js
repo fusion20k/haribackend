@@ -199,6 +199,18 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'stripe_item_id'
+        ) THEN
+          ALTER TABLE users ADD COLUMN stripe_item_id VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       UPDATE users
       SET plan_status = 'free',
           trial_chars_limit = 25000,
@@ -412,7 +424,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -430,7 +442,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
@@ -737,6 +749,33 @@ async function resetUserCharsIfNeeded(userId) {
   }
 }
 
+async function activatePaygPlan(userId, subscriptionId, stripeItemId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = 'payg',
+           has_access = TRUE,
+           trial_chars_used = 0,
+           trial_chars_limit = 20000000,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
+           subscription_id = $1,
+           stripe_item_id = $2
+       WHERE id = $3
+       RETURNING id, email, plan_status, has_access, subscription_id, stripe_item_id, trial_chars_used, trial_chars_limit`,
+      [subscriptionId, stripeItemId, userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error activating PAYG plan:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function getUsage() {
   if (!process.env.DATABASE_URL) return { current_month_usage_chars: 0 };
 
@@ -778,6 +817,7 @@ module.exports = {
   incrementUserTrialChars,
   updateUserPlanStatus,
   cancelUserSubscription,
+  activatePaygPlan,
   getUsage,
   incrementUsage,
   resetUsageIfNeeded,

@@ -23,6 +23,7 @@ const {
   incrementUserTrialChars,
   updateUserPlanStatus,
   cancelUserSubscription,
+  activatePaygPlan,
   getUsage,
   incrementUsage,
   resetUserCharsIfNeeded,
@@ -115,7 +116,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             console.error("checkout.session.completed: createSubscription error (non-fatal):", dbErr.message);
           }
 
-          if (subscription.status === "trialing") {
+          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+
+          if (isPayg && subscription.status === "active") {
+            const stripeItemId = subscription.items.data[0].id;
+            await activatePaygPlan(userId, subscription.id, stripeItemId);
+            console.log(`PAYG activated: user=${userId} sub=${subscription.id} item=${stripeItemId}`);
+          } else if (subscription.status === "trialing") {
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started: user=${userId} sub=${subscription.id}`);
           } else if (subscription.status === "active") {
@@ -155,7 +162,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             console.error("customer.subscription.created: createSubscription error (non-fatal):", dbErr.message);
           }
 
-          if (subscription.status === "trialing") {
+          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+
+          if (isPayg && subscription.status === "active") {
+            const stripeItemId = subscription.items.data[0].id;
+            await activatePaygPlan(userId, subscription.id, stripeItemId);
+            console.log(`PAYG activated via subscription.created: user=${userId} sub=${subscription.id} item=${stripeItemId}`);
+          } else if (subscription.status === "trialing") {
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started via subscription.created: user=${userId}`);
           } else if (subscription.status === "active") {
@@ -177,6 +190,8 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
+          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+
           if (subscription.status === "trialing") {
             const prevAttrs = event.data.previous_attributes || {};
             const statusChanged = prevAttrs.status !== undefined && prevAttrs.status !== "trialing";
@@ -187,8 +202,14 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
               console.log(`Sub ${subscription.id} still trialing, skipping trial reset`);
             }
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(subRow.user_id, "pre", true, new Date(), subscription.id);
-            console.log(`User ${subRow.user_id} plan set to active`);
+            if (isPayg) {
+              const stripeItemId = subscription.items.data[0].id;
+              await activatePaygPlan(subRow.user_id, subscription.id, stripeItemId);
+              console.log(`PAYG activated via subscription.updated: user=${subRow.user_id} sub=${subscription.id} item=${stripeItemId}`);
+            } else {
+              await updateUserPlanStatus(subRow.user_id, "pre", true, new Date(), subscription.id);
+              console.log(`User ${subRow.user_id} plan set to active`);
+            }
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             const currentUser = await getUserById(subRow.user_id);
             if (currentUser && currentUser.subscription_id === subscription.id) {
@@ -534,7 +555,7 @@ app.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    if (["free", "pre"].includes(user.plan_status)) {
+    if (["free", "pre", "payg"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) {
         user = await getUserById(req.userId);
@@ -543,7 +564,7 @@ app.get("/me", requireAuth, async (req, res) => {
 
     const hasAccess = user.plan_status === "free" ? true : await userHasActiveSubscription(req.userId);
 
-    res.json({
+    const meResponse = {
       id: user.id,
       email: user.email,
       hasAccess,
@@ -552,7 +573,14 @@ app.get("/me", requireAuth, async (req, res) => {
       trial_chars_used: user.trial_chars_used ?? 0,
       trial_chars_limit: user.trial_chars_limit ?? 25000,
       trial_started_at: user.trial_started_at || null,
-    });
+    };
+
+    if (user.plan_status === "payg") {
+      meResponse.payg_chars_used = user.trial_chars_used ?? 0;
+      meResponse.payg_chars_limit = user.trial_chars_limit ?? 20000000;
+    }
+
+    res.json(meResponse);
   } catch (err) {
     console.error("/me error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -704,6 +732,41 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
+    const user = await getUserById(req.userId);
+    if (!user || !user.stripe_customer_id) {
+      return res.status(400).json({ error: "Missing Stripe customer" });
+    }
+
+    if (user.plan_status === "payg") {
+      return res.status(400).json({ error: "Already on PAYG plan" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: user.stripe_customer_id,
+      line_items: [{ price: process.env.STRIPE_PAYG_PRICE_ID }],
+      subscription_data: {
+        metadata: { userId: user.id.toString() },
+      },
+      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
+      allow_promotion_codes: true,
+      metadata: { userId: user.id.toString() },
+    });
+
+    res.json({ checkoutUrl: session.url });
+  } catch (err) {
+    console.error("PAYG checkout session error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.get("/stats", requireAuth, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
@@ -761,7 +824,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre"].includes(user.plan_status)
+      !["free", "active", "pre", "payg"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -841,6 +904,13 @@ app.post("/translate", requireAuth, async (req, res) => {
           trial_chars_used: charsUsed,
           trial_chars_limit: charsLimit,
         });
+      }
+    }
+
+    if (user && user.plan_status === "payg") {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) {
+        user = await getUserById(req.userId);
       }
     }
 
@@ -1009,6 +1079,37 @@ app.post("/translate", requireAuth, async (req, res) => {
       sourceLang,
       targetLang
     );
+
+    if (user && user.plan_status === "payg") {
+      await incrementUserTrialChars(req.userId, totalChars);
+
+      const freshUser = await getUserById(req.userId);
+      if (freshUser?.stripe_item_id && stripe) {
+        setImmediate(async () => {
+          try {
+            await stripe.subscriptionItems.createUsageRecord(
+              freshUser.stripe_item_id,
+              { quantity: totalChars, timestamp: "now", action: "increment" }
+            );
+          } catch (e) {
+            console.error("PAYG Stripe usage report failed (non-fatal):", e.message);
+          }
+        });
+      }
+
+      const charsUsedBefore = user.trial_chars_used ?? 0;
+      const updatedCharsUsed = charsUsedBefore + totalChars;
+      const softLimit = user.trial_chars_limit ?? 20_000_000;
+      const paygResponse = {
+        translations,
+        payg_chars_used: updatedCharsUsed,
+        payg_chars_limit: softLimit,
+      };
+      if (updatedCharsUsed >= softLimit) {
+        paygResponse.payg_soft_limit_warning = "You have exceeded the 20M character soft limit. Contact support if needed.";
+      }
+      return res.json(paygResponse);
+    }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
       const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
