@@ -767,6 +767,112 @@ app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) 
   }
 });
 
+app.post("/billing/switch-plan", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
+    const { targetPlan } = req.body;
+    if (!["pre", "payg"].includes(targetPlan)) {
+      return res.status(400).json({ error: "targetPlan must be 'pre' or 'payg'" });
+    }
+
+    const user = await getUserById(req.userId);
+    if (!user || !user.stripe_customer_id) {
+      return res.status(400).json({ error: "Missing Stripe customer" });
+    }
+
+    if (user.plan_status === targetPlan) {
+      return res.status(400).json({ error: `Already on ${targetPlan} plan` });
+    }
+
+    if (!["pre", "active", "payg"].includes(user.plan_status)) {
+      return res.status(400).json({ error: "No active subscription to switch from. Subscribe first." });
+    }
+
+    const subscriptionId = user.subscription_id;
+    if (subscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(subscriptionId);
+      } catch (e) {
+        console.error("Failed to cancel old subscription during switch:", e.message);
+      }
+    } else {
+      const subRow = await getLatestSubscriptionForUser(req.userId);
+      if (subRow && subRow.stripe_subscription_id) {
+        try {
+          await stripe.subscriptions.cancel(subRow.stripe_subscription_id);
+        } catch (e) {
+          console.error("Failed to cancel old subscription during switch:", e.message);
+        }
+      }
+    }
+
+    await cancelUserSubscription(req.userId);
+
+    const priceId = targetPlan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID : process.env.STRIPE_PRICE_ID;
+    const lineItems = targetPlan === "payg"
+      ? [{ price: priceId }]
+      : [{ price: priceId, quantity: 1 }];
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: user.stripe_customer_id,
+      line_items: lineItems,
+      subscription_data: {
+        metadata: { userId: user.id.toString() },
+      },
+      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
+      allow_promotion_codes: true,
+      metadata: { userId: user.id.toString() },
+    });
+
+    res.json({ checkoutUrl: session.url });
+  } catch (err) {
+    console.error("/billing/switch-plan error:", err);
+    if (err.type && err.type.startsWith("Stripe")) {
+      return res.status(402).json({ error: err.message });
+    }
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/billing/cancel-subscription", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: "Payment system not configured" });
+    }
+
+    const user = await getUserById(req.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const subscriptionId = user.subscription_id;
+    if (!subscriptionId) {
+      const subRow = await getLatestSubscriptionForUser(req.userId);
+      if (!subRow || !subRow.stripe_subscription_id) {
+        return res.status(400).json({ error: "No active subscription found" });
+      }
+      await stripe.subscriptions.cancel(subRow.stripe_subscription_id);
+    } else {
+      await stripe.subscriptions.cancel(subscriptionId);
+    }
+
+    await cancelUserSubscription(req.userId);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("/billing/cancel-subscription error:", err);
+    if (err.type && err.type.startsWith("Stripe")) {
+      return res.status(402).json({ error: err.message });
+    }
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.get("/stats", requireAuth, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
