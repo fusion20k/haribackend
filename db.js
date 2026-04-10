@@ -224,6 +224,18 @@ async function initDatabase() {
     console.log("Migrated existing active users to premium char limits");
 
     await client.query(`
+      UPDATE users
+      SET plan_status = 'free',
+          has_access = TRUE,
+          trial_chars_limit = 25000,
+          trial_chars_used = 0,
+          free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
+          subscription_id = NULL
+      WHERE plan_status = 'canceled'
+    `);
+    console.log("Migrated canceled users to free plan");
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -552,10 +564,7 @@ async function updateUserTrialStart(userId, subscriptionId) {
   try {
     const result = await client.query(
       `UPDATE users
-       SET plan_status = 'trialing',
-           trial_chars_used = CASE WHEN subscription_id = $1 THEN trial_chars_used ELSE 0 END,
-           trial_chars_limit = 25000,
-           trial_started_at = CASE WHEN subscription_id = $1 THEN trial_started_at ELSE NOW() END,
+       SET plan_status = 'free',
            subscription_id = $1,
            has_access = TRUE
        WHERE id = $2
@@ -598,7 +607,7 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, 
   const client = await pool.connect();
   try {
     let result;
-    if (planStatus === 'active') {
+    if (planStatus === 'pre') {
       result = await client.query(
         `UPDATE users
          SET plan_status = $1,
@@ -606,8 +615,8 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, 
              trial_converted_at = $3,
              subscription_id = COALESCE($5, subscription_id),
              trial_chars_limit = 1000000,
-             trial_chars_used = CASE WHEN plan_status != 'active' THEN 0 ELSE trial_chars_used END,
-             free_chars_reset_date = CASE WHEN plan_status != 'active' THEN (NOW() + INTERVAL '30 days')::DATE ELSE free_chars_reset_date END
+             trial_chars_used = CASE WHEN plan_status != 'pre' THEN 0 ELSE trial_chars_used END,
+             free_chars_reset_date = CASE WHEN plan_status != 'pre' THEN (NOW() + INTERVAL '30 days')::DATE ELSE free_chars_reset_date END
          WHERE id = $4
          RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
         [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
@@ -640,8 +649,12 @@ async function cancelUserSubscription(userId) {
   try {
     const result = await client.query(
       `UPDATE users
-       SET plan_status = 'canceled',
-           has_access = FALSE
+       SET plan_status = 'free',
+           has_access = TRUE,
+           trial_chars_limit = 25000,
+           trial_chars_used = 0,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
+           subscription_id = NULL
        WHERE id = $1
        RETURNING id, email, plan_status, has_access`,
       [userId]

@@ -121,7 +121,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           } else if (subscription.status === "active") {
             const userBeforeUpdate = await getUserById(userId);
             const previousSubscriptionId = userBeforeUpdate ? userBeforeUpdate.subscription_id : null;
-            await updateUserPlanStatus(userId, "active", true, new Date(), subscription.id);
+            await updateUserPlanStatus(userId, "pre", true, new Date(), subscription.id);
             console.log(`Subscription active: user=${userId}`);
             if (previousSubscriptionId && previousSubscriptionId !== subscription.id) {
               try {
@@ -159,7 +159,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             await updateUserTrialStart(userId, subscription.id);
             console.log(`Trial started via subscription.created: user=${userId}`);
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(userId, "active", true, new Date(), subscription.id);
+            await updateUserPlanStatus(userId, "pre", true, new Date(), subscription.id);
             console.log(`Active via subscription.created: user=${userId}`);
           }
         }
@@ -187,12 +187,12 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
               console.log(`Sub ${subscription.id} still trialing, skipping trial reset`);
             }
           } else if (subscription.status === "active") {
-            await updateUserPlanStatus(subRow.user_id, "active", true, new Date(), subscription.id);
+            await updateUserPlanStatus(subRow.user_id, "pre", true, new Date(), subscription.id);
             console.log(`User ${subRow.user_id} plan set to active`);
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             const currentUser = await getUserById(subRow.user_id);
             if (currentUser && currentUser.subscription_id === subscription.id) {
-              await updateUserPlanStatus(subRow.user_id, subscription.status, false, null);
+              await cancelUserSubscription(subRow.user_id);
               console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
             } else {
               console.log(`Skipping revoke for user ${subRow.user_id}: current sub ${currentUser?.subscription_id} differs from updated sub ${subscription.id}`);
@@ -211,7 +211,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         if (subRow) {
           const currentUser = await getUserById(subRow.user_id);
           if (currentUser && currentUser.subscription_id === subscription.id) {
-            await updateUserPlanStatus(subRow.user_id, "canceled", false, null);
+            await cancelUserSubscription(subRow.user_id);
             console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
           } else {
             console.log(`Skipping revoke for user ${subRow.user_id}: current sub differs from deleted sub`);
@@ -451,7 +451,7 @@ app.post("/start-trial", async (req, res) => {
       isNewUser = true;
     }
 
-    if (user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled") {
+    if (["pre", "active"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -534,7 +534,7 @@ app.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    if (user.plan_status === "free" || user.plan_status === "active") {
+    if (["free", "pre"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) {
         user = await getUserById(req.userId);
@@ -570,7 +570,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (user.plan_status === "active") {
+    if (["active", "pre"].includes(user.plan_status)) {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
@@ -605,7 +605,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled") {
+    if (["pre", "active"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -682,7 +682,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       await updateUserTrialStart(req.userId, subscription.id);
       console.log(`verify-session: trial activated user=${req.userId} sub=${subscription.id}`);
     } else if (subscription.status === "active") {
-      await updateUserPlanStatus(req.userId, "active", true, new Date(), subscription.id);
+      await updateUserPlanStatus(req.userId, "pre", true, new Date(), subscription.id);
       console.log(`verify-session: active plan set user=${req.userId}`);
     }
 
@@ -761,7 +761,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "trialing", "active"].includes(user.plan_status)
+      !["free", "active", "pre"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -817,8 +817,8 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
 
-    if (user && ["free", "trialing", "active"].includes(user.plan_status)) {
-      if (user.plan_status === "free" || user.plan_status === "active") {
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      if (["free", "pre"].includes(user.plan_status)) {
         const reset = await resetUserCharsIfNeeded(req.userId);
         if (reset) {
           user = await getUserById(req.userId);
@@ -827,7 +827,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       const charsUsed = user.trial_chars_used ?? 0;
       const charsLimit = user.trial_chars_limit ?? 25000;
       if (charsUsed >= charsLimit) {
-        if (user.plan_status === "active") {
+        if (user.plan_status === "pre") {
           return res.status(402).json({
             error: "monthly_limit_reached",
             message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
@@ -1010,10 +1010,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       targetLang
     );
 
-    if (user && ["free", "trialing", "active"].includes(user.plan_status)) {
+    if (user && ["free", "pre"].includes(user.plan_status)) {
       const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
-        if (user.plan_status === "trialing" && stripe && updatedUser.subscription_id) {
+        if (user.plan_status === "free" && stripe && updatedUser.subscription_id) {
           try {
             await stripe.subscriptions.update(updatedUser.subscription_id, {
               trial_end: "now",
