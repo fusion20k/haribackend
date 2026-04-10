@@ -1084,17 +1084,23 @@ app.post("/translate", requireAuth, async (req, res) => {
       await incrementUserTrialChars(req.userId, totalChars);
 
       const freshUser = await getUserById(req.userId);
-      if (freshUser?.stripe_item_id && stripe) {
-        setImmediate(async () => {
-          try {
-            await stripe.subscriptionItems.createUsageRecord(
-              freshUser.stripe_item_id,
-              { quantity: totalChars, timestamp: "now", action: "increment" }
-            );
-          } catch (e) {
-            console.error("PAYG Stripe usage report failed (non-fatal):", e.message);
-          }
-        });
+      if (freshUser?.stripe_customer_id && stripe) {
+        const charsToReport = Math.ceil(totalChars / 1000);
+        if (charsToReport > 0) {
+          setImmediate(async () => {
+            try {
+              await stripe.billing.meterEvents.create({
+                event_name: "translation_chars",
+                payload: {
+                  value: String(charsToReport),
+                  stripe_customer_id: freshUser.stripe_customer_id,
+                },
+              });
+            } catch (e) {
+              console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+            }
+          });
+        }
       }
 
       const charsUsedBefore = user.trial_chars_used ?? 0;
