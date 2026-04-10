@@ -215,6 +215,15 @@ async function initDatabase() {
     console.log("Seeded free_chars_reset_date for existing free users");
 
     await client.query(`
+      UPDATE users
+      SET trial_chars_limit = 1000000,
+          free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+      WHERE plan_status = 'active'
+        AND (trial_chars_limit != 1000000 OR free_chars_reset_date IS NULL)
+    `);
+    console.log("Migrated existing active users to premium char limits");
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -588,16 +597,33 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, 
 
   const client = await pool.connect();
   try {
-    const result = await client.query(
-      `UPDATE users
-       SET plan_status = $1,
-           has_access = $2,
-           trial_converted_at = $3,
-           subscription_id = COALESCE($5, subscription_id)
-       WHERE id = $4
-       RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
-      [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
-    );
+    let result;
+    if (planStatus === 'active') {
+      result = await client.query(
+        `UPDATE users
+         SET plan_status = $1,
+             has_access = $2,
+             trial_converted_at = $3,
+             subscription_id = COALESCE($5, subscription_id),
+             trial_chars_limit = 1000000,
+             trial_chars_used = CASE WHEN plan_status != 'active' THEN 0 ELSE trial_chars_used END,
+             free_chars_reset_date = CASE WHEN plan_status != 'active' THEN (NOW() + INTERVAL '30 days')::DATE ELSE free_chars_reset_date END
+         WHERE id = $4
+         RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
+        [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
+      );
+    } else {
+      result = await client.query(
+        `UPDATE users
+         SET plan_status = $1,
+             has_access = $2,
+             trial_converted_at = $3,
+             subscription_id = COALESCE($5, subscription_id)
+         WHERE id = $4
+         RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
+        [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
+      );
+    }
     return result.rows[0] || null;
   } catch (error) {
     console.error("Error updating user plan status:", error);
@@ -663,7 +689,7 @@ async function resetUsageIfNeeded() {
   }
 }
 
-async function resetFreeUserCharsIfNeeded(userId) {
+async function resetUserCharsIfNeeded(userId) {
   if (!process.env.DATABASE_URL) return null;
 
   const client = await pool.connect();
@@ -691,7 +717,7 @@ async function resetFreeUserCharsIfNeeded(userId) {
 
     return null;
   } catch (error) {
-    console.error("Error in resetFreeUserCharsIfNeeded:", error);
+    console.error("Error in resetUserCharsIfNeeded:", error);
     return null;
   } finally {
     client.release();
@@ -742,5 +768,5 @@ module.exports = {
   getUsage,
   incrementUsage,
   resetUsageIfNeeded,
-  resetFreeUserCharsIfNeeded,
+  resetUserCharsIfNeeded,
 };

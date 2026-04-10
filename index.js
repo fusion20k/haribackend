@@ -25,7 +25,7 @@ const {
   cancelUserSubscription,
   getUsage,
   incrementUsage,
-  resetFreeUserCharsIfNeeded,
+  resetUserCharsIfNeeded,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation } = require("./segmentation");
@@ -534,8 +534,8 @@ app.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    if (user.plan_status === "free") {
-      const reset = await resetFreeUserCharsIfNeeded(req.userId);
+    if (user.plan_status === "free" || user.plan_status === "active") {
+      const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) {
         user = await getUserById(req.userId);
       }
@@ -817,9 +817,9 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
     }
 
-    if (user && ["free", "trialing"].includes(user.plan_status)) {
-      if (user.plan_status === "free") {
-        const reset = await resetFreeUserCharsIfNeeded(req.userId);
+    if (user && ["free", "trialing", "active"].includes(user.plan_status)) {
+      if (user.plan_status === "free" || user.plan_status === "active") {
+        const reset = await resetUserCharsIfNeeded(req.userId);
         if (reset) {
           user = await getUserById(req.userId);
         }
@@ -827,6 +827,14 @@ app.post("/translate", requireAuth, async (req, res) => {
       const charsUsed = user.trial_chars_used ?? 0;
       const charsLimit = user.trial_chars_limit ?? 25000;
       if (charsUsed >= charsLimit) {
+        if (user.plan_status === "active") {
+          return res.status(402).json({
+            error: "monthly_limit_reached",
+            message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
+            trial_chars_used: charsUsed,
+            trial_chars_limit: charsLimit,
+          });
+        }
         return res.status(402).json({
           error: "trial_exhausted",
           message: "You have used your 25,000 free characters.",
@@ -1002,7 +1010,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       targetLang
     );
 
-    if (user && ["free", "trialing"].includes(user.plan_status)) {
+    if (user && ["free", "trialing", "active"].includes(user.plan_status)) {
       const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
         if (user.plan_status === "trialing" && stripe && updatedUser.subscription_id) {
