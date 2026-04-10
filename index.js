@@ -747,10 +747,15 @@ app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) 
       return res.status(400).json({ error: "Already on PAYG plan" });
     }
 
+    const paygPriceId = process.env.STRIPE_PAYG_PRICE_ID || (req.body && req.body.priceId);
+    if (!paygPriceId || typeof paygPriceId !== "string" || !paygPriceId.startsWith("price_")) {
+      return res.status(503).json({ error: "PAYG price not configured" });
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: user.stripe_customer_id,
-      line_items: [{ price: process.env.STRIPE_PAYG_PRICE_ID }],
+      line_items: [{ price: paygPriceId }],
       subscription_data: {
         metadata: { userId: user.id.toString() },
       },
