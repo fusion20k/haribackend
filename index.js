@@ -270,7 +270,7 @@ app.get("/checkout-success", (req, res) => {
 h1{color:#4ade80;margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
 .icon{font-size:3rem;margin-bottom:1rem}</style></head>
 <body><div class="card"><div class="icon">&#10003;</div><h1>You're all set!</h1>
-<p>Your free trial has started. You can close this tab and return to your browser — Hari is ready to use.</p>
+<p>Your subscription is active. You can close this tab and return to your browser — Hari is ready to use.</p>
 </div></body></html>`);
 });
 
