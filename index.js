@@ -472,7 +472,7 @@ app.post("/start-trial", async (req, res) => {
       isNewUser = true;
     }
 
-    if (["pre", "active"].includes(user.plan_status) || !!user.subscription_id) {
+    if (["pre", "active", "payg"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -706,12 +706,21 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       console.error("verify-session: createSubscription error (non-fatal):", dbErr.message);
     }
 
+    const paygPriceId = process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH";
+    const isPayg = subscription.items?.data[0]?.price?.id === paygPriceId;
+
     if (subscription.status === "trialing") {
       await updateUserTrialStart(req.userId, subscription.id);
       console.log(`verify-session: trial activated user=${req.userId} sub=${subscription.id}`);
     } else if (subscription.status === "active") {
-      await updateUserPlanStatus(req.userId, "pre", true, new Date(), subscription.id);
-      console.log(`verify-session: active plan set user=${req.userId}`);
+      if (isPayg) {
+        const stripeItemId = subscription.items.data[0].id;
+        await activatePaygPlan(req.userId, subscription.id, stripeItemId);
+        console.log(`verify-session: PAYG activated user=${req.userId} sub=${subscription.id} item=${stripeItemId}`);
+      } else {
+        await updateUserPlanStatus(req.userId, "pre", true, new Date(), subscription.id);
+        console.log(`verify-session: active plan set user=${req.userId}`);
+      }
     }
 
     const updatedUser = await getUserById(req.userId);
@@ -844,7 +853,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/billing/cancel-subscription", requireAuth, async (req, res) => {
+async function handleCancelSubscription(req, res) {
   try {
     if (!stripe) {
       return res.status(503).json({ error: "Payment system not configured" });
@@ -868,7 +877,7 @@ app.post("/billing/cancel-subscription", requireAuth, async (req, res) => {
 
     await cancelUserSubscription(req.userId);
 
-    res.json({ success: true });
+    res.json({ success: true, message: "Subscription canceled" });
   } catch (err) {
     console.error("/billing/cancel-subscription error:", err);
     if (err.type && err.type.startsWith("Stripe")) {
@@ -876,7 +885,9 @@ app.post("/billing/cancel-subscription", requireAuth, async (req, res) => {
     }
     res.status(500).json({ error: "Internal server error" });
   }
-});
+}
+
+app.post("/billing/cancel-subscription", requireAuth, handleCancelSubscription);
 
 app.get("/stats", requireAuth, async (req, res) => {
   try {
@@ -1271,39 +1282,7 @@ app.post("/translate", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/cancel-subscription", requireAuth, async (req, res) => {
-  try {
-    if (!stripe) {
-      return res.status(503).json({ error: "Payment system not configured" });
-    }
-
-    const user = await getUserById(req.userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const subscriptionId = user.subscription_id;
-    if (!subscriptionId) {
-      const subRow = await getLatestSubscriptionForUser(req.userId);
-      if (!subRow || !subRow.stripe_subscription_id) {
-        return res.status(400).json({ error: "No active subscription found" });
-      }
-      await stripe.subscriptions.cancel(subRow.stripe_subscription_id);
-    } else {
-      await stripe.subscriptions.cancel(subscriptionId);
-    }
-
-    await cancelUserSubscription(req.userId);
-
-    res.json({ success: true, message: "Subscription canceled" });
-  } catch (err) {
-    console.error("/cancel-subscription error:", err);
-    if (err.type && err.type.startsWith("Stripe")) {
-      return res.status(402).json({ error: err.message });
-    }
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+app.post("/cancel-subscription", requireAuth, handleCancelSubscription);
 
 async function startServer() {
   try {

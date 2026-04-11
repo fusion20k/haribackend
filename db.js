@@ -578,7 +578,8 @@ async function updateUserTrialStart(userId, subscriptionId) {
       `UPDATE users
        SET plan_status = 'free',
            subscription_id = $1,
-           has_access = TRUE
+           has_access = TRUE,
+           trial_started_at = COALESCE(trial_started_at, NOW())
        WHERE id = $2
        RETURNING id, email, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, has_access`,
       [subscriptionId, userId]
@@ -666,7 +667,8 @@ async function cancelUserSubscription(userId) {
            trial_chars_limit = 25000,
            trial_chars_used = 0,
            free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
-           subscription_id = NULL
+           subscription_id = NULL,
+           stripe_item_id = NULL
        WHERE id = $1
        RETURNING id, email, plan_status, has_access`,
       [userId]
