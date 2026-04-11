@@ -639,9 +639,10 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, 
              has_access = $2,
              trial_converted_at = $3,
              subscription_id = COALESCE($5, subscription_id),
-             trial_chars_limit = 1000000
+             trial_chars_limit = 1000000,
+             chars_used_at_payg_start = trial_chars_used
          WHERE id = $4
-         RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id`,
+         RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id, chars_used_at_payg_start`,
         [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
       );
     } else {
