@@ -598,7 +598,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (["active", "pre"].includes(user.plan_status)) {
+    if (["active", "pre", "payg"].includes(user.plan_status)) {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
@@ -752,8 +752,8 @@ app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) 
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (user.plan_status === "payg") {
-      return res.status(400).json({ error: "Already on PAYG plan" });
+    if (["pre", "active", "payg"].includes(user.plan_status)) {
+      return res.status(400).json({ error: "Already on a paid plan. Use switch-plan to change." });
     }
 
     const paygPriceId = process.env.STRIPE_PAYG_PRICE_ID || (req.body && req.body.priceId);
@@ -864,15 +864,48 @@ async function handleCancelSubscription(req, res) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const subscriptionId = user.subscription_id;
-    if (!subscriptionId) {
+    if (user.plan_status === "free" && !user.subscription_id) {
+      return res.json({ success: true, message: "Already on free plan" });
+    }
+
+    let subscriptionIdToCancel = user.subscription_id;
+
+    if (!subscriptionIdToCancel) {
       const subRow = await getLatestSubscriptionForUser(req.userId);
-      if (!subRow || !subRow.stripe_subscription_id) {
-        return res.status(400).json({ error: "No active subscription found" });
+      if (subRow && subRow.stripe_subscription_id) {
+        subscriptionIdToCancel = subRow.stripe_subscription_id;
       }
-      await stripe.subscriptions.cancel(subRow.stripe_subscription_id);
+    }
+
+    if (!subscriptionIdToCancel && user.stripe_customer_id) {
+      try {
+        const stripeList = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: "active",
+          limit: 1,
+        });
+        if (stripeList.data.length > 0) {
+          subscriptionIdToCancel = stripeList.data[0].id;
+        }
+      } catch (listErr) {
+        console.error("Stripe subscriptions.list fallback failed (non-fatal):", listErr.message);
+      }
+    }
+
+    if (subscriptionIdToCancel) {
+      try {
+        await stripe.subscriptions.cancel(subscriptionIdToCancel);
+      } catch (stripeErr) {
+        const code = stripeErr.code || "";
+        const alreadyGone = code === "resource_missing" || stripeErr.statusCode === 404 || (stripeErr.message && stripeErr.message.toLowerCase().includes("no such subscription"));
+        if (alreadyGone) {
+          console.log(`Stripe sub ${subscriptionIdToCancel} already canceled/missing — continuing with local DB update`);
+        } else {
+          throw stripeErr;
+        }
+      }
     } else {
-      await stripe.subscriptions.cancel(subscriptionId);
+      console.log(`No Stripe subscription found for user=${req.userId} — proceeding with local DB update only`);
     }
 
     await cancelUserSubscription(req.userId);

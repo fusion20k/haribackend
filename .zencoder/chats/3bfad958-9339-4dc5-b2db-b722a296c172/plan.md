@@ -52,58 +52,79 @@ Save to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\3bfad958-9339-4dc5-b
 
 ---
 
-### [x] Step: db.js — Schema migrations and new DB functions
+### [x] Step: Implement `db.js` changes
 
-Modify `db.js`:
+Modify `db.js` with all database-layer changes per spec:
 
-1. In `initDatabase()`, add idempotent migrations:
-   - Add `free_chars_reset_date DATE` column to `users` if missing.
-   - Migrate all `plan_status = 'trialing'` users → `'free'`, set `trial_chars_limit = 25000`, seed `free_chars_reset_date` to next calendar month start.
-   - Seed `free_chars_reset_date` for any existing `plan_status = 'free'` users where it is NULL.
-2. Update `createUser()` INSERT to also set `plan_status = 'free'`, `has_access = TRUE`, `trial_chars_limit = 25000`, `trial_chars_used = 0`, `free_chars_reset_date = next month start`.
-3. Add new exported function `resetFreeUserCharsIfNeeded(userId)`: if today >= `free_chars_reset_date`, reset `trial_chars_used = 0` and advance `free_chars_reset_date` by one calendar month; return updated row or null.
-4. Add `free_chars_reset_date` to the SELECT list in `getUserById` and `getUserByEmail`.
-5. Update `updateUserTrialStart()` hardcoded `trial_chars_limit = 10000` → `25000`.
+1. **`updateUserTrialStart`**: Change SQL to set `plan_status = 'free'`, store `subscription_id`, set `has_access = TRUE`. Remove changes to `trial_chars_limit`, `trial_chars_used`, `trial_started_at`, and `free_chars_reset_date`.
 
-Verification: server starts without error; migration log messages appear; `createUser` sets correct defaults.
+2. **`updateUserPlanStatus`**: Remove the special `if (planStatus === 'active')` branch. Add a new `if (planStatus === 'pre')` branch with `trial_chars_limit = 1000000` and conditional resets of `trial_chars_used` and `free_chars_reset_date` (only when transitioning from non-`pre`). The `'active'` case falls through to the generic branch unchanged.
 
----
+3. **`cancelUserSubscription`**: Replace `plan_status = 'canceled', has_access = FALSE` with a full reset to `free` (25K limit, 0 used, 30-day reset date, `subscription_id = NULL`).
 
-### [x] Step: index.js — Access gate, /auth/signup, /me
+4. **`initDatabase`**: Add a migration after the existing `trialing → free` migration that converts all `plan_status = 'canceled'` users to `free` with `has_access = TRUE`, `trial_chars_limit = 25000`, `trial_chars_used = 0`, `free_chars_reset_date = NOW() + 30 days`, `subscription_id = NULL`. Add a `console.log` for it.
 
-Modify `index.js`:
-
-1. Import `resetFreeUserCharsIfNeeded` from `./db`.
-2. `userHasActiveSubscription()`: add `"free"` as an access-granting condition (user with `plan_status === "free"` always has access).
-3. `POST /auth/signup`:
-   - Remove the hard `if (!stripe) return 503` guard — Stripe is now optional at signup (still create Stripe customer if configured, but don't block).
-   - Return `hasAccess: true`, `plan_status: "free"`, `trial_chars_used: 0`, `trial_chars_limit: 25000` in the response body.
-4. `GET /me`:
-   - Call `resetFreeUserCharsIfNeeded(req.userId)` when `user.plan_status === "free"` and re-fetch user if a reset occurred.
-   - Return `hasAccess: true` for free-plan users.
-   - Change fallback `trial_chars_limit ?? 10000` → `?? 25000`.
-
-Verification: new signup response matches spec; `/me` for free user returns correct fields.
+Verification: Start server, confirm DB init logs success including the new canceled-users migration line.
 
 ---
 
-### [x] Step: index.js — /translate free plan support
+### [x] Step: Implement `index.js` — Stripe webhook handlers
 
-Modify `POST /translate` in `index.js`:
+Modify the four Stripe webhook event handlers in `index.js`:
 
-1. Extend the access gate to allow `plan_status === "free"` (alongside `"trialing"` and `"active"`).
-2. For `"free"` (and `"trialing"`) users: call `resetFreeUserCharsIfNeeded` before the char exhaustion check; re-read `trial_chars_used`/`trial_chars_limit` from the returned row if a reset happened.
-3. Extend the exhaustion check from `=== "trialing"` to `["free", "trialing"].includes(user.plan_status)`. Update the error message to reference 25,000 characters. Do **not** attempt to cancel a Stripe subscription for `"free"` users.
-4. Extend the post-translation char increment block from `=== "trialing"` to `["free", "trialing"].includes(user.plan_status)`. Keep the Stripe `trial_end: "now"` call guarded by `user.plan_status === "trialing"`.
-5. Fix `billing/verify-session` stale fallback: `trial_chars_limit: 10000` → `25000`.
+1. **`checkout.session.completed`**: In the `subscription.status === "active"` branch, change `updateUserPlanStatus(userId, "active", ...)` → `updateUserPlanStatus(userId, "pre", ...)`. The `"trialing"` branch already calls `updateUserTrialStart` — no change needed.
 
-Verification: free-plan user can translate; chars increment; exhaustion returns 402 `trial_exhausted`; active user gets unlimited translations; global quota gate unchanged.
+2. **`customer.subscription.created`**: Same pattern — change `"active"` → `"pre"` in the `updateUserPlanStatus` call.
+
+3. **`customer.subscription.updated`**: 
+   - Change `"active"` → `"pre"` in the `updateUserPlanStatus` call.
+   - In the `["canceled", "unpaid", "past_due"]` branch, replace `updateUserPlanStatus(subRow.user_id, subscription.status, false, null)` with `cancelUserSubscription(subRow.user_id)`.
+
+4. **`customer.subscription.deleted`**: Replace `updateUserPlanStatus(subRow.user_id, "canceled", false, null)` with `cancelUserSubscription(subRow.user_id)`.
+
+Verification: Confirm `cancelUserSubscription` is already destructured from `./db` at the top of `index.js` (it is). No import changes needed.
 
 ---
 
-### [x] Step: Final verification and report
+### [x] Step: Implement `index.js` — endpoint guards and access logic
 
-1. Start server locally (`node index.js`) — confirm no startup errors and migration log lines appear.
-2. Manually verify the three key flows (new signup, free translate + exhaustion, active user translate).
-3. Commit all changes.
-4. Write report to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\3bfad958-9339-4dc5-b2db-b722a296c172/report.md`.
+Update all endpoint-level guard conditions and access checks in `index.js`:
+
+1. **`/billing/verify-session`**: In the `subscription.status === "active"` branch, change `updateUserPlanStatus(req.userId, "active", ...)` → `updateUserPlanStatus(req.userId, "pre", ...)`.
+
+2. **`/start-trial`**: Change guard from `user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled"` to `["pre", "active"].includes(user.plan_status) || !!user.subscription_id`.
+
+3. **`/billing/create-checkout-session`**: Change `if (user.plan_status === "active")` → `if (["active", "pre"].includes(user.plan_status))`.
+
+4. **`/billing/create-trial-checkout-session`**: Change guard from `user.plan_status === "trialing" || user.plan_status === "active" || user.plan_status === "canceled"` to `["pre", "active"].includes(user.plan_status) || !!user.subscription_id`.
+
+5. **`/me`**: Change char reset condition from `user.plan_status === "free" || user.plan_status === "active"` to `["free", "pre"].includes(user.plan_status)`.
+
+---
+
+### [x] Step: Implement `index.js` — `/translate` endpoint
+
+Update all plan-status checks inside the `/translate` handler:
+
+1. **Allow-list check**: `!["free", "trialing", "active"].includes(user.plan_status)` → `!["free", "active", "pre"].includes(user.plan_status)`
+
+2. **Char reset trigger**: `if (user.plan_status === "free" || user.plan_status === "active")` → `if (["free", "pre"].includes(user.plan_status))`
+
+3. **Char tracking block entry**: `if (user && ["free", "trialing", "active"].includes(user.plan_status))` → `if (user && ["free", "pre"].includes(user.plan_status))`
+
+4. **Inside char tracking block**:
+   - `monthly_limit_reached` sub-check: `if (user.plan_status === "active")` → `if (user.plan_status === "pre")`
+   - Early Stripe trial-end: `if (user.plan_status === "trialing" && stripe && updatedUser.subscription_id)` → `if (user.plan_status === "free" && stripe && updatedUser.subscription_id)`
+
+Verification: Read through the entire `/translate` handler after changes to confirm no remaining references to `"trialing"` or the old `"active"`-as-premium logic.
+
+---
+
+### [x] Step: Final review and report
+
+1. Search `index.js` and `db.js` for any remaining references to `"trialing"` or `"canceled"` that should have been updated. Confirm only legitimate uses remain (e.g., the `trialing → free` migration in `initDatabase`, logging strings, Stripe status string comparisons that correctly route to `updateUserTrialStart`).
+2. Start the server with `node index.js` and confirm clean startup with no errors.
+3. Write a report to `c:\Users\david\Desktop\HariBackend\.zencoder\chats\3bfad958-9339-4dc5-b2db-b722a296c172/report.md` describing:
+   - What was implemented
+   - How the solution was tested
+   - The biggest issues or challenges encountered
