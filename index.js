@@ -302,6 +302,7 @@ app.get("/debug/me", requireAuth, async (req, res) => {
         trial_chars_used: user.trial_chars_used,
         trial_chars_limit: user.trial_chars_limit,
         subscription_id: user.subscription_id,
+        chars_used_at_payg_start: user.chars_used_at_payg_start,
       } : null,
       hasAccessResult: hasAccess,
       latestSubscription: sub || null,
@@ -576,7 +577,7 @@ app.get("/me", requireAuth, async (req, res) => {
     };
 
     if (user.plan_status === "payg") {
-      meResponse.payg_chars_used = user.trial_chars_used ?? 0;
+      meResponse.payg_chars_used = (user.trial_chars_used ?? 0) - (user.chars_used_at_payg_start ?? 0);
       meResponse.payg_chars_limit = user.trial_chars_limit ?? 20000000;
     }
 
@@ -1260,10 +1261,11 @@ app.post("/translate", requireAuth, async (req, res) => {
 
       const charsUsedBefore = user.trial_chars_used ?? 0;
       const updatedCharsUsed = charsUsedBefore + totalChars;
+      const paygBaseline = user.chars_used_at_payg_start ?? 0;
       const softLimit = user.trial_chars_limit ?? 20_000_000;
       const paygResponse = {
         translations,
-        payg_chars_used: updatedCharsUsed,
+        payg_chars_used: updatedCharsUsed - paygBaseline,
         payg_chars_limit: softLimit,
       };
       if (updatedCharsUsed >= softLimit) {
