@@ -29,7 +29,7 @@ const {
   resetUserCharsIfNeeded,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
-const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation } = require("./segmentation");
+const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -1194,6 +1194,12 @@ app.post("/translate", requireAuth, async (req, res) => {
           return;
         }
 
+        if (!isValidTranslation(text, tl)) {
+          translations[index] = textsToTranslate[index];
+          console.warn(`[translate] placeholder leak detected, falling back: "${text}" → "${tl}"`);
+          return;
+        }
+
         const finalTranslation = reattachDecorations(tl, decorations);
         translations[index] = finalTranslation;
         rowsToInsert.push({
@@ -1219,6 +1225,12 @@ app.post("/translate", requireAuth, async (req, res) => {
               if (stillEchoed) {
                 translations[index] = textsToTranslate[index];
                 console.log(`[translate] word retry still echoed, skipping: "${text}"`);
+                return;
+              }
+
+              if (!isValidTranslation(text, tl)) {
+                translations[index] = textsToTranslate[index];
+                console.warn(`[translate] placeholder leak detected on retry, falling back: "${text}" → "${tl}"`);
                 return;
               }
 

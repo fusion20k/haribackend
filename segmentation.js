@@ -155,6 +155,14 @@ function isEchoedTranslation(cleanInput, cleanOutput) {
   return normIn === normOut;
 }
 
+function isValidTranslation(inputText, outputText) {
+  if (typeof inputText !== "string" || typeof outputText !== "string") return false;
+  if (/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b/.test(outputText)) return false;
+  if (/\*[A-Z0-9_]+\*/.test(outputText)) return false;
+  if (outputText.length > inputText.length * 8 && outputText.length > 100) return false;
+  return true;
+}
+
 module.exports = {
   normalizeSegment,
   isUIString,
@@ -167,4 +175,5 @@ module.exports = {
   isTranslatable,
   reattachDecorations,
   isEchoedTranslation,
+  isValidTranslation,
 };
