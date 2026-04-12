@@ -75,11 +75,11 @@ async function llmDictionary(word, english, context) {
       messages: [
         {
           role: "system",
-          content: "You are a Tagalog language expert. Always respond with valid JSON only.",
+          content: "You are a Tagalog language expert. Always respond in English with valid JSON only. All field values must be in English except where Tagalog text is explicitly required (tagalog, pronunciation, example.tl, and wordBreakdown[].tagalog fields).",
         },
         {
           role: "user",
-          content: `Given the Tagalog word "${word}" (English: "${english}", context: "${context}"), provide a dictionary entry as JSON with exactly these fields:\n{\n  "tagalog": string,\n  "pronunciation": string,\n  "partOfSpeech": string,\n  "englishTranslation": string,\n  "example": { "tl": string, "en": string },\n  "culturalNotes": string,\n  "wordBreakdown": [{ "tagalog": string, "english": string, "pos": string }]\n}`,
+          content: `Given the Tagalog word "${word}" (English: "${english}", context: "${context}"), provide a dictionary entry as JSON with exactly these fields:\n{\n  "tagalog": string,\n  "pronunciation": string (syllable-broken, e.g. "ma-gan-da"),\n  "partOfSpeech": string (in English, e.g. "noun", "verb", "adjective"),\n  "englishTranslation": string (in English),\n  "example": { "tl": string (Tagalog sentence), "en": string (English translation) },\n  "culturalNotes": string (in English),\n  "wordBreakdown": [{ "tagalog": string, "english": string (in English), "pos": string (in English, e.g. "noun", "verb", "particle") }]\n}`,
         },
       ],
       response_format: { type: "json_object" },
