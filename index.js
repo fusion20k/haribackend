@@ -65,6 +65,37 @@ async function azureTranslate(texts, sourceLang, targetLang) {
   return response.data.map((item) => item.translations[0].text);
 }
 
+async function llmDictionary(word, english, context) {
+  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const apiKey = process.env.AZURE_OPENAI_KEY;
+  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+  const response = await axios.post(
+    `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-12-01-preview`,
+    {
+      messages: [
+        {
+          role: "system",
+          content: "You are a Tagalog language expert. Always respond with valid JSON only.",
+        },
+        {
+          role: "user",
+          content: `Given the Tagalog word "${word}" (English: "${english}", context: "${context}"), provide a dictionary entry as JSON with exactly these fields:\n{\n  "tagalog": string,\n  "pronunciation": string,\n  "partOfSpeech": string,\n  "englishTranslation": string,\n  "example": { "tl": string, "en": string },\n  "culturalNotes": string,\n  "wordBreakdown": [{ "tagalog": string, "english": string, "pos": string }]\n}`,
+        },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    },
+    {
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  const content = response.data.choices[0].message.content;
+  return JSON.parse(content);
+}
+
 app.use(
   cors({
     origin: "*",
@@ -1318,6 +1349,125 @@ app.post("/translate", requireAuth, async (req, res) => {
 });
 
 app.post("/cancel-subscription", requireAuth, handleCancelSubscription);
+
+app.post("/dictionary", requireAuth, async (req, res) => {
+  try {
+    let user = await getUserById(req.userId);
+
+    const hasAccess = (user && user.has_access) || (await userHasActiveSubscription(req.userId));
+    if (!hasAccess) {
+      return res.status(402).json({ error: "Subscription required" });
+    }
+
+    if (
+      user &&
+      user.plan_status &&
+      !["free", "active", "pre", "payg"].includes(user.plan_status)
+    ) {
+      return res.status(402).json({ error: "no_access" });
+    }
+
+    const { word, english, context } = req.body;
+
+    if (!word || typeof word !== "string" || word.trim() === "" ||
+        !english || typeof english !== "string" || english.trim() === "") {
+      return res.status(400).json({ error: "word and english are required" });
+    }
+
+    const contextStr = typeof context === "string" ? context : "";
+    const totalChars = word.length + english.length + contextStr.length;
+
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) {
+        user = await getUserById(req.userId);
+      }
+      const charsUsed = user.trial_chars_used ?? 0;
+      const charsLimit = user.trial_chars_limit ?? 25000;
+      if (charsUsed >= charsLimit) {
+        if (user.plan_status === "pre") {
+          return res.status(402).json({
+            error: "monthly_limit_reached",
+            message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
+            trial_chars_used: charsUsed,
+            trial_chars_limit: charsLimit,
+          });
+        }
+        return res.status(402).json({
+          error: "trial_exhausted",
+          message: "You have used your 25,000 free characters.",
+          trial_chars_used: charsUsed,
+          trial_chars_limit: charsLimit,
+        });
+      }
+    }
+
+    if (user && user.plan_status === "payg") {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) {
+        user = await getUserById(req.userId);
+      }
+    }
+
+    let entry;
+    try {
+      entry = await llmDictionary(word.trim(), english.trim(), contextStr.trim());
+    } catch (llmErr) {
+      console.error("[dictionary] LLM error:", llmErr.message);
+      return res.status(500).json({ error: "dictionary_unavailable" });
+    }
+
+    if (user && user.plan_status === "payg") {
+      await incrementUserTrialChars(req.userId, totalChars);
+      const freshUser = await getUserById(req.userId);
+      if (freshUser?.stripe_customer_id && stripe) {
+        const charsToReport = Math.ceil(totalChars / 1000);
+        if (charsToReport > 0) {
+          setImmediate(async () => {
+            try {
+              await stripe.billing.meterEvents.create({
+                event_name: "translation_chars",
+                payload: {
+                  value: String(charsToReport),
+                  stripe_customer_id: freshUser.stripe_customer_id,
+                },
+              });
+            } catch (e) {
+              console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+            }
+          });
+        }
+      }
+      const charsUsedBefore = user.trial_chars_used ?? 0;
+      const updatedCharsUsed = charsUsedBefore + totalChars;
+      const paygBaseline = user.chars_used_at_payg_start ?? 0;
+      const softLimit = user.trial_chars_limit ?? 20_000_000;
+      const paygResponse = {
+        ...entry,
+        payg_chars_used: updatedCharsUsed - paygBaseline,
+        payg_chars_limit: softLimit,
+      };
+      if (updatedCharsUsed >= softLimit) {
+        paygResponse.payg_soft_limit_warning = "You have exceeded the 20M character soft limit. Contact support if needed.";
+      }
+      return res.json(paygResponse);
+    }
+
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
+      return res.json({
+        ...entry,
+        trial_chars_used: updatedUser ? updatedUser.trial_chars_used : null,
+        trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : null,
+      });
+    }
+
+    return res.json(entry);
+  } catch (err) {
+    console.error("[dictionary] error:", err);
+    return res.status(500).json({ error: "dictionary_unavailable" });
+  }
+});
 
 async function startServer() {
   try {
