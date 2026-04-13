@@ -358,6 +358,18 @@ async function initDatabase() {
       console.log(`Cache purged: ${phraseDelete.rowCount} phrase-level (multi-word) entries removed.`);
     }
 
+    const badEntriesCheck = await client.query(`
+      SELECT 1 FROM translations
+      WHERE translated_text LIKE '%*%' OR translated_text LIKE '%<%' OR translated_text LIKE '%http%'
+      LIMIT 1
+    `);
+    if (badEntriesCheck.rows.length > 0) {
+      const badEntriesDelete = await client.query(`
+        DELETE FROM translations WHERE translated_text LIKE '%*%' OR translated_text LIKE '%<%' OR translated_text LIKE '%http%'
+      `);
+      console.log(`Cache purged: ${badEntriesDelete.rowCount} bad cached entries (containing *, <, or http) removed.`);
+    }
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);

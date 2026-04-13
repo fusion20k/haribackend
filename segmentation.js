@@ -162,6 +162,20 @@ function isEchoedTranslation(cleanInput, cleanOutput) {
 
 function isValidTranslation(inputText, outputText) {
   if (typeof inputText !== "string" || typeof outputText !== "string") return false;
+  if (outputText.trim().length === 0) return false;
+  if (/<[a-zA-Z]/.test(outputText) || /https?:\/\//.test(outputText)) return false;
+  if (/â€|Ã[^\s]|Â[^\s]/.test(outputText)) return false;
+  if (outputText.includes("*") && !inputText.includes("*")) return false;
+  const inputWordCount = inputText.trim().split(/\s+/).filter(Boolean).length;
+  const outputWords = outputText.trim().split(/\s+/).filter(Boolean);
+  if (
+    inputWordCount === 1 &&
+    outputWords.length >= 3 &&
+    outputWords.every(w => /^[A-Z][a-z]*$/.test(w)) &&
+    /^[\x00-\x7F]+$/.test(outputText)
+  ) {
+    return false;
+  }
   if (/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}\b/.test(outputText)) return false;
   if (/\*[A-Z0-9_]+\*/.test(outputText)) return false;
   if (outputText.length > inputText.length * 8 && outputText.length > 100) return false;
