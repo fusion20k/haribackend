@@ -1431,7 +1431,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
+      const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
         if (user.plan_status === "free" && stripe && updatedUser.subscription_id) {
           try {
