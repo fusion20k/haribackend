@@ -664,11 +664,16 @@ async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, 
              trial_converted_at = $3,
              subscription_id = COALESCE($5, subscription_id),
              trial_chars_limit = 1000000,
-             chars_used_at_payg_start = trial_chars_used
+             chars_used_at_payg_start = trial_chars_used,
+             free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
          WHERE id = $4
+           AND NOT (plan_status = 'pre' AND subscription_id = COALESCE($5, subscription_id))
          RETURNING id, email, plan_status, has_access, trial_converted_at, subscription_id, chars_used_at_payg_start`,
         [planStatus, hasAccess, convertedAt, userId, subscriptionId || null]
       );
+      if (result.rowCount === 0) {
+        console.warn(`updateUserPlanStatus: idempotency guard fired for userId=${userId}, already on pre with same subscription`);
+      }
     } else {
       result = await client.query(
         `UPDATE users
@@ -700,8 +705,9 @@ async function cancelUserSubscription(userId) {
        SET plan_status = 'free',
            has_access = TRUE,
            trial_chars_limit = 25000,
-           trial_chars_used = chars_used_at_payg_start,
+           trial_chars_used = 0,
            chars_used_at_payg_start = 0,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
            subscription_id = NULL,
            stripe_item_id = NULL
        WHERE id = $1
@@ -799,11 +805,16 @@ async function activatePaygPlan(userId, subscriptionId, stripeItemId) {
            chars_used_at_payg_start = trial_chars_used,
            trial_chars_limit = 20000000,
            subscription_id = $1,
-           stripe_item_id = $2
+           stripe_item_id = $2,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
        WHERE id = $3
+         AND NOT (plan_status = 'payg' AND subscription_id = $1)
        RETURNING id, email, plan_status, has_access, subscription_id, stripe_item_id, trial_chars_used, trial_chars_limit, chars_used_at_payg_start`,
       [subscriptionId, stripeItemId, userId]
     );
+    if (result.rowCount === 0) {
+      console.warn(`activatePaygPlan: idempotency guard fired for userId=${userId}, already on payg with same subscription`);
+    }
     return result.rows[0] || null;
   } catch (error) {
     console.error("Error activating PAYG plan:", error);

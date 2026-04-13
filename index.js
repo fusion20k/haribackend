@@ -271,7 +271,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             }
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             const currentUser = await getUserById(subRow.user_id);
-            if (currentUser && currentUser.subscription_id === subscription.id) {
+            if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
               await cancelUserSubscription(subRow.user_id);
               console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
             } else {
@@ -290,7 +290,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
           const currentUser = await getUserById(subRow.user_id);
-          if (currentUser && currentUser.subscription_id === subscription.id) {
+          if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
             await cancelUserSubscription(subRow.user_id);
             console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
           } else {
@@ -633,6 +633,7 @@ app.get("/me", requireAuth, async (req, res) => {
       trial_chars_used: user.trial_chars_used ?? 0,
       trial_chars_limit: user.trial_chars_limit ?? 25000,
       trial_started_at: user.trial_started_at || null,
+      free_chars_reset_date: user.free_chars_reset_date || null,
     };
 
     if (user.plan_status === "payg") {
@@ -658,7 +659,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (["active", "pre", "payg"].includes(user.plan_status)) {
+    if (["active", "pre", "payg"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
@@ -693,7 +694,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (["pre", "active"].includes(user.plan_status) || !!user.subscription_id) {
+    if (["pre", "active", "payg"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -882,8 +883,6 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
         }
       }
     }
-
-    await cancelUserSubscription(req.userId);
 
     const priceId = targetPlan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID : process.env.STRIPE_PRICE_ID;
     const lineItems = targetPlan === "payg"
