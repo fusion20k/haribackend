@@ -346,6 +346,18 @@ async function initDatabase() {
       console.log("Cache purged: pre-v2 keys (decorated cache entries) detected and removed.");
     }
 
+    const phraseCheck = await client.query(`
+      SELECT 1 FROM translations
+      WHERE original_text LIKE '% %'
+      LIMIT 1
+    `);
+    if (phraseCheck.rows.length > 0) {
+      const phraseDelete = await client.query(`
+        DELETE FROM translations WHERE original_text LIKE '% %'
+      `);
+      console.log(`Cache purged: ${phraseDelete.rowCount} phrase-level (multi-word) entries removed.`);
+    }
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);

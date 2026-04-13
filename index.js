@@ -29,7 +29,7 @@ const {
   resetUserCharsIfNeeded,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
-const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
+const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -63,6 +63,34 @@ async function azureTranslate(texts, sourceLang, targetLang) {
     throw azureErr;
   }
   return response.data.map((item) => item.translations[0].text);
+}
+
+async function azureDictionaryLookup(words, sourceLang, targetLang) {
+  const from = mapLangCode(sourceLang);
+  const to = mapLangCode(targetLang);
+  const endpoint = process.env.AZURE_ENDPOINT || "https://api.cognitive.microsofttranslator.com";
+  let response;
+  try {
+    response = await axios.post(
+      `${endpoint}/dictionary/lookup?api-version=3.0&from=${from}&to=${to}`,
+      words.map((word) => ({ Text: word })),
+      {
+        headers: {
+          "Ocp-Apim-Subscription-Key": process.env.AZURE_API_KEY,
+          "Ocp-Apim-Subscription-Region": process.env.AZURE_REGION || "eastus",
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (axiosErr) {
+    const status = axiosErr.response ? axiosErr.response.status : null;
+    const azureErr = new Error(axiosErr.message);
+    azureErr.azureStatus = status;
+    throw azureErr;
+  }
+  return response.data.map((item) =>
+    item.translations && item.translations.length > 0 ? item.translations[0].normalizedTarget : null
+  );
 }
 
 async function llmDictionary(word, english, context) {
@@ -1062,6 +1090,13 @@ app.post("/translate", requireAuth, async (req, res) => {
       }
     }
 
+    const multiWordIndices = new Set();
+    for (let i = 0; i < cleanedData.length; i++) {
+      if (!skipIndices.has(i) && isMultiWord(cleanedData[i].cleaned)) {
+        multiWordIndices.add(i);
+      }
+    }
+
     const totalChars = normalizedTexts.reduce((sum, s) => sum + s.length, 0);
     if (totalChars > 8000) {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
@@ -1111,8 +1146,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       makeBackendKey(sourceLang, targetLang, cd.cleaned.toLowerCase(), validatedDomain)
     );
 
+    const singleWordKeys = keys.filter((_, i) => !multiWordIndices.has(i));
+
     const dbStart = Date.now();
-    const existingRows = await findTranslationsByKeys(keys);
+    const existingRows = await findTranslationsByKeys(singleWordKeys);
     const dbMs = Date.now() - dbStart;
 
     const existingMap = new Map();
@@ -1128,6 +1165,16 @@ app.post("/translate", requireAuth, async (req, res) => {
       if (skipIndices.has(index)) {
         translations[index] = textsToTranslate[index];
         hitStatuses[index] = true;
+        return;
+      }
+
+      if (multiWordIndices.has(index)) {
+        toTranslate.push({
+          index,
+          text: cleanedData[index].cleaned,
+          key,
+          decorations: cleanedData[index],
+        });
         return;
       }
 
@@ -1178,9 +1225,11 @@ app.post("/translate", requireAuth, async (req, res) => {
 
       const retryItems = [];
       const rowsToInsert = [];
+      const dictLookupItems = [];
 
       newTranslations.forEach((tl, i) => {
         const { index, key, text, decorations } = toTranslate[i];
+        const isSingleWord = !multiWordIndices.has(index);
         const echoed = isEchoedTranslation(text, tl);
 
         if (echoed && wordLevel) {
@@ -1189,13 +1238,21 @@ app.post("/translate", requireAuth, async (req, res) => {
         }
 
         if (echoed) {
-          translations[index] = textsToTranslate[index];
+          if (isSingleWord) {
+            dictLookupItems.push({ index, key, text, decorations, bestEffort: reattachDecorations(tl, decorations) });
+          } else {
+            translations[index] = textsToTranslate[index];
+          }
           console.log(`[translate] echo detected, skipping cache: "${text}"`);
           return;
         }
 
         if (!isValidTranslation(text, tl)) {
-          translations[index] = textsToTranslate[index];
+          if (isSingleWord) {
+            dictLookupItems.push({ index, key, text, decorations, bestEffort: reattachDecorations(tl, decorations) });
+          } else {
+            translations[index] = textsToTranslate[index];
+          }
           console.warn(`[translate] placeholder leak detected, falling back: "${text}" → "${tl}"`);
           return;
         }
@@ -1220,16 +1277,25 @@ app.post("/translate", requireAuth, async (req, res) => {
           if (Array.isArray(retryTranslations)) {
             retryTranslations.forEach((tl, ri) => {
               const { index, key, text, decorations } = retryItems[ri];
+              const isSingleWord = !multiWordIndices.has(index);
               const stillEchoed = isEchoedTranslation(text, tl);
 
               if (stillEchoed) {
-                translations[index] = textsToTranslate[index];
+                if (isSingleWord) {
+                  dictLookupItems.push({ index, key, text, decorations, bestEffort: reattachDecorations(tl, decorations) });
+                } else {
+                  translations[index] = textsToTranslate[index];
+                }
                 console.log(`[translate] word retry still echoed, skipping: "${text}"`);
                 return;
               }
 
               if (!isValidTranslation(text, tl)) {
-                translations[index] = textsToTranslate[index];
+                if (isSingleWord) {
+                  dictLookupItems.push({ index, key, text, decorations, bestEffort: reattachDecorations(tl, decorations) });
+                } else {
+                  translations[index] = textsToTranslate[index];
+                }
                 console.warn(`[translate] placeholder leak detected on retry, falling back: "${text}" → "${tl}"`);
                 return;
               }
@@ -1248,13 +1314,46 @@ app.post("/translate", requireAuth, async (req, res) => {
           }
         } catch (retryErr) {
           console.error("[translate] word retry failed:", retryErr.message);
-          retryItems.forEach(({ index }) => {
-            translations[index] = textsToTranslate[index];
+          retryItems.forEach(({ index, key, text, decorations }) => {
+            if (!multiWordIndices.has(index)) {
+              dictLookupItems.push({ index, key, text, decorations, bestEffort: textsToTranslate[index] });
+            } else {
+              translations[index] = textsToTranslate[index];
+            }
           });
         }
       }
 
-      await insertTranslations(rowsToInsert);
+      if (dictLookupItems.length > 0) {
+        const dictTexts = dictLookupItems.map((d) => d.text);
+        try {
+          const dictResults = await azureDictionaryLookup(dictTexts, sourceLang, targetLang);
+          dictResults.forEach((dictTarget, di) => {
+            const { index, key, text, decorations, bestEffort } = dictLookupItems[di];
+            if (dictTarget && !isEchoedTranslation(text, dictTarget) && isValidTranslation(text, dictTarget)) {
+              const finalTranslation = reattachDecorations(dictTarget, decorations);
+              translations[index] = finalTranslation;
+              rowsToInsert.push({
+                key,
+                source_lang: sourceLang,
+                target_lang: targetLang,
+                original_text: decorations.cleaned.toLowerCase(),
+                translated_text: dictTarget,
+                domain: validatedDomain,
+              });
+            } else {
+              translations[index] = bestEffort;
+            }
+          });
+        } catch (dictErr) {
+          console.error("[translate] dictionary lookup failed:", dictErr.message);
+          dictLookupItems.forEach(({ index, bestEffort }) => {
+            translations[index] = bestEffort;
+          });
+        }
+      }
+
+      await insertTranslations(rowsToInsert.filter((row) => !row.original_text.includes(" ")));
 
       const azureChars = toTranslate.reduce((sum, item) => sum + item.text.length, 0);
       if (azureChars > 0) {

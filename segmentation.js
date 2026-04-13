@@ -139,6 +139,11 @@ function isTranslatable(cleaned) {
   return /[a-zA-Z]/.test(cleaned);
 }
 
+function isMultiWord(cleaned) {
+  if (typeof cleaned !== "string") return false;
+  return cleaned.includes(" ");
+}
+
 function reattachDecorations(translatedClean, decorations) {
   const { leadingPunct, trailingPunct, emojis } = decorations;
   let result = (leadingPunct || "") + translatedClean + (trailingPunct || "");
@@ -173,6 +178,7 @@ module.exports = {
   stripEmojis,
   cleanSegment,
   isTranslatable,
+  isMultiWord,
   reattachDecorations,
   isEchoedTranslation,
   isValidTranslation,
