@@ -20,7 +20,7 @@ See `spec.md` for the full specification.
 
 ---
 
-### [ ] Step: Implementation
+### [x] Step: Implementation
 
 Break down into the following tasks:
 

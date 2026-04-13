@@ -1378,31 +1378,45 @@ app.post("/translate", requireAuth, async (req, res) => {
       targetLang
     );
 
+    let cacheChars = 0;
+    let liveChars = 0;
+
+    for (let i = 0; i < cleanedData.length; i++) {
+      if (skipIndices.has(i)) continue;
+      if (hitStatuses[i] && !multiWordIndices.has(i)) {
+        cacheChars += cleanedData[i].cleaned.length;
+      }
+    }
+    for (const item of toTranslate) {
+      liveChars += item.text.length;
+    }
+
+    const billableChars = cacheChars + liveChars;
+
     if (user && user.plan_status === "payg") {
-      await incrementUserTrialChars(req.userId, totalChars);
+      await incrementUserTrialChars(req.userId, billableChars);
 
       const freshUser = await getUserById(req.userId);
-      if (freshUser?.stripe_customer_id && stripe) {
-        const charsToReport = Math.ceil(totalChars / 1000);
-        if (charsToReport > 0) {
-          setImmediate(async () => {
-            try {
-              await stripe.billing.meterEvents.create({
-                event_name: "translation_chars",
-                payload: {
-                  value: String(charsToReport),
-                  stripe_customer_id: freshUser.stripe_customer_id,
-                },
-              });
-            } catch (e) {
-              console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
-            }
-          });
-        }
+      if (freshUser?.stripe_customer_id && stripe && billableChars > 0) {
+        const charsToReport = Math.ceil(billableChars / 1000);
+        setImmediate(async () => {
+          try {
+            await stripe.billing.meterEvents.create({
+              event_name: "translation_chars",
+              payload: {
+                value: String(charsToReport),
+                stripe_customer_id: freshUser.stripe_customer_id,
+              },
+            });
+            console.log(`[payg] billed user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} units=${charsToReport}`);
+          } catch (e) {
+            console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+          }
+        });
       }
 
       const charsUsedBefore = user.trial_chars_used ?? 0;
-      const updatedCharsUsed = charsUsedBefore + totalChars;
+      const updatedCharsUsed = charsUsedBefore + billableChars;
       const paygBaseline = user.chars_used_at_payg_start ?? 0;
       const softLimit = user.trial_chars_limit ?? 20_000_000;
       const paygResponse = {
@@ -1417,7 +1431,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
+      const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
         if (user.plan_status === "free" && stripe && updatedUser.subscription_id) {
           try {
@@ -1486,7 +1500,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     const contextStr = typeof context === "string" ? context : "";
-    const totalChars = word.length + english.length + contextStr.length;
+    const totalChars = word.trim().length;
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
