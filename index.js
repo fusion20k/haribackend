@@ -484,7 +484,7 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const plan = req.query.plan || null;
     const offset = (page - 1) * limit;
-    const validPlans = ["free", "active", "payg", "canceled"];
+    const validPlans = ["free", "pre", "active", "payg", "canceled"];
     const planFilter = plan && validPlans.includes(plan) ? plan : null;
     const client = await adminPool.connect();
     try {
