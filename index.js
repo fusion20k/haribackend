@@ -450,7 +450,8 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
       const result = await client.query(`
         SELECT
           COUNT(*) AS total_users,
-          SUM(CASE WHEN plan_status = 'active' THEN 1 ELSE 0 END) AS active_subscribers,
+          SUM(CASE WHEN plan_status IN ('pre', 'active') THEN 1 ELSE 0 END) AS active_subscribers,
+          SUM(CASE WHEN plan_status = 'pre' THEN 1 ELSE 0 END) AS premium_users,
           SUM(CASE WHEN plan_status = 'payg' THEN 1 ELSE 0 END) AS payg_users,
           SUM(CASE WHEN plan_status = 'free' THEN 1 ELSE 0 END) AS free_users,
           SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS new_signups_7d
@@ -464,6 +465,7 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
     res.json({
       total_users: parseInt(overviewData.total_users) || 0,
       active_subscribers: parseInt(overviewData.active_subscribers) || 0,
+      premium_users: parseInt(overviewData.premium_users) || 0,
       payg_users: parseInt(overviewData.payg_users) || 0,
       free_users: parseInt(overviewData.free_users) || 0,
       new_signups_7d: parseInt(overviewData.new_signups_7d) || 0,
