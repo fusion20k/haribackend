@@ -498,7 +498,7 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
         dataQuery += " WHERE plan_status = $1";
         params.push(planFilter);
       }
-      dataQuery += ` ORDER BY created_at DESC LIMIT ${params.length + 1} OFFSET ${params.length + 2}`;
+      dataQuery += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
       const [countResult, dataResult] = await Promise.all([
         client.query(countQuery, planFilter ? [planFilter] : []),
         client.query(dataQuery, [...params, limit, offset]),
