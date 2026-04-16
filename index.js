@@ -4,6 +4,15 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+
+const adminPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 5,
+});
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
 const axios = require("axios");
 const {
@@ -27,6 +36,8 @@ const {
   getUsage,
   incrementUsage,
   resetUserCharsIfNeeded,
+  insertClickEvent,
+  getWebsiteActivity,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -383,6 +394,162 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (!payload.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    req.userId = payload.userId;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+app.post("/admin/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password || typeof email !== "string" || typeof password !== "string") {
+      return res.status(400).json({ error: "Email and password required" });
+    }
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    if (!process.env.ADMIN_EMAIL || email.toLowerCase() !== process.env.ADMIN_EMAIL.toLowerCase()) {
+      return res.status(403).json({ error: "Access denied: not an admin account" });
+    }
+
+    const token = jwt.sign({ userId: user.id, isAdmin: true }, process.env.JWT_SECRET, {
+      expiresIn: "30d",
+    });
+
+    res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (err) {
+    console.error("Admin login error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/admin/overview", requireAdmin, async (req, res) => {
+  try {
+    const client = await adminPool.connect();
+    let overviewData;
+    try {
+      const result = await client.query(`
+        SELECT
+          COUNT(*) AS total_users,
+          SUM(CASE WHEN plan_status = 'active' THEN 1 ELSE 0 END) AS active_subscribers,
+          SUM(CASE WHEN plan_status = 'payg' THEN 1 ELSE 0 END) AS payg_users,
+          SUM(CASE WHEN plan_status = 'free' THEN 1 ELSE 0 END) AS free_users,
+          SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS new_signups_7d
+        FROM users
+      `);
+      overviewData = result.rows[0];
+    } finally {
+      client.release();
+    }
+    const usage = await getMonthlyUsage();
+    res.json({
+      total_users: parseInt(overviewData.total_users) || 0,
+      active_subscribers: parseInt(overviewData.active_subscribers) || 0,
+      payg_users: parseInt(overviewData.payg_users) || 0,
+      free_users: parseInt(overviewData.free_users) || 0,
+      new_signups_7d: parseInt(overviewData.new_signups_7d) || 0,
+      chars_used_this_month: usage.used,
+      chars_quota: usage.total,
+    });
+  } catch (err) {
+    console.error("Admin overview error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const plan = req.query.plan || null;
+    const offset = (page - 1) * limit;
+    const validPlans = ["free", "active", "payg", "canceled"];
+    const planFilter = plan && validPlans.includes(plan) ? plan : null;
+    const client = await adminPool.connect();
+    try {
+      let countQuery = "SELECT COUNT(*) AS total FROM users";
+      let dataQuery = `
+        SELECT id, email, plan_status, has_access, trial_chars_used, trial_chars_limit,
+               subscription_id, created_at, free_chars_reset_date
+        FROM users
+      `;
+      const params = [];
+      if (planFilter) {
+        countQuery += " WHERE plan_status = $1";
+        dataQuery += " WHERE plan_status = $1";
+        params.push(planFilter);
+      }
+      dataQuery += ` ORDER BY created_at DESC LIMIT ${params.length + 1} OFFSET ${params.length + 2}`;
+      const [countResult, dataResult] = await Promise.all([
+        client.query(countQuery, planFilter ? [planFilter] : []),
+        client.query(dataQuery, [...params, limit, offset]),
+      ]);
+      const total = parseInt(countResult.rows[0].total) || 0;
+      const pages = Math.ceil(total / limit);
+      res.json({ users: dataResult.rows, total, page, limit, pages });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("Admin users error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/admin/activity", requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(90, Math.max(1, parseInt(req.query.days) || 30));
+    const client = await adminPool.connect();
+    try {
+      const result = await client.query(`
+        SELECT DATE(created_at) AS date, COUNT(*) AS count
+        FROM users
+        WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
+        GROUP BY DATE(created_at)
+        ORDER BY date ASC
+      `, [days]);
+      const signupMap = new Map();
+      for (const row of result.rows) {
+        signupMap.set(new Date(row.date).toISOString().split('T')[0], parseInt(row.count));
+      }
+      const signups_by_day = [];
+      let total_period = 0;
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date();
+        d.setUTCDate(d.getUTCDate() - i);
+        const dateStr = d.toISOString().split('T')[0];
+        const count = signupMap.get(dateStr) || 0;
+        signups_by_day.push({ date: dateStr, count });
+        total_period += count;
+      }
+      res.json({ signups_by_day, total_period });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("Admin activity error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 async function userHasActiveSubscription(userId) {
   const user = await getUserById(userId);
@@ -1590,6 +1757,49 @@ app.post("/dictionary", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("[dictionary] error:", err);
     return res.status(500).json({ error: "dictionary_unavailable" });
+  }
+});
+
+
+const clickRateLimiter = new Map();
+
+app.post("/track/click", async (req, res) => {
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+  const maxPerWindow = 10;
+
+  const entry = clickRateLimiter.get(ip);
+  if (entry && now < entry.resetAt) {
+    if (entry.count >= maxPerWindow) {
+      return res.status(204).end();
+    }
+    entry.count++;
+  } else {
+    clickRateLimiter.set(ip, { count: 1, resetAt: now + windowMs });
+  }
+
+  try {
+    const { btn, ref } = req.body || {};
+    const btnId = btn && typeof btn === "string" ? btn.slice(0, 64) : null;
+    const referrer = ref && typeof ref === "string" ? ref : null;
+    const userAgent = req.headers["user-agent"] || null;
+    await insertClickEvent(btnId, referrer, userAgent);
+  } catch (err) {
+    console.error("click tracking error (non-fatal):", err.message);
+  }
+
+  return res.status(204).end();
+});
+
+app.get("/admin/website-activity", requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days) || 30, 90);
+    const result = await getWebsiteActivity(days);
+    res.json(result);
+  } catch (err) {
+    console.error("admin/website-activity error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 

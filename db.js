@@ -326,6 +326,25 @@ async function initDatabase() {
       ON CONFLICT (id) DO NOTHING
     `, [nextReset.toISOString().split('T')[0]]);
 
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS click_events (
+        id SERIAL PRIMARY KEY,
+        btn_id VARCHAR(64) NOT NULL,
+        referrer TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_click_events_btn_id ON click_events(btn_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_click_events_created_at ON click_events(created_at)
+    `);
+
     const oldKeyCheck = await client.query(`
       SELECT 1 FROM translations
       WHERE key ~ '^[^:]+:[0-9a-f]{1,8}$'
@@ -847,6 +866,59 @@ async function incrementUsage(chars) {
   }
 }
 
+
+async function insertClickEvent(btnId, referrer, userAgent) {
+  if (!process.env.DATABASE_URL) return;
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "INSERT INTO click_events (btn_id, referrer, user_agent) VALUES ($1, $2, $3)",
+      [btnId || null, referrer || null, userAgent || null]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+async function getWebsiteActivity(days) {
+  if (!process.env.DATABASE_URL) return { by_button: [], by_day: [], total: 0 };
+  const client = await pool.connect();
+  try {
+    const [byButtonResult, byDayResult] = await Promise.all([
+      client.query(
+        `SELECT btn_id, COUNT(*)::int AS count
+         FROM click_events
+         WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
+         GROUP BY btn_id
+         ORDER BY count DESC`,
+        [days]
+      ),
+      client.query(
+        `SELECT DATE(created_at) AS date, COUNT(*)::int AS count
+         FROM click_events
+         WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
+         GROUP BY DATE(created_at)
+         ORDER BY date ASC`,
+        [days]
+      ),
+    ]);
+
+    const byDayMap = new Map(byDayResult.rows.map((r) => [r.date.toISOString().split("T")[0], r.count]));
+    const byDay = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().split("T")[0];
+      byDay.push({ date: dateStr, count: byDayMap.get(dateStr) || 0 });
+    }
+
+    const total = byButtonResult.rows.reduce((sum, r) => sum + r.count, 0);
+    return { by_button: byButtonResult.rows, by_day: byDay, total };
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -870,4 +942,6 @@ module.exports = {
   incrementUsage,
   resetUsageIfNeeded,
   resetUserCharsIfNeeded,
+  insertClickEvent,
+  getWebsiteActivity,
 };
