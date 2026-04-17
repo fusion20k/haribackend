@@ -50,6 +50,32 @@ function mapLangCode(lang) {
   return MAP[lang] || lang;
 }
 
+function getPeriodEnd(sub) {
+  const ts = sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end;
+  return ts ? new Date(ts * 1000) : null;
+}
+
+async function cancelStripeSubscriptionWithFinalUsage(subscriptionId) {
+  if (!stripe || !subscriptionId) return;
+  let isPayg = false;
+  try {
+    const sub = await stripe.subscriptions.retrieve(subscriptionId);
+    isPayg = sub.items?.data?.some(
+      (item) => item.price?.id === process.env.STRIPE_PAYG_PRICE_ID
+    );
+    await stripe.subscriptions.cancel(
+      subscriptionId,
+      isPayg ? { invoice_now: true, prorate: true } : undefined
+    );
+  } catch (err) {
+    const alreadyGone =
+      err.code === "resource_missing" ||
+      err.statusCode === 404 ||
+      /no such subscription/i.test(err.message || "");
+    if (!alreadyGone) throw err;
+  }
+}
+
 async function azureTranslate(texts, sourceLang, targetLang) {
   const from = mapLangCode(sourceLang);
   const to = mapLangCode(targetLang);
@@ -180,7 +206,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
               userId,
               subscription.id,
               subscription.status,
-              new Date(subscription.current_period_end * 1000)
+              getPeriodEnd(subscription)
             );
           } catch (dbErr) {
             console.error("checkout.session.completed: createSubscription error (non-fatal):", dbErr.message);
@@ -202,7 +228,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             console.log(`Subscription active: user=${userId}`);
             if (previousSubscriptionId && previousSubscriptionId !== subscription.id) {
               try {
-                await stripe.subscriptions.cancel(previousSubscriptionId);
+                await cancelStripeSubscriptionWithFinalUsage(previousSubscriptionId);
                 console.log(`Canceled old sub ${previousSubscriptionId} after upgrade for user=${userId}`);
               } catch (e) {
                 console.error("Failed to cancel old sub on upgrade:", e.message);
@@ -226,7 +252,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
               userId,
               subscription.id,
               subscription.status,
-              new Date(subscription.current_period_end * 1000)
+              getPeriodEnd(subscription)
             );
           } catch (dbErr) {
             console.error("customer.subscription.created: createSubscription error (non-fatal):", dbErr.message);
@@ -254,7 +280,8 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         await updateSubscription(
           subscription.id,
           subscription.status,
-          new Date(subscription.current_period_end * 1000)
+          getPeriodEnd(subscription),
+          subscription.metadata?.userId ? parseInt(subscription.metadata.userId) : null
         );
         console.log(`Subscription ${subscription.id} updated to ${subscription.status}`);
 
@@ -749,7 +776,7 @@ app.post("/start-trial", async (req, res) => {
       userId,
       subscription.id,
       subscription.status,
-      new Date(subscription.current_period_end * 1000)
+      getPeriodEnd(subscription)
     );
 
     const updatedUser = await updateUserTrialStart(userId, subscription.id);
@@ -806,6 +833,7 @@ app.get("/me", requireAuth, async (req, res) => {
     };
 
     if (user.plan_status === "payg") {
+      // Display-only counters — Stripe metered billing is the source of truth for invoicing
       meResponse.payg_chars_used = (user.trial_chars_used ?? 0) - (user.chars_used_at_payg_start ?? 0);
       meResponse.payg_chars_limit = user.trial_chars_limit ?? 20000000;
     }
@@ -930,7 +958,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
         req.userId,
         subscription.id,
         subscription.status,
-        new Date(subscription.current_period_end * 1000)
+        getPeriodEnd(subscription)
       );
     } catch (dbErr) {
       console.error("verify-session: createSubscription error (non-fatal):", dbErr.message);
@@ -1038,7 +1066,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
     const subscriptionId = user.subscription_id;
     if (subscriptionId) {
       try {
-        await stripe.subscriptions.cancel(subscriptionId);
+        await cancelStripeSubscriptionWithFinalUsage(subscriptionId);
       } catch (e) {
         console.error("Failed to cancel old subscription during switch:", e.message);
       }
@@ -1046,7 +1074,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
       const subRow = await getLatestSubscriptionForUser(req.userId);
       if (subRow && subRow.stripe_subscription_id) {
         try {
-          await stripe.subscriptions.cancel(subRow.stripe_subscription_id);
+          await cancelStripeSubscriptionWithFinalUsage(subRow.stripe_subscription_id);
         } catch (e) {
           console.error("Failed to cancel old subscription during switch:", e.message);
         }
@@ -1121,17 +1149,7 @@ async function handleCancelSubscription(req, res) {
     }
 
     if (subscriptionIdToCancel) {
-      try {
-        await stripe.subscriptions.cancel(subscriptionIdToCancel);
-      } catch (stripeErr) {
-        const code = stripeErr.code || "";
-        const alreadyGone = code === "resource_missing" || stripeErr.statusCode === 404 || (stripeErr.message && stripeErr.message.toLowerCase().includes("no such subscription"));
-        if (alreadyGone) {
-          console.log(`Stripe sub ${subscriptionIdToCancel} already canceled/missing — continuing with local DB update`);
-        } else {
-          throw stripeErr;
-        }
-      }
+      await cancelStripeSubscriptionWithFinalUsage(subscriptionIdToCancel);
     } else {
       console.log(`No Stripe subscription found for user=${req.userId} — proceeding with local DB update only`);
     }
@@ -1567,20 +1585,18 @@ app.post("/translate", requireAuth, async (req, res) => {
       const freshUser = await getUserById(req.userId);
       if (freshUser?.stripe_customer_id && stripe && billableChars > 0) {
         const charsToReport = Math.ceil(billableChars / 1000);
-        setImmediate(async () => {
-          try {
-            await stripe.billing.meterEvents.create({
-              event_name: "translation_chars",
-              payload: {
-                value: String(charsToReport),
-                stripe_customer_id: freshUser.stripe_customer_id,
-              },
-            });
-            console.log(`[payg] billed user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} units=${charsToReport}`);
-          } catch (e) {
-            console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
-          }
-        });
+        try {
+          await stripe.billing.meterEvents.create({
+            event_name: "translation_chars",
+            payload: {
+              value: String(charsToReport),
+              stripe_customer_id: freshUser.stripe_customer_id,
+            },
+          });
+          console.log(`[payg] billed user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} units=${charsToReport}`);
+        } catch (e) {
+          console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+        }
       }
 
       const charsUsedBefore = user.trial_chars_used ?? 0;
@@ -1716,19 +1732,18 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       if (freshUser?.stripe_customer_id && stripe) {
         const charsToReport = Math.ceil(totalChars / 1000);
         if (charsToReport > 0) {
-          setImmediate(async () => {
-            try {
-              await stripe.billing.meterEvents.create({
-                event_name: "translation_chars",
-                payload: {
-                  value: String(charsToReport),
-                  stripe_customer_id: freshUser.stripe_customer_id,
-                },
-              });
-            } catch (e) {
-              console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
-            }
-          });
+          try {
+            await stripe.billing.meterEvents.create({
+              event_name: "translation_chars",
+              payload: {
+                value: String(charsToReport),
+                stripe_customer_id: freshUser.stripe_customer_id,
+              },
+            });
+            console.log(`[payg] billed user=${req.userId} total=${totalChars} units=${charsToReport}`);
+          } catch (e) {
+            console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+          }
         }
       }
       const charsUsedBefore = user.trial_chars_used ?? 0;

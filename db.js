@@ -588,7 +588,7 @@ async function createSubscription(userId, stripeSubscriptionId, status, currentP
   }
 }
 
-async function updateSubscription(stripeSubscriptionId, status, currentPeriodEnd) {
+async function updateSubscription(stripeSubscriptionId, status, currentPeriodEnd, userId = null) {
   if (!process.env.DATABASE_URL) throw new Error("Database not configured");
 
   const client = await pool.connect();
@@ -597,7 +597,11 @@ async function updateSubscription(stripeSubscriptionId, status, currentPeriodEnd
       "UPDATE subscriptions SET status = $1, current_period_end = $2, updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = $3 RETURNING id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at",
       [status, currentPeriodEnd, stripeSubscriptionId]
     );
-    return result.rows[0] || null;
+    if (result.rowCount > 0) return result.rows[0];
+    if (userId) {
+      return await createSubscription(userId, stripeSubscriptionId, status, currentPeriodEnd);
+    }
+    return null;
   } catch (error) {
     console.error("Error updating subscription:", error);
     throw error;
