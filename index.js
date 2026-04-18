@@ -1820,6 +1820,53 @@ app.get("/admin/website-activity", requireAdmin, async (req, res) => {
   }
 });
 
+app.post("/tts", requireAuth, async (req, res) => {
+  if (!process.env.AZURE_SPEECH_KEY) {
+    return res.status(503).json({ error: "TTS service not configured" });
+  }
+
+  const { text, voice = "fil-PH-BlessicaNeural" } = req.body;
+
+  if (!text || typeof text !== "string" || text.trim().length === 0) {
+    return res.status(400).json({ error: "text is required" });
+  }
+  if (text.length > 500) {
+    return res.status(400).json({ error: "text must be 500 characters or fewer" });
+  }
+
+  const escapedText = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+
+  const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}">${escapedText}</voice></speak>`;
+
+  const region = process.env.AZURE_SPEECH_REGION || "eastus";
+
+  try {
+    const response = await axios.post(
+      `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`,
+      ssml,
+      {
+        headers: {
+          "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
+          "Content-Type": "application/ssml+xml",
+          "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
+        },
+        responseType: "arraybuffer",
+      }
+    );
+
+    res.set("Content-Type", "audio/mpeg");
+    res.send(Buffer.from(response.data));
+  } catch (err) {
+    console.error("Azure TTS error:", err.message);
+    res.status(500).json({ error: "TTS request failed" });
+  }
+});
+
 async function startServer() {
   try {
     if (process.env.DATABASE_URL) {
