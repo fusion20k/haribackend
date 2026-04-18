@@ -1825,13 +1825,20 @@ app.post("/tts", requireAuth, async (req, res) => {
     return res.status(503).json({ error: "TTS service not configured" });
   }
 
-  const { text, voice = "en-US-Ava:DragonHDLatestNeural" } = req.body;
+  const { text, voice = "en-US-Ava:DragonHDLatestNeural", native = false } = req.body;
 
   if (!text || text.length > 500) {
     return res.status(400).json({ error: "Invalid text" });
   }
 
   const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+
+  let ssml;
+  if (native) {
+    ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}">${safeText}</voice></speak>`;
+  } else {
+    ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}"><lang xml:lang="fil-PH">${safeText}</lang></voice></speak>`;
+  }
 
   try {
     const response = await fetch(
@@ -1843,7 +1850,7 @@ app.post("/tts", requireAuth, async (req, res) => {
           "Content-Type": "application/ssml+xml",
           "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
         },
-        body: `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}"><lang xml:lang="fil-PH">${safeText}</lang></voice></speak>`,
+        body: ssml,
       }
     );
 
