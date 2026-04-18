@@ -1825,47 +1825,40 @@ app.post("/tts", requireAuth, async (req, res) => {
     return res.status(503).json({ error: "TTS service not configured" });
   }
 
-  const { text, voice = "fil-PH-BlessicaNeural" } = req.body;
+  const { text, voice = "en-US-Ava:DragonHDLatestNeural" } = req.body;
 
-  if (!text || typeof text !== "string" || text.trim().length === 0) {
-    return res.status(400).json({ error: "text is required" });
-  }
-  if (text.length > 500) {
-    return res.status(400).json({ error: "text must be 500 characters or fewer" });
+  if (!text || text.length > 500) {
+    return res.status(400).json({ error: "Invalid text" });
   }
 
-  const escapedText = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-
-  const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}">${escapedText}</voice></speak>`;
-
-  const region = process.env.AZURE_SPEECH_REGION || "eastus";
+  const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
   try {
-    const response = await axios.post(
-      `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`,
-      ssml,
+    const response = await fetch(
+      `https://eastus.tts.speech.microsoft.com/cognitiveservices/v1`,
       {
+        method: "POST",
         headers: {
           "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
           "Content-Type": "application/ssml+xml",
           "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
         },
-        responseType: "arraybuffer",
+        body: `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}"><lang xml:lang="fil-PH">${safeText}</lang></voice></speak>`,
       }
     );
 
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error("Azure TTS error:", response.status, errorBody);
+      return res.status(response.status).json({ error: "TTS request failed", details: errorBody });
+    }
+
     res.set("Content-Type", "audio/mpeg");
-    res.send(Buffer.from(response.data));
+    const buffer = await response.arrayBuffer();
+    res.send(Buffer.from(buffer));
   } catch (err) {
-    const status = err.response ? err.response.status : 500;
-    const details = err.response ? Buffer.from(err.response.data).toString() : err.message;
-    console.error("Azure TTS error:", status, details);
-    res.status(status).json({ error: "TTS request failed", details });
+    console.error("TTS service error:", err);
+    res.status(500).json({ error: "TTS service error" });
   }
 });
 
