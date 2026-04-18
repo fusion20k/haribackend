@@ -1862,8 +1862,10 @@ app.post("/tts", requireAuth, async (req, res) => {
     res.set("Content-Type", "audio/mpeg");
     res.send(Buffer.from(response.data));
   } catch (err) {
-    console.error("Azure TTS error:", err.message);
-    res.status(500).json({ error: "TTS request failed" });
+    const status = err.response ? err.response.status : 500;
+    const details = err.response ? Buffer.from(err.response.data).toString() : err.message;
+    console.error("Azure TTS error:", status, details);
+    res.status(status).json({ error: "TTS request failed", details });
   }
 });
 
