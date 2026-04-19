@@ -1827,10 +1827,51 @@ app.post("/tts", requireAuth, async (req, res) => {
     return res.status(503).json({ error: "TTS service not configured" });
   }
 
+  let user = await getUserById(req.userId);
+  const hasAccess = (user && user.has_access) || (await userHasActiveSubscription(req.userId));
+  if (!hasAccess) {
+    return res.status(402).json({ error: "Subscription required" });
+  }
+
   const { text, voice = "en-US-Ava:DragonHDLatestNeural", native = false } = req.body;
 
   if (!text || text.length > 500) {
     return res.status(400).json({ error: "Invalid text" });
+  }
+
+  const ttsChars = text.length;
+  const weightedChars = ttsChars * 2;
+
+  if (user && ["free", "pre"].includes(user.plan_status)) {
+    const reset = await resetUserCharsIfNeeded(req.userId);
+    if (reset) {
+      user = await getUserById(req.userId);
+    }
+    const charsUsed = user.trial_chars_used ?? 0;
+    const charsLimit = user.trial_chars_limit ?? 25000;
+    if (charsUsed >= charsLimit) {
+      if (user.plan_status === "pre") {
+        return res.status(402).json({
+          error: "monthly_limit_reached",
+          message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
+          trial_chars_used: charsUsed,
+          trial_chars_limit: charsLimit,
+        });
+      }
+      return res.status(402).json({
+        error: "trial_exhausted",
+        message: "You have used your 25,000 free characters.",
+        trial_chars_used: charsUsed,
+        trial_chars_limit: charsLimit,
+      });
+    }
+  }
+
+  if (user && user.plan_status === "payg") {
+    const reset = await resetUserCharsIfNeeded(req.userId);
+    if (reset) {
+      user = await getUserById(req.userId);
+    }
   }
 
   const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -1860,6 +1901,30 @@ app.post("/tts", requireAuth, async (req, res) => {
       const errorBody = await response.text();
       console.error("Azure TTS error:", response.status, errorBody);
       return res.status(response.status).json({ error: "TTS request failed", details: errorBody });
+    }
+
+    if (user && user.plan_status === "payg") {
+      await incrementUserTrialChars(req.userId, weightedChars);
+      const freshUser = await getUserById(req.userId);
+      if (freshUser?.stripe_customer_id && stripe && weightedChars > 0) {
+        const unitsToReport = Math.ceil(weightedChars / 1000);
+        try {
+          await stripe.billing.meterEvents.create({
+            event_name: "translation_chars",
+            payload: {
+              value: String(unitsToReport),
+              stripe_customer_id: freshUser.stripe_customer_id,
+            },
+          });
+          console.log(`[tts] billed user=${req.userId} raw=${ttsChars} weighted=${weightedChars} units=${unitsToReport}`);
+        } catch (e) {
+          console.error("TTS PAYG Stripe meter event failed (non-fatal):", e.message);
+        }
+      }
+    }
+
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      await incrementUserTrialChars(req.userId, weightedChars);
     }
 
     res.set("Content-Type", "audio/mpeg");
