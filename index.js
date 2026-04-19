@@ -39,6 +39,7 @@ const {
   insertClickEvent,
   getWebsiteActivity,
   syncUserXp,
+  getUserXp,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -1886,6 +1887,19 @@ app.post("/xp/sync", requireAuth, async (req, res) => {
     return res.json({ xp_balance: updated.xp_balance, xp_lifetime_earned: updated.xp_lifetime_earned });
   } catch (err) {
     console.error("POST /xp/sync error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/xp", requireAuth, async (req, res) => {
+  try {
+    const xp = await getUserXp(req.userId);
+    if (!xp) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    return res.json({ xp_balance: xp.xp_balance, xp_lifetime_earned: xp.xp_lifetime_earned });
+  } catch (err) {
+    console.error("GET /xp error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });

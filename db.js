@@ -960,6 +960,19 @@ async function syncUserXp(userId, xpBalance, xpLifetimeEarned) {
   }
 }
 
+async function getUserXp(userId) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT xp_balance, xp_lifetime_earned FROM users WHERE id = $1`,
+      [userId]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -986,4 +999,5 @@ module.exports = {
   insertClickEvent,
   getWebsiteActivity,
   syncUserXp,
+  getUserXp,
 };
