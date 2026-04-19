@@ -223,6 +223,30 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'xp_balance'
+        ) THEN
+          ALTER TABLE users ADD COLUMN xp_balance INTEGER NOT NULL DEFAULT 0;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'xp_lifetime_earned'
+        ) THEN
+          ALTER TABLE users ADD COLUMN xp_lifetime_earned INTEGER NOT NULL DEFAULT 0;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       UPDATE users
       SET plan_status = 'free',
           trial_chars_limit = 25000,
@@ -923,6 +947,19 @@ async function getWebsiteActivity(days) {
   }
 }
 
+async function syncUserXp(userId, xpBalance, xpLifetimeEarned) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users SET xp_balance = $1, xp_lifetime_earned = $2 WHERE id = $3 RETURNING id, xp_balance, xp_lifetime_earned`,
+      [xpBalance, xpLifetimeEarned, userId]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -948,4 +985,5 @@ module.exports = {
   resetUserCharsIfNeeded,
   insertClickEvent,
   getWebsiteActivity,
+  syncUserXp,
 };

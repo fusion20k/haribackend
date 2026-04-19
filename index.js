@@ -38,6 +38,7 @@ const {
   resetUserCharsIfNeeded,
   insertClickEvent,
   getWebsiteActivity,
+  syncUserXp,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -1866,6 +1867,26 @@ app.post("/tts", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("TTS service error:", err);
     res.status(500).json({ error: "TTS service error" });
+  }
+});
+
+app.post("/xp/sync", requireAuth, async (req, res) => {
+  const { xp_balance, xp_lifetime_earned } = req.body;
+  if (
+    !Number.isInteger(xp_balance) || xp_balance < 0 ||
+    !Number.isInteger(xp_lifetime_earned) || xp_lifetime_earned < 0
+  ) {
+    return res.status(400).json({ error: "xp_balance and xp_lifetime_earned must be non-negative integers" });
+  }
+  try {
+    const updated = await syncUserXp(req.userId, xp_balance, xp_lifetime_earned);
+    if (!updated) {
+      return res.status(500).json({ error: "Internal server error" });
+    }
+    return res.json({ xp_balance: updated.xp_balance, xp_lifetime_earned: updated.xp_lifetime_earned });
+  } catch (err) {
+    console.error("POST /xp/sync error:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
