@@ -1,4 +1,4 @@
-# Spec and build
+# Spec and Build
 
 ## Agent Instructions
 
@@ -14,175 +14,316 @@ Do not make assumptions on important decisions — get clarification first.
 
 ## Workflow Steps
 
-### [x] Step: Technical Specification
+### [x] Step: Technical Specification (approved by user — proceed)
 
-See `spec.md` for the full analysis. Confirmed decisions:
-1. `/dictionary` charges `word + english + context` character length (full LLM input).
-2. `/tts` user quota uses `ttsChars * 2`; `incrementUsage` uses raw `ttsChars` (no weighting).
-3. `active` plan users: leave as-is, no quota enforcement added.
+Spec written to `spec.md`. Four billing safety risks identified and fully specified.
 
 ---
 
-### [x] Step: Migrate `translation_usage` table — add `service_type` column
+### [x] Step: Implementation — Risk 4 (Global Azure Cost Guard)
 
-**File:** `db.js` → inside `initDatabase()`, after the last `DO $$ BEGIN IF NOT EXISTS` block for `translation_usage` columns.
+**Simplest change, no logic restructure. Do this first.**
 
-Add a new migration block using the same `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE ...) THEN ALTER TABLE ... END IF; END $$` pattern:
+File: `index.js`
 
-```sql
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'translation_usage' AND column_name = 'service_type'
-  ) THEN
-    ALTER TABLE translation_usage ADD COLUMN service_type VARCHAR(20) NOT NULL DEFAULT 'translator';
-  END IF;
-END $$;
-```
-
-No index needed — `service_type` is low-cardinality and only used in aggregations.
-
-**Verification:** Server starts without DB error; `\d translation_usage` shows `service_type` column.
+Sub-steps:
+1. In `/dictionary` handler: after `totalChars` is computed and before the `llmDictionary` call, insert:
+   ```js
+   const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
+   const usageRow = await getUsage();
+   if (usageRow.current_month_usage_chars + totalChars > QUOTA * 0.95) {
+     return res.status(503).json({ error: "usage_cap_reached" });
+   }
+   ```
+2. In `/tts` handler: after `ttsChars` is computed and before the Azure Speech `fetch` call, insert the same block using `ttsChars` (not `weightedChars`) as the guard value.
+3. Verify: `node --check index.js`
 
 ---
 
-### [x] Step: Update `logTranslationUsage` in `analytics.js` to accept and store `service_type`
+### [x] Step: Implementation — Risk 1 (Stripe Meter Event Idempotency)
 
-**File:** `analytics.js` → `logTranslationUsage` function.
+File: `index.js`
 
-1. Add `serviceType = 'translator'` as a 7th parameter (default keeps all existing callers working without changes).
-2. In the `segments.forEach` loop, push `serviceType` as the 8th value per row (`offset` becomes `i * 8`).
-3. Update the `INSERT` SQL:
-   - Column list: add `service_type` after `character_count`.
-   - Placeholder list: change `$${offset + 7}` → add `$${offset + 8}` for `service_type`.
-
-Existing call in `/translate` passes 6 positional args — the new 7th (`serviceType`) will default to `'translator'` automatically. No changes needed to that call site yet (it will be updated in the `/translate` step for clarity, but it works either way).
-
-**Verification:** A translation request inserts a row with `service_type = 'translator'` in `translation_usage`.
-
----
-
-### [x] Step: Fix `/translate` — charge `billableChars` to free/pre users instead of `totalChars`
-
-**File:** `index.js` → `POST /translate` handler, near line 1619.
-
-**Change 1 — free/pre char increment:**
-```js
-// Before:
-const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
-// After:
-const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
-```
-`billableChars` is already computed above (`cacheChars + liveChars`) and correctly excludes non-translatable skipped segments.
-
-**Change 2 — `logTranslationUsage` call (already present ~line 1560):**
-Update to pass the new `serviceType` argument explicitly:
-```js
-logTranslationUsage(
-  req.userId,
-  normalizedTexts,
-  hitStatuses,
-  validatedDomain,
-  sourceLang,
-  targetLang,
-  'translator'   // ← add this
-);
-```
-
-No changes to PAYG path, `incrementUsage`, or quota pre-check — those are correct.
-
-**Verification:**
-- Free user translates 10 words (8 cache hits, 2 live, 0 skipped): `trial_chars_used` increases by `cacheChars + liveChars`, not by total normalized length.
-- Confirm `translation_usage` row has `service_type = 'translator'`.
+Sub-steps:
+1. Add `const crypto = require("crypto");` at top of file if not already imported (check — `crypto` is already used in `db.js` but confirm in `index.js`).
+2. In `/translate` handler: at the top of the handler (after `requireAuth`), extract idempotency key:
+   ```js
+   const idempotencyKey = req.headers["x-idempotency-key"] || crypto.randomUUID();
+   const meterIdentifier = `translate:${req.userId}:${idempotencyKey}`;
+   ```
+3. In the `stripe.billing.meterEvents.create` call in `/translate`, add `identifier: meterIdentifier` to the params object.
+4. Repeat for `/dictionary`: `meterIdentifier = \`dictionary:${req.userId}:${idempotencyKey}\``
+5. Repeat for `/tts`: `meterIdentifier = \`tts:${req.userId}:${idempotencyKey}\``
+6. Verify: `node --check index.js`
 
 ---
 
-### [x] Step: Fix `/dictionary` — full input char count, `incrementUsage`, and analytics logging
+### [x] Step: Implementation — Risk 2 (Stripe Meter Event Failure Queue)
 
-**File:** `index.js` → `POST /dictionary` handler.
+Files: `db.js`, `index.js`
 
-**Change 1 — char count formula** (near line 1689):
-```js
-// Before:
-const totalChars = word.trim().length;
-// After:
-const totalChars = word.trim().length + english.trim().length + contextStr.trim().length;
-```
-`contextStr` is already safely derived from `context` as a string above this line.
+Sub-steps:
 
-**Change 2 — call `incrementUsage` after the LLM call succeeds** (after `entry = await llmDictionary(...)`, before the per-plan billing blocks):
-```js
-await incrementUsage(totalChars);
-```
-This adds LLM chars to the global server cost guard.
+**db.js**:
+1. In `initDatabase`, add a new migration block after existing table creations:
+   ```sql
+   CREATE TABLE IF NOT EXISTS pending_meter_events (
+     id                 SERIAL PRIMARY KEY,
+     user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     stripe_customer_id VARCHAR(255) NOT NULL,
+     event_name         VARCHAR(100) NOT NULL DEFAULT 'translation_chars',
+     units              INTEGER NOT NULL,
+     identifier         VARCHAR(255) NOT NULL,
+     status             VARCHAR(20) NOT NULL DEFAULT 'pending',
+     attempts           INTEGER NOT NULL DEFAULT 0,
+     last_attempted_at  TIMESTAMPTZ,
+     created_at         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+   );
+   CREATE INDEX IF NOT EXISTS idx_pending_meter_events_status ON pending_meter_events(status);
+   ```
+2. Add `insertPendingMeterEvent(userId, stripeCustomerId, eventName, units, identifier)`:
+   - INSERT into `pending_meter_events`
+3. Add `getPendingMeterEvents(limit = 20)`:
+   - SELECT where `status = 'pending'` AND `attempts < 3`, ORDER BY `created_at ASC`, LIMIT
+4. Add `updateMeterEventAttempt(id, succeeded)`:
+   - If `succeeded`: DELETE the row (successfully delivered, clean up)
+   - If not succeeded: INCREMENT `attempts`, set `last_attempted_at = NOW()`; if new `attempts >= 3`, set `status = 'permanently_failed'`
+5. Export all 3 new functions in `module.exports`
 
-**Change 3 — add `logTranslationUsage` call** (after the `incrementUsage` call, fire-and-forget):
-```js
-logTranslationUsage(
-  req.userId,
-  [word.trim()],
-  [false],
-  'dictionary',
-  'tl',
-  'en',
-  'llm'
-);
-```
-`source_lang = 'tl'` and `target_lang = 'en'` are hardcoded because the dictionary endpoint is always Tagalog→English. `hitStatuses = [false]` because LLM results are never cached.
-
-No changes needed to the quota pre-check, PAYG Stripe meter event, or free/pre `incrementUserTrialChars` calls — they already use `totalChars` (which is now the corrected full-input length).
-
-**Verification:**
-- Request with `word = "mahal"` (5), `english = "expensive"` (9), `context = "in a store"` (10) → `totalChars = 24`; `trial_chars_used` increases by 24; `incrementUsage` increases by 24; `translation_usage` row inserted with `service_type = 'llm'`.
-- Previously `totalChars` would have been 5 (word only).
-
----
-
-### [x] Step: Fix `/tts` — call `incrementUsage` with raw chars and add analytics logging
-
-**File:** `index.js` → `POST /tts` handler, after the `if (!response.ok)` error block and before the per-plan billing blocks (around line 1906).
-
-**Change 1 — call `incrementUsage` with raw `ttsChars`** (not weighted):
-```js
-await incrementUsage(ttsChars);
-```
-`ttsChars = text.length` is already computed near the top of the handler. `weightedChars = ttsChars * 2` continues to be used for user quota and Stripe billing — unchanged.
-
-**Change 2 — add `logTranslationUsage` call** (after `incrementUsage`, fire-and-forget):
-```js
-logTranslationUsage(
-  req.userId,
-  [text],
-  [false],
-  'tts',
-  'fil',
-  'fil',
-  'tts'
-);
-```
-TTS is monolingual, so `source_lang` and `target_lang` are both `'fil'`. `hitStatuses = [false]` — TTS results are never cached.
-
-No changes to the PAYG Stripe meter event (already uses `weightedChars`) or the free/pre `incrementUserTrialChars` calls (already uses `weightedChars`).
-
-**Verification:**
-- TTS request with `text = "Magandang umaga"` (15 chars): `incrementUsage` increases by 15 (raw); `trial_chars_used` increases by 30 (weighted `* 2`); Stripe billed `ceil(30/1000) = 1` unit for PAYG; `translation_usage` row inserted with `service_type = 'tts'`.
+**index.js**:
+6. Import the 3 new functions from `./db`
+7. In `/translate` catch block for Stripe meter: replace silent swallow with `await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, 'translation_chars', charsToReport, meterIdentifier)`
+8. Repeat for `/dictionary` catch block
+9. Repeat for `/tts` catch block
+10. After `app.listen(...)` in `startServer`, add the background drainer:
+    ```js
+    if (stripe) {
+      setInterval(async () => {
+        try {
+          const rows = await getPendingMeterEvents(20);
+          for (const row of rows) {
+            try {
+              await stripe.billing.meterEvents.create({
+                event_name: row.event_name,
+                payload: { value: String(row.units), stripe_customer_id: row.stripe_customer_id },
+                identifier: row.identifier,
+              });
+              await updateMeterEventAttempt(row.id, true);
+              console.log(`[meter-drainer] succeeded: id=${row.id}`);
+            } catch (e) {
+              await updateMeterEventAttempt(row.id, false);
+              console.error(`[meter-drainer] retry failed: id=${row.id} attempt=${row.attempts + 1} err=${e.message}`);
+            }
+          }
+        } catch (drainErr) {
+          console.error("[meter-drainer] drainer error:", drainErr.message);
+        }
+      }, 60_000);
+    }
+    ```
+11. Verify: `node --check index.js && node --check db.js`
 
 ---
 
-### [x] Step: Syntax check and verification
+### [x] Step: Implementation — Risk 3 (Atomic Quota Check+Increment)
 
-Run:
-```
-node --check index.js
-node --check db.js
-node --check analytics.js
-```
+**Most complex change — restructures control flow in 3 handlers. Read spec.md § Risk 3 before starting.**
 
-All three must exit with code 0 (no syntax errors).
+Decision confirmed: no refund-on-error. If Azure fails after chars are reserved, chars are lost. Do not add rollback logic.
 
-Write `report.md` covering:
-- What was changed in each file and why
-- Which bugs were fixed (overcharge on free/pre translate; undercount on dictionary; missing global guard on LLM/TTS)
-- How each change was verified
-- Any edge cases or risks noted
+Files: `db.js`, `index.js`
+
+Sub-steps:
+
+**db.js**:
+1. Add `atomicCheckAndIncrementChars(userId, chars)` after `incrementUserTrialChars`:
+   ```js
+   async function atomicCheckAndIncrementChars(userId, chars) {
+     const client = await pool.connect();
+     try {
+       const result = await client.query(
+         `UPDATE users
+          SET trial_chars_used = trial_chars_used + $1
+          WHERE id = $2
+            AND trial_chars_used + $1 <= trial_chars_limit
+          RETURNING id, trial_chars_used, trial_chars_limit, plan_status, subscription_id, stripe_customer_id`,
+         [chars, userId]
+       );
+       if (result.rowCount === 0) return { allowed: false, user: null };
+       return { allowed: true, user: result.rows[0] };
+     } catch (error) {
+       console.error("Error in atomicCheckAndIncrementChars:", error);
+       throw error;
+     } finally {
+       client.release();
+     }
+   }
+   ```
+2. Add `atomicCheckAndIncrementChars` to `module.exports`
+
+**index.js — /translate handler** (reference lines in current file):
+3. Move `billableChars` computation (currently lines 1570–1583) to immediately after the `toTranslate` array is built (currently ends around line 1391). Place it just before the `if (toTranslate.length > 0)` block. The computation only uses `cleanedData`, `hitStatuses`, `skipIndices`, `multiWordIndices`, and `toTranslate` — all available at that point:
+   ```js
+   let cacheChars = 0;
+   let liveChars = 0;
+   for (let i = 0; i < cleanedData.length; i++) {
+     if (skipIndices.has(i)) continue;
+     if (hitStatuses[i] && !multiWordIndices.has(i)) {
+       cacheChars += cleanedData[i].cleaned.length;
+     }
+   }
+   for (const item of toTranslate) {
+     liveChars += item.text.length;
+   }
+   const billableChars = cacheChars + liveChars;
+   ```
+   Remove the duplicate `let cacheChars`, `let liveChars`, `const billableChars` lines from their original position (lines 1570–1583).
+
+4. Remove the early quota check block for `free`/`pre` (currently lines 1293–1318):
+   ```js
+   // DELETE this entire block:
+   if (user && ["free", "pre"].includes(user.plan_status)) {
+     if (["free", "pre"].includes(user.plan_status)) {
+       const reset = await resetUserCharsIfNeeded(req.userId);
+       if (reset) { user = await getUserById(req.userId); }
+     }
+     const charsUsed = user.trial_chars_used ?? 0;
+     const charsLimit = user.trial_chars_limit ?? 25000;
+     if (charsUsed >= charsLimit) { ... return 402 ... }
+   }
+   ```
+   NOTE: The `resetUserCharsIfNeeded` call within that block must be preserved — move it to just before the atomic increment (step 5 below).
+
+5. In place of the removed block, after `billableChars` is computed and before `if (toTranslate.length > 0)`, insert for `free`/`pre`:
+   ```js
+   let translateUpdatedUser = null;
+   if (user && ["free", "pre"].includes(user.plan_status)) {
+     const reset = await resetUserCharsIfNeeded(req.userId);
+     if (reset) { user = await getUserById(req.userId); }
+     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
+     if (!allowed) {
+       return res.status(402).json({
+         error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+         message: user.plan_status === "pre"
+           ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+           : "You have used your 25,000 free characters.",
+         trial_chars_used: user.trial_chars_used,
+         trial_chars_limit: user.trial_chars_limit,
+       });
+     }
+     translateUpdatedUser = au;
+     if (translateUpdatedUser.trial_chars_used >= translateUpdatedUser.trial_chars_limit) {
+       if (user.plan_status === "free" && stripe && translateUpdatedUser.subscription_id) {
+         try {
+           await stripe.subscriptions.update(translateUpdatedUser.subscription_id, { trial_end: "now" });
+           console.log(`Trial ended early for user ${req.userId} after hitting char limit`);
+         } catch (stripeErr) {
+           console.error("Failed to end Stripe trial early:", stripeErr.message);
+         }
+       }
+     }
+   }
+   ```
+
+6. Replace the post-Azure `free`/`pre` branch (currently lines 1620–1638):
+   ```js
+   // DELETE this block:
+   if (user && ["free", "pre"].includes(user.plan_status)) {
+     const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
+     if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) { ... }
+     return res.json({ translations, trial_chars_used: ..., trial_chars_limit: ... });
+   }
+   ```
+   Replace with:
+   ```js
+   if (user && ["free", "pre"].includes(user.plan_status)) {
+     return res.json({
+       translations,
+       trial_chars_used: translateUpdatedUser ? translateUpdatedUser.trial_chars_used : null,
+       trial_chars_limit: translateUpdatedUser ? translateUpdatedUser.trial_chars_limit : null,
+     });
+   }
+   ```
+   (The Stripe `trial_end: "now"` logic moved to step 5 above; the `payg` branch at lines 1585–1618 is untouched.)
+
+**index.js — /dictionary handler** (reference lines in current file):
+7. Remove early quota check block (currently lines 1692–1714) — the block that reads `charsUsed`/`charsLimit` and returns 402 for `free`/`pre`. Keep the `payg` reset-check block (lines 1717–1722) untouched.
+8. Before the `llmDictionary` call (currently line 1726), insert:
+   ```js
+   let dictUpdatedUser = null;
+   if (user && ["free", "pre"].includes(user.plan_status)) {
+     const reset = await resetUserCharsIfNeeded(req.userId);
+     if (reset) { user = await getUserById(req.userId); }
+     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
+     if (!allowed) {
+       return res.status(402).json({
+         error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+         message: user.plan_status === "pre"
+           ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+           : "You have used your 25,000 free characters.",
+         trial_chars_used: user.trial_chars_used,
+         trial_chars_limit: user.trial_chars_limit,
+       });
+     }
+     dictUpdatedUser = au;
+   }
+   ```
+9. In the post-call `free`/`pre` branch (currently lines 1778–1784):
+   ```js
+   // DELETE:
+   const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
+   return res.json({ ...entry, trial_chars_used: updatedUser ? ..., trial_chars_limit: ... });
+   // REPLACE WITH:
+   return res.json({
+     ...entry,
+     trial_chars_used: dictUpdatedUser ? dictUpdatedUser.trial_chars_used : null,
+     trial_chars_limit: dictUpdatedUser ? dictUpdatedUser.trial_chars_limit : null,
+   });
+   ```
+   (The `payg` branch at lines 1743–1775 is untouched.)
+
+**index.js — /tts handler** (reference lines in current file):
+10. Remove early quota check block (currently lines 1857–1880) — the block that reads `charsUsed`/`charsLimit` and returns 402 for `free`/`pre`. Keep the `payg` reset-check block (lines 1882–1887) untouched.
+11. Before the Azure Speech `fetch` call (currently line 1899), insert:
+    ```js
+    let ttsUpdatedUser = null;
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) { user = await getUserById(req.userId); }
+      const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);
+      if (!allowed) {
+        return res.status(402).json({
+          error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+          message: user.plan_status === "pre"
+            ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+            : "You have used your 25,000 free characters.",
+          trial_chars_used: user.trial_chars_used,
+          trial_chars_limit: user.trial_chars_limit,
+        });
+      }
+      ttsUpdatedUser = au;
+    }
+    ```
+12. In the post-call `free`/`pre` branch (currently lines 1949–1951):
+    ```js
+    // DELETE:
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      await incrementUserTrialChars(req.userId, weightedChars);
+    }
+    ```
+    The response for TTS is the audio buffer (not JSON), so no trial_chars_used field is returned — simply removing the `incrementUserTrialChars` call is the complete change here. `ttsUpdatedUser` is computed but not sent in the response body (TTS returns binary audio).
+    (The `payg` branch at lines 1929–1947 is untouched.)
+13. Import `atomicCheckAndIncrementChars` in the destructured require from `./db` at the top of `index.js`.
+14. Verify: `node --check index.js && node --check db.js`
+
+---
+
+### [x] Step: Verification
+
+1. Run `node --check index.js` — must exit 0
+2. Run `node --check db.js` — must exit 0
+3. Manual smoke-test checklist (document results):
+   - Risk 1: Call `/translate` as PAYG user; check server log for `identifier` field in meter event log line
+   - Risk 2: Temporarily make Stripe throw; call `/translate`; confirm row in `pending_meter_events`; restore, wait 60s, confirm drainer log
+   - Risk 3: With a free user near quota, send two concurrent requests; confirm only one succeeds
+   - Risk 4: Set `MONTHLY_CHAR_LIMIT=1`; call `/dictionary` and `/tts`; confirm 503 `usage_cap_reached`

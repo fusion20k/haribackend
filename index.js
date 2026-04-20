@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
@@ -40,6 +41,10 @@ const {
   getWebsiteActivity,
   syncUserXp,
   getUserXp,
+  insertPendingMeterEvent,
+  getPendingMeterEvents,
+  updateMeterEventAttempt,
+  atomicCheckAndIncrementChars,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -1216,6 +1221,8 @@ app.get("/usage", async (req, res) => {
 
 app.post("/translate", requireAuth, async (req, res) => {
   const requestStart = Date.now();
+  const idempotencyKey = req.headers["x-idempotency-key"] || crypto.randomUUID();
+  const meterIdentifier = `translate:${req.userId}:${idempotencyKey}`;
   try {
     let user = await getUserById(req.userId);
 
@@ -1288,33 +1295,6 @@ app.post("/translate", requireAuth, async (req, res) => {
     const totalChars = normalizedTexts.reduce((sum, s) => sum + s.length, 0);
     if (totalChars > 8000) {
       return res.status(400).json({ error: "Request too large (over 8000 characters)" });
-    }
-
-    if (user && ["free", "pre"].includes(user.plan_status)) {
-      if (["free", "pre"].includes(user.plan_status)) {
-        const reset = await resetUserCharsIfNeeded(req.userId);
-        if (reset) {
-          user = await getUserById(req.userId);
-        }
-      }
-      const charsUsed = user.trial_chars_used ?? 0;
-      const charsLimit = user.trial_chars_limit ?? 25000;
-      if (charsUsed >= charsLimit) {
-        if (user.plan_status === "pre") {
-          return res.status(402).json({
-            error: "monthly_limit_reached",
-            message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
-            trial_chars_used: charsUsed,
-            trial_chars_limit: charsLimit,
-          });
-        }
-        return res.status(402).json({
-          error: "trial_exhausted",
-          message: "You have used your 25,000 free characters.",
-          trial_chars_used: charsUsed,
-          trial_chars_limit: charsLimit,
-        });
-      }
     }
 
     if (user && user.plan_status === "payg") {
@@ -1394,6 +1374,47 @@ app.post("/translate", requireAuth, async (req, res) => {
     const cacheHits = totalChunks - toTranslate.length;
     let mtCalls = toTranslate.length;
     const hitRatePct = totalChunks > 0 ? ((cacheHits / totalChunks) * 100).toFixed(1) : "0.0";
+
+    let cacheChars = 0;
+    let liveChars = 0;
+    for (let i = 0; i < cleanedData.length; i++) {
+      if (skipIndices.has(i)) continue;
+      if (hitStatuses[i] && !multiWordIndices.has(i)) {
+        cacheChars += cleanedData[i].cleaned.length;
+      }
+    }
+    for (const item of toTranslate) {
+      liveChars += item.text.length;
+    }
+    const billableChars = cacheChars + liveChars;
+
+    let translateUpdatedUser = null;
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) { user = await getUserById(req.userId); }
+      const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
+      if (!allowed) {
+        return res.status(402).json({
+          error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+          message: user.plan_status === "pre"
+            ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+            : "You have used your 25,000 free characters.",
+          trial_chars_used: user.trial_chars_used,
+          trial_chars_limit: user.trial_chars_limit,
+        });
+      }
+      translateUpdatedUser = au;
+      if (translateUpdatedUser.trial_chars_used >= translateUpdatedUser.trial_chars_limit) {
+        if (user.plan_status === "free" && stripe && translateUpdatedUser.subscription_id) {
+          try {
+            await stripe.subscriptions.update(translateUpdatedUser.subscription_id, { trial_end: "now" });
+            console.log(`Trial ended early for user ${req.userId} after hitting char limit`);
+          } catch (stripeErr) {
+            console.error("Failed to end Stripe trial early:", stripeErr.message);
+          }
+        }
+      }
+    }
 
     if (toTranslate.length > 0) {
       const textsForAzure = toTranslate.map((item) => item.text);
@@ -1567,21 +1588,6 @@ app.post("/translate", requireAuth, async (req, res) => {
       'translator'
     );
 
-    let cacheChars = 0;
-    let liveChars = 0;
-
-    for (let i = 0; i < cleanedData.length; i++) {
-      if (skipIndices.has(i)) continue;
-      if (hitStatuses[i] && !multiWordIndices.has(i)) {
-        cacheChars += cleanedData[i].cleaned.length;
-      }
-    }
-    for (const item of toTranslate) {
-      liveChars += item.text.length;
-    }
-
-    const billableChars = cacheChars + liveChars;
-
     if (user && user.plan_status === "payg") {
       await incrementUserTrialChars(req.userId, billableChars);
 
@@ -1595,10 +1601,12 @@ app.post("/translate", requireAuth, async (req, res) => {
               value: String(charsToReport),
               stripe_customer_id: freshUser.stripe_customer_id,
             },
+            identifier: meterIdentifier,
           });
           console.log(`[payg] billed user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} units=${charsToReport}`);
         } catch (e) {
           console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+          await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", charsToReport, meterIdentifier);
         }
       }
 
@@ -1618,23 +1626,10 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
-      if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
-        if (user.plan_status === "free" && stripe && updatedUser.subscription_id) {
-          try {
-            await stripe.subscriptions.update(updatedUser.subscription_id, {
-              trial_end: "now",
-            });
-            console.log(`Trial ended early for user ${req.userId} after hitting char limit`);
-          } catch (stripeErr) {
-            console.error("Failed to end Stripe trial early:", stripeErr.message);
-          }
-        }
-      }
       return res.json({
         translations,
-        trial_chars_used: updatedUser ? updatedUser.trial_chars_used : null,
-        trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : null,
+        trial_chars_used: translateUpdatedUser ? translateUpdatedUser.trial_chars_used : null,
+        trial_chars_limit: translateUpdatedUser ? translateUpdatedUser.trial_chars_limit : null,
       });
     }
 
@@ -1663,6 +1658,8 @@ app.post("/translate", requireAuth, async (req, res) => {
 app.post("/cancel-subscription", requireAuth, handleCancelSubscription);
 
 app.post("/dictionary", requireAuth, async (req, res) => {
+  const idempotencyKey = req.headers["x-idempotency-key"] || crypto.randomUUID();
+  const meterIdentifier = `dictionary:${req.userId}:${idempotencyKey}`;
   try {
     let user = await getUserById(req.userId);
 
@@ -1689,29 +1686,10 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     const contextStr = typeof context === "string" ? context : "";
     const totalChars = word.trim().length + english.trim().length + contextStr.trim().length;
 
-    if (user && ["free", "pre"].includes(user.plan_status)) {
-      const reset = await resetUserCharsIfNeeded(req.userId);
-      if (reset) {
-        user = await getUserById(req.userId);
-      }
-      const charsUsed = user.trial_chars_used ?? 0;
-      const charsLimit = user.trial_chars_limit ?? 25000;
-      if (charsUsed >= charsLimit) {
-        if (user.plan_status === "pre") {
-          return res.status(402).json({
-            error: "monthly_limit_reached",
-            message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
-            trial_chars_used: charsUsed,
-            trial_chars_limit: charsLimit,
-          });
-        }
-        return res.status(402).json({
-          error: "trial_exhausted",
-          message: "You have used your 25,000 free characters.",
-          trial_chars_used: charsUsed,
-          trial_chars_limit: charsLimit,
-        });
-      }
+    const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
+    const usageRow = await getUsage();
+    if (usageRow.current_month_usage_chars + totalChars > QUOTA * 0.95) {
+      return res.status(503).json({ error: "usage_cap_reached" });
     }
 
     if (user && user.plan_status === "payg") {
@@ -1719,6 +1697,24 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       if (reset) {
         user = await getUserById(req.userId);
       }
+    }
+
+    let dictUpdatedUser = null;
+    if (user && ["free", "pre"].includes(user.plan_status)) {
+      const reset = await resetUserCharsIfNeeded(req.userId);
+      if (reset) { user = await getUserById(req.userId); }
+      const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
+      if (!allowed) {
+        return res.status(402).json({
+          error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+          message: user.plan_status === "pre"
+            ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+            : "You have used your 25,000 free characters.",
+          trial_chars_used: user.trial_chars_used,
+          trial_chars_limit: user.trial_chars_limit,
+        });
+      }
+      dictUpdatedUser = au;
     }
 
     let entry;
@@ -1753,10 +1749,12 @@ app.post("/dictionary", requireAuth, async (req, res) => {
                 value: String(charsToReport),
                 stripe_customer_id: freshUser.stripe_customer_id,
               },
+              identifier: meterIdentifier,
             });
             console.log(`[payg] billed user=${req.userId} total=${totalChars} units=${charsToReport}`);
           } catch (e) {
             console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+            await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", charsToReport, meterIdentifier);
           }
         }
       }
@@ -1776,11 +1774,10 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
       return res.json({
         ...entry,
-        trial_chars_used: updatedUser ? updatedUser.trial_chars_used : null,
-        trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : null,
+        trial_chars_used: dictUpdatedUser ? dictUpdatedUser.trial_chars_used : null,
+        trial_chars_limit: dictUpdatedUser ? dictUpdatedUser.trial_chars_limit : null,
       });
     }
 
@@ -1835,6 +1832,9 @@ app.get("/admin/website-activity", requireAdmin, async (req, res) => {
 });
 
 app.post("/tts", requireAuth, async (req, res) => {
+  const idempotencyKey = req.headers["x-idempotency-key"] || crypto.randomUUID();
+  const meterIdentifier = `tts:${req.userId}:${idempotencyKey}`;
+
   if (!process.env.AZURE_SPEECH_KEY) {
     return res.status(503).json({ error: "TTS service not configured" });
   }
@@ -1854,29 +1854,10 @@ app.post("/tts", requireAuth, async (req, res) => {
   const ttsChars = text.length;
   const weightedChars = ttsChars * 2;
 
-  if (user && ["free", "pre"].includes(user.plan_status)) {
-    const reset = await resetUserCharsIfNeeded(req.userId);
-    if (reset) {
-      user = await getUserById(req.userId);
-    }
-    const charsUsed = user.trial_chars_used ?? 0;
-    const charsLimit = user.trial_chars_limit ?? 25000;
-    if (charsUsed >= charsLimit) {
-      if (user.plan_status === "pre") {
-        return res.status(402).json({
-          error: "monthly_limit_reached",
-          message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
-          trial_chars_used: charsUsed,
-          trial_chars_limit: charsLimit,
-        });
-      }
-      return res.status(402).json({
-        error: "trial_exhausted",
-        message: "You have used your 25,000 free characters.",
-        trial_chars_used: charsUsed,
-        trial_chars_limit: charsLimit,
-      });
-    }
+  const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
+  const usageRow = await getUsage();
+  if (usageRow.current_month_usage_chars + ttsChars > QUOTA * 0.95) {
+    return res.status(503).json({ error: "usage_cap_reached" });
   }
 
   if (user && user.plan_status === "payg") {
@@ -1884,6 +1865,24 @@ app.post("/tts", requireAuth, async (req, res) => {
     if (reset) {
       user = await getUserById(req.userId);
     }
+  }
+
+  let ttsUpdatedUser = null;
+  if (user && ["free", "pre"].includes(user.plan_status)) {
+    const reset = await resetUserCharsIfNeeded(req.userId);
+    if (reset) { user = await getUserById(req.userId); }
+    const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);
+    if (!allowed) {
+      return res.status(402).json({
+        error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
+        message: user.plan_status === "pre"
+          ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
+          : "You have used your 25,000 free characters.",
+        trial_chars_used: user.trial_chars_used,
+        trial_chars_limit: user.trial_chars_limit,
+      });
+    }
+    ttsUpdatedUser = au;
   }
 
   const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -1938,16 +1937,14 @@ app.post("/tts", requireAuth, async (req, res) => {
               value: String(unitsToReport),
               stripe_customer_id: freshUser.stripe_customer_id,
             },
+            identifier: meterIdentifier,
           });
           console.log(`[tts] billed user=${req.userId} raw=${ttsChars} weighted=${weightedChars} units=${unitsToReport}`);
         } catch (e) {
           console.error("TTS PAYG Stripe meter event failed (non-fatal):", e.message);
+          await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", unitsToReport, meterIdentifier);
         }
       }
-    }
-
-    if (user && ["free", "pre"].includes(user.plan_status)) {
-      await incrementUserTrialChars(req.userId, weightedChars);
     }
 
     res.set("Content-Type", "audio/mpeg");
@@ -2007,6 +2004,30 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
+
+    if (stripe) {
+      setInterval(async () => {
+        try {
+          const rows = await getPendingMeterEvents(20);
+          for (const row of rows) {
+            try {
+              await stripe.billing.meterEvents.create({
+                event_name: row.event_name,
+                payload: { value: String(row.units), stripe_customer_id: row.stripe_customer_id },
+                identifier: row.identifier,
+              });
+              await updateMeterEventAttempt(row.id, true);
+              console.log(`[meter-drainer] succeeded: id=${row.id}`);
+            } catch (e) {
+              await updateMeterEventAttempt(row.id, false);
+              console.error(`[meter-drainer] retry failed: id=${row.id} attempt=${row.attempts + 1} err=${e.message}`);
+            }
+          }
+        } catch (drainErr) {
+          console.error("[meter-drainer] drainer error:", drainErr.message);
+        }
+      }, 60_000);
+    }
   } catch (error) {
     console.error("Failed to start server:", error);
     process.exit(1);

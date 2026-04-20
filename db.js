@@ -381,6 +381,25 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_click_events_created_at ON click_events(created_at)
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pending_meter_events (
+        id                 SERIAL PRIMARY KEY,
+        user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        stripe_customer_id VARCHAR(255) NOT NULL,
+        event_name         VARCHAR(100) NOT NULL DEFAULT 'translation_chars',
+        units              INTEGER NOT NULL,
+        identifier         VARCHAR(255) NOT NULL,
+        status             VARCHAR(20) NOT NULL DEFAULT 'pending',
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        last_attempted_at  TIMESTAMPTZ,
+        created_at         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_pending_meter_events_status ON pending_meter_events(status)
+    `);
+
     const oldKeyCheck = await client.query(`
       SELECT 1 FROM translations
       WHERE key ~ '^[^:]+:[0-9a-f]{1,8}$'
@@ -731,6 +750,27 @@ async function incrementUserTrialChars(userId, chars) {
   }
 }
 
+async function atomicCheckAndIncrementChars(userId, chars) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET trial_chars_used = trial_chars_used + $1
+       WHERE id = $2
+         AND trial_chars_used + $1 <= trial_chars_limit
+       RETURNING id, trial_chars_used, trial_chars_limit, plan_status, subscription_id, stripe_customer_id`,
+      [chars, userId]
+    );
+    if (result.rowCount === 0) return { allowed: false, user: null };
+    return { allowed: true, user: result.rows[0] };
+  } catch (error) {
+    console.error("Error in atomicCheckAndIncrementChars:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function updateUserPlanStatus(userId, planStatus, hasAccess, convertedAt, subscriptionId) {
   if (!process.env.DATABASE_URL) throw new Error("Database not configured");
 
@@ -981,6 +1021,69 @@ async function getWebsiteActivity(days) {
   }
 }
 
+async function insertPendingMeterEvent(userId, stripeCustomerId, eventName, units, identifier) {
+  if (!process.env.DATABASE_URL) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO pending_meter_events (user_id, stripe_customer_id, event_name, units, identifier)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, stripeCustomerId, eventName, units, identifier]
+    );
+  } catch (error) {
+    console.error("Error inserting pending meter event:", error);
+  } finally {
+    client.release();
+  }
+}
+
+async function getPendingMeterEvents(limit = 20) {
+  if (!process.env.DATABASE_URL) return [];
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT id, user_id, stripe_customer_id, event_name, units, identifier, attempts
+       FROM pending_meter_events
+       WHERE status = 'pending' AND attempts < 3
+       ORDER BY created_at ASC
+       LIMIT $1`,
+      [limit]
+    );
+    return result.rows;
+  } catch (error) {
+    console.error("Error getting pending meter events:", error);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+async function updateMeterEventAttempt(id, succeeded) {
+  if (!process.env.DATABASE_URL) return;
+
+  const client = await pool.connect();
+  try {
+    if (succeeded) {
+      await client.query(`DELETE FROM pending_meter_events WHERE id = $1`, [id]);
+    } else {
+      await client.query(
+        `UPDATE pending_meter_events
+         SET attempts = attempts + 1,
+             last_attempted_at = NOW(),
+             status = CASE WHEN attempts + 1 >= 3 THEN 'permanently_failed' ELSE status END
+         WHERE id = $1`,
+        [id]
+      );
+    }
+  } catch (error) {
+    console.error("Error updating meter event attempt:", error);
+  } finally {
+    client.release();
+  }
+}
+
 async function syncUserXp(userId, xpBalance, xpLifetimeEarned) {
   const client = await pool.connect();
   try {
@@ -1034,4 +1137,8 @@ module.exports = {
   getWebsiteActivity,
   syncUserXp,
   getUserXp,
+  insertPendingMeterEvent,
+  getPendingMeterEvents,
+  updateMeterEventAttempt,
+  atomicCheckAndIncrementChars,
 };

@@ -1,145 +1,249 @@
-# Technical Specification: Unified Character Billing
+# Technical Specification: Billing Safety Fixes
 
 ## Complexity Assessment
-**Hard** — involves multiple services with inconsistent counting logic, both per-user quota tracking and global server-side quota tracking, Stripe metered billing, and PAYG/premium/free plan differences across three endpoints.
+**Medium** — four targeted, isolated fixes. Each touches 1–3 well-defined locations. No schema rewrites. Highest risk item is Risk 3 (atomic quota), which restructures per-request control flow.
 
 ---
 
 ## Technical Context
 
 - **Language / Runtime**: Node.js (CommonJS)
-- **Key dependencies**: `pg`, `stripe`, `axios`, `express`, `jsonwebtoken`, `bcrypt`
-- **Azure Services in use**:
-  - Azure Translator (`/translate` endpoint → `azureTranslate`, `azureDictionaryLookup`)
-  - Azure OpenAI (`/dictionary` endpoint → `llmDictionary`)
-  - Azure TTS (`/tts` endpoint → Azure Speech REST API)
-- **Billing plans** (`users.plan_status`):
-  - `free` — 25,000 chars/30 days, `trial_chars_limit = 25000`
-  - `pre` — premium/paid, 1,000,000 chars/30 days, `trial_chars_limit = 1000000`
-  - `payg` — pay-as-you-go, no cap; Stripe metered billing per 1K chars
-  - `active` — legacy/unused transitional state; **no quota enforcement applied** (leave as-is)
-- **Quota fields** on `users`:
-  - `trial_chars_used` — running total of chars consumed this billing window
-  - `trial_chars_limit` — per-plan cap (25K free, 1M premium, 20M payg soft-cap)
-  - `chars_used_at_payg_start` — baseline to compute net PAYG usage display
-  - `free_chars_reset_date` — date when `trial_chars_used` resets to 0
-- **Global server-side quota** in `usage` table (`incrementUsage`):
-  - Tracks raw Azure Translator chars only (protects against blowing the app-level Azure quota)
-  - Checked before each translate request (95% threshold → 503)
+- **Key dependencies**: `pg`, `stripe`, `axios`, `express`, `crypto`
+- **Billing routes**: `POST /translate`, `POST /dictionary`, `POST /tts`
+- **Stripe surface**: `stripe.billing.meterEvents.create` (PAYG only)
+- **Quota fields on `users`**: `trial_chars_used`, `trial_chars_limit`, `free_chars_reset_date`
+- **Global cost guard**: `usage` table, `getUsage()` / `incrementUsage()` in `db.js`
+- **Plans subject to quota**: `free` (25K chars/30d), `pre` (1M chars/30d); `payg` has soft-cap only
 
 ---
 
-## Current State Analysis
+## Risk 1 — Stripe Meter Event Idempotency
 
-### `/translate` endpoint
-- Computes `totalChars` = sum of all normalized text lengths (including non-translatable/skipped segments).
-- Computes `cacheChars` = chars of cache-hit single-word segments (excluding skipped).
-- Computes `liveChars` = chars actually sent to Azure Translator.
-- Computes `billableChars = cacheChars + liveChars`.
-- **PAYG**: charges `billableChars` to `trial_chars_used` and reports `billableChars` to Stripe metered billing.
-- **free/pre**: charges **`totalChars`** (not `billableChars`) to `trial_chars_used`. ← **Bug/inconsistency**
-- `incrementUsage` (global server quota): called with `azureChars` (only live Azure calls, not cache). ✓ Correct for cost guard.
-- **Cache hits are billed** to PAYG users. ✓ Intended.
-- Cache hits are NOT counted in `incrementUsage`. ✓ Correct (they cost nothing on Azure).
+### Problem
+`stripe.billing.meterEvents.create` is called in `/translate`, `/dictionary`, and `/tts` with no `identifier` field. If the Stripe HTTP call times out and the caller retries (or if the handler runs twice due to a proxy/LB retry), Stripe will record the usage twice — double-billing the PAYG user.
 
-### `/dictionary` endpoint
-- Uses Azure OpenAI LLM.
-- `totalChars = word.trim().length` — only the word, not the `english` or `context` inputs. ← **Underbilling risk**: LLM processes all three inputs.
-- Checks free/pre quota before serving. ✓
-- Charges `totalChars` to `trial_chars_used` for free/pre and PAYG. ✓ (but undercounts)
-- **Does NOT call `incrementUsage`**. ← **Gap**: global cost guard doesn't account for LLM calls.
-- Users with `plan_status = 'active'` get through without any char charge. ← **Minor**: `active` appears legacy/unused.
+### Stripe API
+`stripe.billing.meterEvents.create` accepts an optional `identifier` string. Within a 10-minute deduplication window, Stripe rejects duplicate events with the same `identifier`. See: https://docs.stripe.com/api/billing/meter-event/create
 
-### `/tts` endpoint
-- Uses Azure Speech TTS.
-- `ttsChars = text.length`, `weightedChars = ttsChars * 2` (TTS priced 2× per char on Azure).
-- Checks free/pre quota before serving. ✓
-- Charges `weightedChars` to `trial_chars_used` for free/pre and PAYG. ✓
-- Bills `weightedChars` to Stripe for PAYG. ✓
-- **Does NOT call `incrementUsage`**. ← **Gap**: global cost guard doesn't account for TTS calls.
-- Users with `plan_status = 'active'` get through without any char charge. ← **Minor**.
+### Fix
+1. At the top of each handler, generate a per-request idempotency key:
+   - Accept an optional `X-Idempotency-Key` header from the client (allows true client-retry idempotency).
+   - If absent, generate a server-side UUID via `crypto.randomUUID()` (prevents server-internal retries only).
+2. Derive the meter event `identifier` as: `` `${route}:${userId}:${idempotencyKey}` ``
+   - `route` is the literal string `'translate'`, `'dictionary'`, or `'tts'`
+3. Pass as `identifier` in every `stripe.billing.meterEvents.create` call.
 
-### Global quota (`incrementUsage` / `usage` table)
-- Only tracks Azure Translator live-call chars.
-- Protects against server-level Azure overage (95% threshold = 503).
-- Does **not** include LLM or TTS costs.
+### Scope
+- `index.js`: three `stripe.billing.meterEvents.create` call sites
+- No `db.js` changes needed
 
----
-
-## Gaps / Inconsistencies Found
-
-| # | Issue | Severity |
-|---|-------|----------|
-| 1 | `/translate` free/pre charged `totalChars` (includes non-translatable skips) instead of `billableChars` | **High** — overcharges free/pre users vs. PAYG |
-| 2 | `/dictionary` only counts `word.length`, not full LLM input | **High** — underbills actual Azure OpenAI cost |
-| 3 | `/dictionary` and `/tts` do not call `incrementUsage` | **Medium** — global cost guard is blind to 2/3 services |
-| 4 | `/translate` charges free/pre `totalChars` vs. PAYG `billableChars` (inconsistent formula) | **High** — same as #1 |
-| 5 | No per-service breakdown in `translation_usage` analytics | **Low** — harder to audit costs per service |
-| 6 | `active` plan users bypass all char counting (legacy state) | **Low** — appears unused in practice |
-| 7 | Pre-check quota enforcement is non-atomic (race condition on concurrent requests) | **Low** — edge case, acceptable for now |
-
----
-
-## Unified Billing Proposal
-
-### Principle
-> **Bill the same chars for the same service across all plans.** Cache hits and live calls are both billed to users (they consume quota regardless of whether we paid Azure for them). Only live Azure calls count against the global server cost guard.
-
-### Per-service char formula
-
-| Service | User quota chars | Stripe PAYG units | Global `incrementUsage` |
-|---------|-----------------|-------------------|------------------------|
-| Translator (live) | `text.length` per segment | `ceil(sum / 1000)` | `sum` (live only) ✓ already correct |
-| Translator (cache hit) | `text.length` per segment | `ceil(sum / 1000)` | `0` (no Azure cost) ✓ already correct |
-| Dictionary / LLM | `word.length + english.length + context.length` | `ceil(totalChars / 1000)` | `totalChars` (raw, no weighting) ← add |
-| TTS | `text.length * 2` (weighted) | `ceil(weightedChars / 1000)` | `text.length` (raw, no weighting) ← add |
-
-**Rationale for TTS split:** User quota uses `* 2` to reflect that TTS consumes quota 2× faster (fairness to the service's higher Azure cost), but `incrementUsage` tracks raw Azure-billed characters (the Azure TTS pricing is per character sent, not weighted), so raw `text.length` is the accurate cost-guard figure.
-
-### Plan enforcement
-
-| Plan | Cap | Reset | Action at cap |
-|------|-----|-------|---------------|
-| `free` | 25,000 chars / 30 days | `free_chars_reset_date` | 402 `trial_exhausted` |
-| `pre` | 1,000,000 chars / 30 days | `free_chars_reset_date` | 402 `monthly_limit_reached` |
-| `payg` | None (soft warn at 20M) | `free_chars_reset_date` | Stripe meter; soft warning |
-
-### Cache hit billing policy
-Cache hits **are** billed to user quota (all plans). This is correct — the user benefits from the translation regardless of where it came from. Only the server's Azure cost guard (`incrementUsage`) excludes cache hits.
-
----
-
-## Data Model Changes
-
-### `translation_usage` table — add `service_type` column
-```sql
-ALTER TABLE translation_usage
-  ADD COLUMN IF NOT EXISTS service_type VARCHAR(20) NOT NULL DEFAULT 'translator';
+### Key format examples
 ```
-Values: `'translator'`, `'llm'`, `'tts'`
+translate:42:a1b2c3d4-e5f6-...
+dictionary:42:a1b2c3d4-e5f6-...
+tts:42:a1b2c3d4-e5f6-...
+```
 
-This allows per-service cost analytics without schema rework.
+---
 
-### `db.js` `initDatabase`
-Add migration block for `service_type` column (same pattern as existing column-add migrations).
+## Risk 2 — Stripe Meter Event Failure Handling
+
+### Problem
+All three routes catch Stripe meter failures with:
+```js
+} catch (e) {
+  console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+}
+```
+A Stripe outage or network error silently drops the billing record. Revenue is lost with no recovery path.
+
+### Fix
+Implement a **DB-backed retry queue** with a background drainer.
+
+#### New DB table: `pending_meter_events`
+```sql
+CREATE TABLE IF NOT EXISTS pending_meter_events (
+  id              SERIAL PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_customer_id  VARCHAR(255) NOT NULL,
+  event_name      VARCHAR(100) NOT NULL DEFAULT 'translation_chars',
+  units           INTEGER NOT NULL,
+  identifier      VARCHAR(255) NOT NULL,
+  status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_attempted_at  TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pending_meter_events_status ON pending_meter_events(status);
+```
+
+`status` values: `'pending'`, `'permanently_failed'`
+
+#### New `db.js` functions
+- `insertPendingMeterEvent(userId, stripeCustomerId, eventName, units, identifier)` — inserts a row with `status = 'pending'`
+- `getPendingMeterEvents(limit = 20)` — returns rows with `status = 'pending'` and `attempts < 3`, ordered by `created_at ASC`
+- `updateMeterEventAttempt(id, failed)` — increments `attempts`, sets `last_attempted_at = NOW()`; if `failed && attempts >= 3`, sets `status = 'permanently_failed'`
+
+#### Modified failure path in `index.js`
+On `stripe.billing.meterEvents.create` catch:
+```js
+} catch (e) {
+  console.error("[payg] Stripe meter event failed, queuing for retry:", e.message);
+  await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, 'translation_chars', charsToReport, meterIdentifier);
+}
+```
+
+#### Background drainer (in `index.js`, started after DB init)
+```js
+setInterval(async () => {
+  const rows = await getPendingMeterEvents(20);
+  for (const row of rows) {
+    try {
+      await stripe.billing.meterEvents.create({
+        event_name: row.event_name,
+        payload: { value: String(row.units), stripe_customer_id: row.stripe_customer_id },
+        identifier: row.identifier,
+      });
+      await updateMeterEventAttempt(row.id, false);
+      console.log(`[meter-drainer] retried and succeeded: id=${row.id}`);
+    } catch (e) {
+      await updateMeterEventAttempt(row.id, true);
+      console.error(`[meter-drainer] retry failed (attempt ${row.attempts + 1}): id=${row.id} err=${e.message}`);
+    }
+  }
+}, 60_000);
+```
+
+After 3 failures, the row is marked `permanently_failed` and logged at `console.error` level for operator alerting (no silent loss).
+
+The drainer only runs if `stripe` is configured (guard with `if (!stripe) return`).
+
+### Scope
+- `db.js`: `initDatabase` migration block + 3 new exported functions
+- `index.js`: 3 catch blocks + drainer setup after `startServer`
+- Exports: add `insertPendingMeterEvent`, `getPendingMeterEvents`, `updateMeterEventAttempt` to `module.exports`
+
+---
+
+## Risk 3 — Race Condition on Quota Check
+
+### Problem
+For `free` and `pre` users, quota enforcement is a read-then-write:
+1. **Read** `trial_chars_used`, `trial_chars_limit` from DB
+2. If used < limit → proceed
+3. Call Azure (takes 100–500ms)
+4. **Write** `incrementUserTrialChars(userId, chars)`
+
+Two concurrent requests can both pass step 2 with the same stale read, then both call Azure, then both increment — consuming up to 2× the remaining quota.
+
+### Fix
+Replace the two-step read+check with a single atomic SQL UPDATE for `free` and `pre` plans:
+
+```sql
+UPDATE users
+SET trial_chars_used = trial_chars_used + $1
+WHERE id = $2
+  AND trial_chars_used + $1 <= trial_chars_limit
+RETURNING id, trial_chars_used, trial_chars_limit, plan_status, subscription_id, stripe_customer_id
+```
+
+- If `rowCount === 1` → quota was available; row now shows the committed new value. Proceed.
+- If `rowCount === 0` → quota exceeded atomically. Return 402.
+
+This "reserve-then-use" pattern: chars are debited **before** the Azure call. If Azure fails after reservation, the chars are consumed. **Decision (confirmed by user): no refund-on-error. Reserve-then-use is final.** This is acceptable — the alternative (post-billing) has the race.
+
+#### New `db.js` function
+```js
+async function atomicCheckAndIncrementChars(userId, chars)
+// Returns { allowed: boolean, user: row | null }
+// allowed=false means quota exceeded; user is null in that case
+```
+
+#### Handler restructuring (`free`/`pre` path)
+Before (current):
+```js
+// Step A (early): read user, check quota
+if (charsUsed >= charsLimit) return 402;
+// ... call Azure ...
+// Step B (late): increment
+const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
+```
+
+After:
+```js
+// Single atomic step: check AND increment
+const { allowed, user: updatedUser } = await atomicCheckAndIncrementChars(req.userId, billableChars);
+if (!allowed) return 402 quota_exceeded;
+// ... call Azure ...
+// No second increment needed — already done atomically
+```
+
+**Important**: `billableChars` for `/translate` is known before the Azure call because it depends on segment lengths, not Azure responses. Compute it up front (already done at line 1583 conceptually — `cacheChars + liveChars`). For `/dictionary` and `/tts`, `totalChars`/`weightedChars` are also computed before the external call. So all three endpoints can do the atomic increment before hitting Azure.
+
+#### Applies to
+- `/translate` — `free` and `pre` branches
+- `/dictionary` — `free` and `pre` branches
+- `/tts` — `free` and `pre` branches
+- **Not `payg`** — payg has no hard quota; its `incrementUserTrialChars` can remain post-call
+
+#### Error response for quota exceeded via atomic path
+Use the same 402 body as the existing check (plan-appropriate `trial_exhausted` vs `monthly_limit_reached`), but the user object used for `plan_status` comparison comes from the pre-request `getUserById` read (still needed for plan routing).
+
+### Scope
+- `db.js`: 1 new function `atomicCheckAndIncrementChars`, exported
+- `index.js`: restructure `free`/`pre` quota path in all 3 handlers; remove post-call `incrementUserTrialChars` for `free`/`pre`
+
+---
+
+## Risk 4 — Global Azure Cost Guard on `/dictionary` and `/tts`
+
+### Problem
+`/translate` checks the global `usage` table before calling Azure (lines 1327–1331):
+```js
+const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
+const usageRow = await getUsage();
+if (usageRow.current_month_usage_chars + totalChars > QUOTA * 0.95) {
+  return res.status(503).json({ error: "usage_cap_reached" });
+}
+```
+`/dictionary` and `/tts` have no equivalent guard. A burst of dictionary/TTS requests can silently exceed the Azure monthly budget.
+
+### Fix
+Add the identical guard to `/dictionary` (before `llmDictionary` call) and `/tts` (before the Azure Speech fetch). Use the same variable names, same 95% threshold, same 503 response.
+
+For `/dictionary`, the guard char count is `totalChars` (already computed as `word.trim().length + english.trim().length + contextStr.trim().length`).
+
+For `/tts`, the guard char count is `ttsChars` (raw `text.length`, not weighted — same rationale as Risk 4 column in prior spec: `incrementUsage` tracks raw Azure-billed chars).
+
+### Scope
+- `index.js`: 2 insertion points (one in `/dictionary`, one in `/tts`)
+- No `db.js` changes needed
+
+---
+
+## Data Model Changes Summary
+
+| Table | Change |
+|-------|--------|
+| `pending_meter_events` | New table (Risk 2) |
+
+All other changes are code-only.
 
 ---
 
 ## Files to Modify
 
-| File | Changes |
-|------|---------|
-| `db.js` | Add `service_type` migration in `initDatabase` |
-| `index.js` | Fix 5 billing issues (see Implementation Plan) |
-| `analytics.js` | Update `logTranslationUsage` to accept and store `service_type` |
+| File | Risks |
+|------|-------|
+| `db.js` | Risk 2 (table migration + 3 functions), Risk 3 (1 function) |
+| `index.js` | Risk 1 (3 call sites), Risk 2 (3 catch blocks + drainer), Risk 3 (3 handlers restructured), Risk 4 (2 guard blocks) |
 
 ---
 
 ## Verification Approach
 
-1. Manual smoke test: create a free user, call `/translate`, `/dictionary`, `/tts` in sequence; verify `trial_chars_used` increments correctly for each.
-2. Verify PAYG Stripe meter events fire with correct char counts for all three services.
-3. Verify `incrementUsage` is called by `/dictionary` and `/tts`.
-4. Verify `/translate` free/pre users are charged `billableChars` not `totalChars`.
-5. Verify premium (`pre`) users are hard-stopped at 1,000,000 chars/month.
-6. Check `npm run lint` / `node --check index.js` for syntax errors (no test framework found in `package.json`).
+1. **Risk 1**: Log the `identifier` passed to Stripe; confirm format `route:userId:uuid` in server logs for `/translate`, `/dictionary`, `/tts`.
+2. **Risk 2**: Temporarily throw in the Stripe call; verify row appears in `pending_meter_events`; verify drainer picks it up within 60s and logs success/failure.
+3. **Risk 3**: Simulate two concurrent requests that together exceed a user's remaining quota (e.g., 200 chars left, two requests of 150 chars); verify only one succeeds (201 status), the other gets 402.
+4. **Risk 4**: Set `MONTHLY_CHAR_LIMIT=1` in `.env`; call `/dictionary` and `/tts`; verify both return 503 `usage_cap_reached`.
+5. **Syntax check**: `node --check index.js && node --check db.js`
