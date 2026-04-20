@@ -413,6 +413,28 @@ async function initDatabase() {
       console.log(`Cache purged: ${badEntriesDelete.rowCount} bad cached entries (containing *, <, or http) removed.`);
     }
 
+    await client.query(`
+      ALTER TABLE translations ENABLE ROW LEVEL SECURITY
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        DROP POLICY IF EXISTS "anon_select" ON translations;
+        CREATE POLICY "anon_select" ON translations FOR SELECT TO anon USING (true);
+
+        DROP POLICY IF EXISTS "anon_insert" ON translations;
+        CREATE POLICY "anon_insert" ON translations FOR INSERT TO anon WITH CHECK (true);
+
+        DROP POLICY IF EXISTS "anon_update" ON translations;
+        CREATE POLICY "anon_update" ON translations FOR UPDATE TO anon USING (true);
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_translations_key ON translations (key)
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
