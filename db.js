@@ -413,6 +413,24 @@ async function initDatabase() {
       console.log(`Cache purged: ${badEntriesDelete.rowCount} bad cached entries (containing *, <, or http) removed.`);
     }
 
+    await client.query(`
+      CREATE OR REPLACE VIEW translation_usage_with_email AS
+      SELECT
+        tu.id,
+        tu.user_id,
+        u.email,
+        tu.segment_text,
+        tu.source_lang,
+        tu.target_lang,
+        tu.domain,
+        tu.was_cache_hit,
+        tu.character_count,
+        tu.created_at
+      FROM translation_usage tu
+      LEFT JOIN users u ON u.id = tu.user_id
+      ORDER BY tu.created_at DESC
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
