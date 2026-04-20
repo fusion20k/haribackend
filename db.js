@@ -329,6 +329,18 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_usage_created_at ON translation_usage(created_at)
     `);
 
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'translation_usage' AND column_name = 'service_type'
+        ) THEN
+          ALTER TABLE translation_usage ADD COLUMN service_type VARCHAR(20) NOT NULL DEFAULT 'translator';
+        END IF;
+      END $$;
+    `);
+
     const resetDay = parseInt(process.env.BILLING_RESET_DAY) || 1;
     const now = new Date();
     let nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), resetDay));

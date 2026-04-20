@@ -8,7 +8,7 @@ const pool = new Pool({
   max: 10,
 });
 
-async function logTranslationUsage(userId, segments, hitStatuses, domain, sourceLang, targetLang) {
+async function logTranslationUsage(userId, segments, hitStatuses, domain, sourceLang, targetLang, serviceType = 'translator') {
   if (!process.env.DATABASE_URL) {
     return;
   }
@@ -29,9 +29,9 @@ async function logTranslationUsage(userId, segments, hitStatuses, domain, source
       const placeholders = [];
 
       segments.forEach((segment, i) => {
-        const offset = i * 7;
+        const offset = i * 8;
         placeholders.push(
-          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`
+          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`
         );
         values.push(
           userId,
@@ -40,12 +40,13 @@ async function logTranslationUsage(userId, segments, hitStatuses, domain, source
           targetLang,
           domain,
           hitStatuses[i],
-          segment.length
+          segment.length,
+          serviceType
         );
       });
 
       const query = `
-        INSERT INTO translation_usage (user_id, segment_text, source_lang, target_lang, domain, was_cache_hit, character_count)
+        INSERT INTO translation_usage (user_id, segment_text, source_lang, target_lang, domain, was_cache_hit, character_count, service_type)
         VALUES ${placeholders.join(", ")}
       `;
 

@@ -1563,7 +1563,8 @@ app.post("/translate", requireAuth, async (req, res) => {
       hitStatuses,
       validatedDomain,
       sourceLang,
-      targetLang
+      targetLang,
+      'translator'
     );
 
     let cacheChars = 0;
@@ -1617,7 +1618,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      const updatedUser = await incrementUserTrialChars(req.userId, totalChars);
+      const updatedUser = await incrementUserTrialChars(req.userId, billableChars);
       if (updatedUser && updatedUser.trial_chars_used >= updatedUser.trial_chars_limit) {
         if (user.plan_status === "free" && stripe && updatedUser.subscription_id) {
           try {
@@ -1686,7 +1687,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     const contextStr = typeof context === "string" ? context : "";
-    const totalChars = word.trim().length;
+    const totalChars = word.trim().length + english.trim().length + contextStr.trim().length;
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
@@ -1727,6 +1728,17 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       console.error("[dictionary] LLM error:", llmErr.message);
       return res.status(500).json({ error: "dictionary_unavailable" });
     }
+
+    await incrementUsage(totalChars);
+    logTranslationUsage(
+      req.userId,
+      [word.trim()],
+      [false],
+      'dictionary',
+      'tl',
+      'en',
+      'llm'
+    );
 
     if (user && user.plan_status === "payg") {
       await incrementUserTrialChars(req.userId, totalChars);
@@ -1902,6 +1914,17 @@ app.post("/tts", requireAuth, async (req, res) => {
       console.error("Azure TTS error:", response.status, errorBody);
       return res.status(response.status).json({ error: "TTS request failed", details: errorBody });
     }
+
+    await incrementUsage(ttsChars);
+    logTranslationUsage(
+      req.userId,
+      [text],
+      [false],
+      'tts',
+      'fil',
+      'fil',
+      'tts'
+    );
 
     if (user && user.plan_status === "payg") {
       await incrementUserTrialChars(req.userId, weightedChars);
