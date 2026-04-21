@@ -15,6 +15,7 @@ const adminPool = new Pool({
   max: 5,
 });
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
+const paymentsCache = {};
 const axios = require("axios");
 const {
   initDatabase,
@@ -584,6 +585,283 @@ app.get("/admin/activity", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Admin activity error:", err);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+function getRangeTimestamp(range) {
+  const now = new Date();
+  switch (range) {
+    case "today": {
+      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      return Math.floor(start.getTime() / 1000);
+    }
+    case "7d":
+      return Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000);
+    case "30d":
+      return Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
+    case "90d":
+      return Math.floor((Date.now() - 90 * 24 * 60 * 60 * 1000) / 1000);
+    case "all":
+    default:
+      return null;
+  }
+}
+
+async function fetchPaymentsForRange(range) {
+  const cacheKey = range;
+  const cached = paymentsCache[cacheKey];
+  if (cached && Date.now() - cached.ts < 30000) {
+    return cached.data;
+  }
+
+  const listParams = {
+    limit: 100,
+    expand: ["data.customer", "data.invoice"],
+  };
+  const gte = getRangeTimestamp(range);
+  if (gte !== null) {
+    listParams.created = { gte };
+  }
+
+  const payments = [];
+  await stripe.paymentIntents.list(listParams).autoPagingEach((pi) => {
+    payments.push(pi);
+  });
+
+  paymentsCache[cacheKey] = { ts: Date.now(), data: payments };
+  return payments;
+}
+
+function extractPaymentShape(pi) {
+  const charge = pi.latest_charge && typeof pi.latest_charge === "object"
+    ? pi.latest_charge
+    : (pi.charges && pi.charges.data && pi.charges.data[0]) || null;
+
+  const card = charge && charge.payment_method_details && charge.payment_method_details.card
+    ? charge.payment_method_details.card
+    : null;
+
+  const invoice = pi.invoice && typeof pi.invoice === "object" ? pi.invoice : null;
+  const invoiceLine = invoice && invoice.lines && invoice.lines.data && invoice.lines.data[0]
+    ? invoice.lines.data[0]
+    : null;
+  const price = invoiceLine ? (invoiceLine.price || null) : null;
+
+  const customer = pi.customer && typeof pi.customer === "object" ? pi.customer : null;
+
+  let plan = null;
+  if (price) {
+    plan = {
+      id: price.id || null,
+      nickname: price.nickname || null,
+      type: price.type || null,
+    };
+  } else if (pi.metadata && pi.metadata.plan) {
+    plan = { id: null, nickname: pi.metadata.plan, type: null };
+  }
+
+  const amountRefunded = charge && charge.amount_refunded ? charge.amount_refunded : 0;
+  const refunded = amountRefunded > 0;
+
+  const receiptUrl = charge && charge.receipt_url ? charge.receipt_url : null;
+  const invoiceUrl = invoice && invoice.hosted_invoice_url ? invoice.hosted_invoice_url : null;
+
+  return {
+    id: pi.id,
+    created: pi.created,
+    amount: pi.amount,
+    currency: pi.currency,
+    status: pi.status,
+    refunded,
+    amount_refunded: amountRefunded,
+    customer: customer
+      ? { id: customer.id || null, email: customer.email || null, name: customer.name || null }
+      : null,
+    plan,
+    payment_method: card
+      ? { brand: card.brand || null, last4: card.last4 || null }
+      : null,
+    receipt_url: receiptUrl,
+    invoice_url: invoiceUrl,
+    description: pi.description || null,
+  };
+}
+
+function applyFilters(payments, { status, search }) {
+  let filtered = payments;
+
+  if (status && status !== "all") {
+    filtered = filtered.filter((p) => {
+      if (status === "succeeded") return p.status === "succeeded";
+      if (status === "pending") return p.status === "processing";
+      if (status === "failed") return p.status === "canceled" || p.status === "requires_payment_method";
+      if (status === "refunded") return p.amount_refunded > 0;
+      return true;
+    });
+  }
+
+  if (search && search.trim() !== "") {
+    const q = search.trim().toLowerCase();
+    filtered = filtered.filter((p) => {
+      const email = p.customer && p.customer.email ? p.customer.email.toLowerCase() : "";
+      const customerId = p.customer && p.customer.id ? p.customer.id.toLowerCase() : "";
+      return email.includes(q) || customerId.includes(q);
+    });
+  }
+
+  return filtered;
+}
+
+function applySort(payments, sort) {
+  const sorted = payments.slice();
+  switch (sort) {
+    case "date_asc":
+      sorted.sort((a, b) => a.created - b.created);
+      break;
+    case "amount_desc":
+      sorted.sort((a, b) => b.amount - a.amount);
+      break;
+    case "amount_asc":
+      sorted.sort((a, b) => a.amount - b.amount);
+      break;
+    case "date_desc":
+    default:
+      sorted.sort((a, b) => b.created - a.created);
+      break;
+  }
+  return sorted;
+}
+
+async function computeKpis(paymentIntents) {
+  const now = new Date();
+  const todayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000;
+  const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000;
+
+  const totalRevenue = {};
+  const revenueThisMonth = {};
+  const revenueToday = {};
+  let succeededCount = 0;
+  const payment_count = paymentIntents.length;
+
+  for (const pi of paymentIntents) {
+    if (pi.status === "succeeded") {
+      succeededCount++;
+      const cur = pi.currency;
+      const amt = pi.amount_received || 0;
+
+      totalRevenue[cur] = (totalRevenue[cur] || 0) + amt;
+
+      if (pi.created >= monthStart) {
+        revenueThisMonth[cur] = (revenueThisMonth[cur] || 0) + amt;
+      }
+      if (pi.created >= todayStart) {
+        revenueToday[cur] = (revenueToday[cur] || 0) + amt;
+      }
+    }
+  }
+
+  const avg_payment = {};
+  for (const cur of Object.keys(totalRevenue)) {
+    avg_payment[cur] = succeededCount > 0 ? Math.round(totalRevenue[cur] / succeededCount) : 0;
+  }
+
+  let active_subscriptions = 0;
+  const mrr = {};
+
+  if (stripe) {
+    await stripe.subscriptions.list({ status: "active", limit: 100 }).autoPagingEach((sub) => {
+      active_subscriptions++;
+      for (const item of (sub.items && sub.items.data) || []) {
+        const price = item.price;
+        if (!price || !price.recurring) continue;
+        const cur = price.currency;
+        let monthlyAmount = price.unit_amount || 0;
+        const interval = price.recurring.interval;
+        const intervalCount = price.recurring.interval_count || 1;
+        if (interval === "year") {
+          monthlyAmount = Math.round(monthlyAmount / (12 * intervalCount));
+        } else if (interval === "week") {
+          monthlyAmount = Math.round((monthlyAmount * 52) / (12 * intervalCount));
+        } else if (interval === "day") {
+          monthlyAmount = Math.round((monthlyAmount * 365) / (12 * intervalCount));
+        } else {
+          monthlyAmount = Math.round(monthlyAmount / intervalCount);
+        }
+        mrr[cur] = (mrr[cur] || 0) + monthlyAmount;
+      }
+    });
+  }
+
+  return {
+    total_revenue: totalRevenue,
+    revenue_this_month: revenueThisMonth,
+    revenue_today: revenueToday,
+    payment_count,
+    avg_payment,
+    active_subscriptions,
+    mrr,
+  };
+}
+
+app.get("/admin/payments", requireAdmin, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured" });
+
+  try {
+    const validRanges = ["today", "7d", "30d", "90d", "all"];
+    const validStatuses = ["all", "succeeded", "pending", "refunded", "failed"];
+    const validSorts = ["date_desc", "date_asc", "amount_desc", "amount_asc"];
+
+    const range = validRanges.includes(req.query.range) ? req.query.range : "30d";
+    const status = validStatuses.includes(req.query.status) ? req.query.status : "all";
+    const search = typeof req.query.search === "string" ? req.query.search : "";
+    const sort = validSorts.includes(req.query.sort) ? req.query.sort : "date_desc";
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+
+    const rawPis = await fetchPaymentsForRange(range);
+    const kpis = await computeKpis(rawPis);
+
+    const allMapped = rawPis.map(extractPaymentShape);
+    const filtered = applyFilters(allMapped, { status, search });
+    const sorted = applySort(filtered, sort);
+
+    const count = sorted.length;
+    const totalPages = Math.ceil(count / pageSize) || 1;
+    const sum_by_currency = {};
+    let succeeded_count = 0;
+    let refunded_count = 0;
+    let failed_count = 0;
+
+    for (const p of sorted) {
+      const cur = p.currency || "usd";
+      if (p.status === "succeeded") {
+        sum_by_currency[cur] = (sum_by_currency[cur] || 0) + (p.amount || 0);
+        succeeded_count++;
+      }
+      if (p.amount_refunded > 0) refunded_count++;
+      if (p.status === "canceled" || p.status === "requires_payment_method") failed_count++;
+    }
+
+    const start = (page - 1) * pageSize;
+    const payments = sorted.slice(start, start + pageSize);
+
+    res.json({
+      payments,
+      totals: {
+        count,
+        page,
+        pageSize,
+        totalPages,
+        sum_by_currency,
+        succeeded_count,
+        refunded_count,
+        failed_count,
+      },
+      kpis,
+    });
+  } catch (err) {
+    console.error("Admin payments error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
