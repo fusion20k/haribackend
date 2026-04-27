@@ -247,6 +247,18 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'extension_enabled'
+        ) THEN
+          ALTER TABLE users ADD COLUMN extension_enabled BOOLEAN DEFAULT NULL;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       UPDATE users
       SET plan_status = 'free',
           trial_chars_limit = 25000,
@@ -556,7 +568,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -574,13 +586,31 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
   } catch (error) {
     console.error("Error getting user by email:", error);
     return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function setUserExtensionStatus(userId, enabled) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users SET extension_enabled = $1 WHERE id = $2
+       RETURNING id, extension_enabled`,
+      [enabled, userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error setting extension status:", error);
+    throw error;
   } finally {
     client.release();
   }
@@ -1141,4 +1171,5 @@ module.exports = {
   getPendingMeterEvents,
   updateMeterEventAttempt,
   atomicCheckAndIncrementChars,
+  setUserExtensionStatus,
 };

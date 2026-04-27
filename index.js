@@ -46,6 +46,7 @@ const {
   getPendingMeterEvents,
   updateMeterEventAttempt,
   atomicCheckAndIncrementChars,
+  setUserExtensionStatus,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -1089,6 +1090,23 @@ app.post("/start-trial", async (req, res) => {
   }
 });
 
+app.post("/extension/status", requireAuth, async (req, res) => {
+  const { enabled } = req.body;
+  if (typeof enabled !== "boolean") {
+    return res.status(400).json({ error: "enabled must be a boolean" });
+  }
+  try {
+    const row = await setUserExtensionStatus(req.userId, enabled);
+    if (!row) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ extension_enabled: row.extension_enabled });
+  } catch (err) {
+    console.error("/extension/status error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.get("/me", requireAuth, async (req, res) => {
   try {
     let user = await getUserById(req.userId);
@@ -1115,6 +1133,7 @@ app.get("/me", requireAuth, async (req, res) => {
       trial_chars_limit: user.trial_chars_limit ?? 25000,
       trial_started_at: user.trial_started_at || null,
       free_chars_reset_date: user.free_chars_reset_date || null,
+      extension_enabled: user.extension_enabled ?? null,
     };
 
     if (user.plan_status === "payg") {
