@@ -47,6 +47,7 @@ const {
   updateMeterEventAttempt,
   atomicCheckAndIncrementChars,
   setUserExtensionStatus,
+  disableUserExtension,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -1100,11 +1101,27 @@ app.post("/extension/status", requireAuth, async (req, res) => {
     if (!row) {
       return res.status(404).json({ error: "User not found" });
     }
-    res.json({ extension_enabled: row.extension_enabled });
+    res.json({ extension_enabled: row.extension_enabled, extension_last_seen_at: row.extension_last_seen_at });
   } catch (err) {
     console.error("/extension/status error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+app.get("/extension/uninstalled", async (req, res) => {
+  const { token } = req.query;
+  try {
+    if (token) {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      const userId = payload.userId;
+      if (userId) {
+        await disableUserExtension(userId);
+      }
+    }
+  } catch (err) {
+    console.error("/extension/uninstalled error (non-fatal):", err.message);
+  }
+  res.status(200).send("ok");
 });
 
 app.get("/me", requireAuth, async (req, res) => {
@@ -1134,6 +1151,11 @@ app.get("/me", requireAuth, async (req, res) => {
       trial_started_at: user.trial_started_at || null,
       free_chars_reset_date: user.free_chars_reset_date || null,
       extension_enabled: user.extension_enabled ?? null,
+      extension_last_seen_at: user.extension_last_seen_at || null,
+      extension_effectively_enabled:
+        user.extension_enabled === true &&
+        user.extension_last_seen_at != null &&
+        new Date(user.extension_last_seen_at) > new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
     };
 
     if (user.plan_status === "payg") {
