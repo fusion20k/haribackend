@@ -974,6 +974,34 @@ async function resetUserCharsIfNeeded(userId) {
   }
 }
 
+async function resetAllUsersCharsIfNeeded() {
+  if (!process.env.DATABASE_URL) return [];
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET trial_chars_used = 0,
+           chars_used_at_payg_start = 0,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+       WHERE free_chars_reset_date IS NOT NULL
+         AND free_chars_reset_date <= CURRENT_DATE
+       RETURNING id, plan_status`
+    );
+
+    if (result.rowCount > 0) {
+      console.log(`[char-reset] reset ${result.rowCount} users`);
+    }
+
+    return result.rows;
+  } catch (error) {
+    console.error("Error in resetAllUsersCharsIfNeeded:", error);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
 async function activatePaygPlan(userId, subscriptionId, stripeItemId) {
   if (!process.env.DATABASE_URL) throw new Error("Database not configured");
 
@@ -1193,6 +1221,7 @@ module.exports = {
   incrementUsage,
   resetUsageIfNeeded,
   resetUserCharsIfNeeded,
+  resetAllUsersCharsIfNeeded,
   insertClickEvent,
   getWebsiteActivity,
   syncUserXp,

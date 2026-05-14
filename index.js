@@ -38,6 +38,7 @@ const {
   getUsage,
   incrementUsage,
   resetUserCharsIfNeeded,
+  resetAllUsersCharsIfNeeded,
   insertClickEvent,
   getWebsiteActivity,
   syncUserXp,
@@ -2323,6 +2324,16 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
+
+    resetAllUsersCharsIfNeeded().catch((error) => {
+      console.error("[char-reset] startup run failed:", error.message);
+    });
+
+    setInterval(() => {
+      resetAllUsersCharsIfNeeded().catch((error) => {
+        console.error("[char-reset] scheduled run failed:", error.message);
+      });
+    }, 30 * 60 * 1000);
 
     if (stripe) {
       setInterval(async () => {
