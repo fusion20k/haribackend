@@ -17,6 +17,7 @@ const adminPool = new Pool({
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
 const paymentsCache = {};
 const axios = require("axios");
+const FREE_PLAN_LIMIT = 15000;
 const {
   initDatabase,
   findTranslationsByKeys,
@@ -923,7 +924,7 @@ app.post("/auth/signup", async (req, res) => {
       hasAccess: true,
       plan_status: "free",
       trial_chars_used: 0,
-      trial_chars_limit: 25000,
+      trial_chars_limit: FREE_PLAN_LIMIT,
     });
   } catch (err) {
     console.error("Signup error:", err);
@@ -961,7 +962,7 @@ app.post("/auth/login", async (req, res) => {
       hasAccess,
       plan_status: user.plan_status || null,
       trial_chars_used: user.trial_chars_used ?? 0,
-      trial_chars_limit: user.trial_chars_limit ?? 25000,
+      trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
     });
   } catch (err) {
     console.error("Login error:", err);
@@ -1148,7 +1149,7 @@ app.get("/me", requireAuth, async (req, res) => {
       has_access: hasAccess,
       plan_status: user.plan_status || null,
       trial_chars_used: user.trial_chars_used ?? 0,
-      trial_chars_limit: user.trial_chars_limit ?? 25000,
+      trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
       trial_started_at: user.trial_started_at || null,
       free_chars_reset_date: user.free_chars_reset_date || null,
       extension_enabled: user.extension_enabled ?? null,
@@ -1315,7 +1316,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       plan_status: updatedUser ? updatedUser.plan_status : subscription.status,
       has_access: updatedUser ? updatedUser.has_access : true,
       trial_chars_used: updatedUser ? updatedUser.trial_chars_used : 0,
-      trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : 25000,
+      trial_chars_limit: updatedUser ? updatedUser.trial_chars_limit : FREE_PLAN_LIMIT,
     });
   } catch (err) {
     console.error("/billing/verify-session error:", err);
@@ -1714,11 +1715,18 @@ app.post("/translate", requireAuth, async (req, res) => {
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
       if (!allowed) {
+        if (user.plan_status === "free") {
+          return res.status(402).json({
+            allowed: false,
+            reason: "FREE_LIMIT_REACHED",
+            limit: FREE_PLAN_LIMIT,
+            used: user.trial_chars_used,
+            remaining: 0,
+          });
+        }
         return res.status(402).json({
-          error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
-          message: user.plan_status === "pre"
-            ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
-            : "You have used your 25,000 free characters.",
+          error: "monthly_limit_reached",
+          message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
           trial_chars_used: user.trial_chars_used,
           trial_chars_limit: user.trial_chars_limit,
         });
@@ -1946,11 +1954,18 @@ app.post("/translate", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      return res.json({
+      const resp = {
         translations,
         trial_chars_used: translateUpdatedUser ? translateUpdatedUser.trial_chars_used : null,
         trial_chars_limit: translateUpdatedUser ? translateUpdatedUser.trial_chars_limit : null,
-      });
+      };
+      if (user.plan_status === "free") {
+        const used = translateUpdatedUser ? translateUpdatedUser.trial_chars_used : 0;
+        if (used >= FREE_PLAN_LIMIT) resp.quota_warning = "100";
+        else if (used >= 13500) resp.quota_warning = "90";
+        else if (used >= 12000) resp.quota_warning = "80";
+      }
+      return res.json(resp);
     }
 
     return res.json({ translations });
@@ -2025,11 +2040,18 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
       if (!allowed) {
+        if (user.plan_status === "free") {
+          return res.status(402).json({
+            allowed: false,
+            reason: "FREE_LIMIT_REACHED",
+            limit: FREE_PLAN_LIMIT,
+            used: user.trial_chars_used,
+            remaining: 0,
+          });
+        }
         return res.status(402).json({
-          error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
-          message: user.plan_status === "pre"
-            ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
-            : "You have used your 25,000 free characters.",
+          error: "monthly_limit_reached",
+          message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
           trial_chars_used: user.trial_chars_used,
           trial_chars_limit: user.trial_chars_limit,
         });
@@ -2094,11 +2116,18 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     if (user && ["free", "pre"].includes(user.plan_status)) {
-      return res.json({
+      const resp = {
         ...entry,
         trial_chars_used: dictUpdatedUser ? dictUpdatedUser.trial_chars_used : null,
         trial_chars_limit: dictUpdatedUser ? dictUpdatedUser.trial_chars_limit : null,
-      });
+      };
+      if (user.plan_status === "free") {
+        const used = dictUpdatedUser ? dictUpdatedUser.trial_chars_used : 0;
+        if (used >= FREE_PLAN_LIMIT) resp.quota_warning = "100";
+        else if (used >= 13500) resp.quota_warning = "90";
+        else if (used >= 12000) resp.quota_warning = "80";
+      }
+      return res.json(resp);
     }
 
     return res.json(entry);
@@ -2193,11 +2222,18 @@ app.post("/tts", requireAuth, async (req, res) => {
     if (reset) { user = await getUserById(req.userId); }
     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);
     if (!allowed) {
+      if (user.plan_status === "free") {
+        return res.status(402).json({
+          allowed: false,
+          reason: "FREE_LIMIT_REACHED",
+          limit: FREE_PLAN_LIMIT,
+          used: user.trial_chars_used,
+          remaining: 0,
+        });
+      }
       return res.status(402).json({
-        error: user.plan_status === "pre" ? "monthly_limit_reached" : "trial_exhausted",
-        message: user.plan_status === "pre"
-          ? "You have used your 1,000,000 monthly characters. Your limit resets in 30 days."
-          : "You have used your 25,000 free characters.",
+        error: "monthly_limit_reached",
+        message: "You have used your 1,000,000 monthly characters. Your limit resets in 30 days.",
         trial_chars_used: user.trial_chars_used,
         trial_chars_limit: user.trial_chars_limit,
       });

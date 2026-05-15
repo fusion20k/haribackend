@@ -19,6 +19,8 @@ const pool = new Pool({
   max: 10,
 });
 
+const FREE_PLAN_LIMIT = 15000;
+
 function simpleHash(str) {
   return crypto.createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
@@ -273,7 +275,7 @@ async function initDatabase() {
     await client.query(`
       UPDATE users
       SET plan_status = 'free',
-          trial_chars_limit = 25000,
+          trial_chars_limit = ${FREE_PLAN_LIMIT},
           free_chars_reset_date = COALESCE(free_chars_reset_date, (NOW() + INTERVAL '30 days')::DATE)
       WHERE plan_status = 'trialing'
     `);
@@ -299,7 +301,7 @@ async function initDatabase() {
       UPDATE users
       SET plan_status = 'free',
           has_access = TRUE,
-          trial_chars_limit = 25000,
+          trial_chars_limit = ${FREE_PLAN_LIMIT},
           trial_chars_used = 0,
           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
           subscription_id = NULL
@@ -490,6 +492,14 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_translations_key ON translations (key)
     `);
 
+    await client.query(`
+      UPDATE users
+      SET trial_chars_limit = ${FREE_PLAN_LIMIT}
+      WHERE plan_status = 'free'
+        AND trial_chars_limit = 25000
+    `);
+    console.log("Migrated existing free users from 25000 to FREE_PLAN_LIMIT chars");
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -653,7 +663,7 @@ async function createUser(email, passwordHash, stripeCustomerId = null) {
   try {
     const result = await client.query(
       `INSERT INTO users (email, password_hash, stripe_customer_id, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date)
-       VALUES ($1, $2, $3, 'free', TRUE, 25000, 0, (NOW() + INTERVAL '30 days')::DATE)
+       VALUES ($1, $2, $3, 'free', TRUE, ${FREE_PLAN_LIMIT}, 0, (NOW() + INTERVAL '30 days')::DATE)
        RETURNING id, email, stripe_customer_id, created_at, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date`,
       [email, passwordHash, stripeCustomerId]
     );
@@ -885,7 +895,7 @@ async function cancelUserSubscription(userId) {
       `UPDATE users
        SET plan_status = 'free',
            has_access = TRUE,
-           trial_chars_limit = 25000,
+           trial_chars_limit = ${FREE_PLAN_LIMIT},
            trial_chars_used = 0,
            chars_used_at_payg_start = 0,
            free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
