@@ -1133,13 +1133,6 @@ app.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    if (["free", "pre", "payg"].includes(user.plan_status)) {
-      const reset = await resetUserCharsIfNeeded(req.userId);
-      if (reset) {
-        user = await getUserById(req.userId);
-      }
-    }
-
     const hasAccess = user.plan_status === "free" ? true : await userHasActiveSubscription(req.userId);
 
     const meResponse = {
