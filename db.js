@@ -273,6 +273,16 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      UPDATE users SET trial_chars_used = 0 WHERE trial_chars_used IS NULL
+    `);
+    console.log("Repaired NULL trial_chars_used rows");
+
+    await client.query(`
+      UPDATE users SET trial_chars_limit = ${FREE_PLAN_LIMIT} WHERE trial_chars_limit IS NULL
+    `);
+    console.log("Repaired NULL trial_chars_limit rows");
+
+    await client.query(`
       UPDATE users
       SET plan_status = 'free',
           trial_chars_limit = ${FREE_PLAN_LIMIT},
@@ -806,7 +816,7 @@ async function incrementUserTrialChars(userId, chars) {
   try {
     const result = await client.query(
       `UPDATE users
-       SET trial_chars_used = trial_chars_used + $1
+       SET trial_chars_used = COALESCE(trial_chars_used, 0) + $1
        WHERE id = $2
        RETURNING id, trial_chars_used, trial_chars_limit, subscription_id, plan_status`,
       [chars, userId]
@@ -825,9 +835,9 @@ async function atomicCheckAndIncrementChars(userId, chars) {
   try {
     const result = await client.query(
       `UPDATE users
-       SET trial_chars_used = trial_chars_used + $1
+       SET trial_chars_used = COALESCE(trial_chars_used, 0) + $1
        WHERE id = $2
-         AND trial_chars_used + $1 <= trial_chars_limit
+         AND COALESCE(trial_chars_used, 0) + $1 <= COALESCE(trial_chars_limit, ${FREE_PLAN_LIMIT})
        RETURNING id, trial_chars_used, trial_chars_limit, plan_status, subscription_id, stripe_customer_id`,
       [chars, userId]
     );

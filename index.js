@@ -1151,10 +1151,11 @@ app.get("/me", requireAuth, async (req, res) => {
         user.extension_enabled === true &&
         user.extension_last_seen_at != null &&
         new Date(user.extension_last_seen_at) > new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+      payg_chars_used: null,
+      payg_chars_limit: null,
     };
 
     if (user.plan_status === "payg") {
-      // Display-only counters — Stripe metered billing is the source of truth for invoicing
       meResponse.payg_chars_used = (user.trial_chars_used ?? 0) - (user.chars_used_at_payg_start ?? 0);
       meResponse.payg_chars_limit = user.trial_chars_limit ?? 20000000;
     }
