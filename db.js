@@ -1192,6 +1192,58 @@ async function updateMeterEventAttempt(id, succeeded) {
   }
 }
 
+async function setUserFasouPlan(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = 'fasou',
+           has_access = TRUE,
+           trial_chars_limit = 250000,
+           trial_chars_used = 0,
+           chars_used_at_payg_start = 0,
+           subscription_id = NULL,
+           stripe_item_id = NULL,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+       WHERE id = $1
+       RETURNING id, email, plan_status, has_access, trial_chars_used, trial_chars_limit, free_chars_reset_date`,
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error setting FASOU plan:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getMonthlyActiveUsers(months = 12) {
+  if (!process.env.DATABASE_URL) return [];
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT
+        to_char(date_trunc('month', extension_last_seen_at), 'YYYY-MM') AS month,
+        COUNT(DISTINCT id) AS active_users
+      FROM users
+      WHERE extension_last_seen_at IS NOT NULL
+        AND extension_last_seen_at >= date_trunc('month', NOW()) - ($1 || ' months')::INTERVAL
+      GROUP BY date_trunc('month', extension_last_seen_at)
+      ORDER BY month ASC
+    `, [months]);
+    return result.rows;
+  } catch (error) {
+    console.error("Error getting monthly active users:", error);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
 async function syncUserXp(userId, xpBalance, xpLifetimeEarned) {
   const client = await pool.connect();
   try {
@@ -1237,6 +1289,8 @@ module.exports = {
   updateUserPlanStatus,
   cancelUserSubscription,
   activatePaygPlan,
+  setUserFasouPlan,
+  getMonthlyActiveUsers,
   getUsage,
   incrementUsage,
   resetUsageIfNeeded,

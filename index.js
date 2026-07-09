@@ -50,6 +50,8 @@ const {
   atomicCheckAndIncrementChars,
   setUserExtensionStatus,
   disableUserExtension,
+  setUserFasouPlan,
+  getMonthlyActiveUsers,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -493,6 +495,7 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
           SUM(CASE WHEN plan_status = 'pre' THEN 1 ELSE 0 END) AS premium_users,
           SUM(CASE WHEN plan_status = 'payg' THEN 1 ELSE 0 END) AS payg_users,
           SUM(CASE WHEN plan_status = 'free' THEN 1 ELSE 0 END) AS free_users,
+          SUM(CASE WHEN plan_status = 'fasou' THEN 1 ELSE 0 END) AS fasou_users,
           SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS new_signups_7d
         FROM users
       `);
@@ -507,6 +510,7 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
       premium_users: parseInt(overviewData.premium_users) || 0,
       payg_users: parseInt(overviewData.payg_users) || 0,
       free_users: parseInt(overviewData.free_users) || 0,
+      fasou_users: parseInt(overviewData.fasou_users) || 0,
       new_signups_7d: parseInt(overviewData.new_signups_7d) || 0,
       chars_used_this_month: usage.used,
       chars_quota: usage.total,
@@ -523,8 +527,11 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const plan = req.query.plan || null;
     const offset = (page - 1) * limit;
-    const validPlans = ["free", "pre", "active", "payg", "canceled"];
+    const validPlans = ["free", "pre", "active", "payg", "canceled", "fasou"];
     const planFilter = plan && validPlans.includes(plan) ? plan : null;
+    const validSortColumns = ["created_at", "plan_status", "email", "id", "trial_chars_used", "trial_chars_limit"];
+    const sortBy = validSortColumns.includes(req.query.sortBy) ? req.query.sortBy : "created_at";
+    const sortOrder = req.query.sortOrder === "asc" ? "ASC" : "DESC";
     const client = await adminPool.connect();
     try {
       let countQuery = "SELECT COUNT(*) AS total FROM users";
@@ -539,19 +546,51 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
         dataQuery += " WHERE plan_status = $1";
         params.push(planFilter);
       }
-      dataQuery += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+      dataQuery += ` ORDER BY ${sortBy} ${sortOrder} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
       const [countResult, dataResult] = await Promise.all([
         client.query(countQuery, planFilter ? [planFilter] : []),
         client.query(dataQuery, [...params, limit, offset]),
       ]);
       const total = parseInt(countResult.rows[0].total) || 0;
       const pages = Math.ceil(total / limit);
-      res.json({ users: dataResult.rows, total, page, limit, pages });
+      res.json({ users: dataResult.rows, total, page, limit, pages, sortBy, sortOrder: sortOrder.toLowerCase() });
     } finally {
       client.release();
     }
   } catch (err) {
     console.error("Admin users error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/admin/set-fasou", requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId || !Number.isInteger(userId)) {
+      return res.status(400).json({ error: "userId must be an integer" });
+    }
+    const user = await setUserFasouPlan(userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    console.log(`Admin set FASOU plan for user=${userId} by admin=${req.userId}`);
+    res.json({ user });
+  } catch (err) {
+    console.error("Admin set FASOU error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/admin/monthly-active-users", requireAdmin, async (req, res) => {
+  try {
+    const months = Math.min(24, Math.max(1, parseInt(req.query.months) || 12));
+    const data = await getMonthlyActiveUsers(months);
+    const total_active_this_month = data.length > 0
+      ? parseInt(data[data.length - 1].active_users) || 0
+      : 0;
+    res.json({ monthly_active_users: data, total_active_this_month });
+  } catch (err) {
+    console.error("Admin monthly active users error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -871,7 +910,7 @@ app.get("/admin/payments", requireAdmin, async (req, res) => {
 
 async function userHasActiveSubscription(userId) {
   const user = await getUserById(userId);
-  if (user && (user.has_access === true || user.plan_status === "free")) {
+  if (user && (user.has_access === true || user.plan_status === "free" || user.plan_status === "fasou")) {
     return true;
   }
 
@@ -1549,7 +1588,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg"].includes(user.plan_status)
+      !["free", "active", "pre", "payg", "fasou"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -1704,7 +1743,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     const billableChars = cacheChars + liveChars;
 
     let translateUpdatedUser = null;
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
@@ -2000,7 +2039,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg"].includes(user.plan_status)
+      !["free", "active", "pre", "payg", "fasou"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -2029,7 +2068,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     let dictUpdatedUser = null;
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
@@ -2211,7 +2250,7 @@ app.post("/tts", requireAuth, async (req, res) => {
   }
 
   let ttsUpdatedUser = null;
-  if (user && ["free", "pre"].includes(user.plan_status)) {
+  if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
     const reset = await resetUserCharsIfNeeded(req.userId);
     if (reset) { user = await getUserById(req.userId); }
     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);
