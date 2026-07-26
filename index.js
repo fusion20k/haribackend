@@ -52,6 +52,13 @@ const {
   disableUserExtension,
   setUserFasouPlan,
   getMonthlyActiveUsers,
+  findPartnerBySlug,
+  createPartnerReferral,
+  findValidReferral,
+  markReferralClicked,
+  claimReferral,
+  grantPartnerPlan,
+  getPartnerReferralStats,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
@@ -504,6 +511,7 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
       client.release();
     }
     const usage = await getMonthlyUsage();
+    const partnerStats = await getPartnerReferralStats();
     res.json({
       total_users: parseInt(overviewData.total_users) || 0,
       active_subscribers: parseInt(overviewData.active_subscribers) || 0,
@@ -514,6 +522,9 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
       new_signups_7d: parseInt(overviewData.new_signups_7d) || 0,
       chars_used_this_month: usage.used,
       chars_quota: usage.total,
+      partner_referrals_pending: parseInt(partnerStats.pending) || 0,
+      partner_referrals_completed: parseInt(partnerStats.completed) || 0,
+      partner_referrals_expired: parseInt(partnerStats.expired) || 0,
     });
   } catch (err) {
     console.error("Admin overview error:", err);
@@ -922,9 +933,57 @@ async function userHasActiveSubscription(userId) {
   return true;
 }
 
+// --- Partner referral endpoints ---
+
+app.post("/api/partner/start", async (req, res) => {
+  try {
+    const { slug } = req.body;
+
+    if (!slug || typeof slug !== "string") {
+      return res.status(400).json({ error: "slug is required" });
+    }
+
+    const partner = await findPartnerBySlug(slug.toLowerCase());
+    if (!partner) {
+      return res.status(404).json({ error: "Partner not found or inactive" });
+    }
+
+    const referral = await createPartnerReferral(partner.id, 30);
+
+    console.log(`Partner referral created: slug=${slug} partner_id=${partner.id} token=${referral.referral_token.slice(0, 8)}...`);
+
+    res.json({
+      referralToken: referral.referral_token,
+      partnerName: partner.name,
+    });
+  } catch (err) {
+    console.error("/api/partner/start error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/partner/click", async (req, res) => {
+  try {
+    const { referralToken } = req.body;
+
+    if (!referralToken || typeof referralToken !== "string") {
+      return res.status(400).json({ error: "referralToken is required" });
+    }
+
+    await markReferralClicked(referralToken);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("/api/partner/click error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- Auth endpoints ---
+
 app.post("/auth/signup", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, referralToken } = req.body;
 
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
       return res.status(400).json({ error: "Email and password required" });
@@ -953,17 +1012,39 @@ app.post("/auth/signup", async (req, res) => {
 
     const user = await createUser(email, passwordHash, stripeCustomerId);
 
+    // Process partner referral if token present
+    let planGranted = null;
+    if (referralToken && typeof referralToken === "string") {
+      try {
+        const referral = await findValidReferral(referralToken);
+        if (referral) {
+          planGranted = await grantPartnerPlan(user.id, referral.partner_id, "fasou", "partner");
+          if (planGranted) {
+            await claimReferral(referralToken, user.id);
+            console.log(`Partner plan granted on signup: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
+          }
+        } else {
+          console.log(`Referral token invalid/expired/claimed on signup: ${referralToken.slice(0, 8)}...`);
+        }
+      } catch (refErr) {
+        console.error("Referral processing error on signup:", refErr.message);
+      }
+    }
+
     const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
       expiresIn: "30d",
     });
 
+    const updatedUser = planGranted ? await getUserById(user.id) : user;
+
     res.json({
       token,
-      user: { id: user.id, email: user.email },
-      hasAccess: true,
-      plan_status: "free",
-      trial_chars_used: 0,
-      trial_chars_limit: FREE_PLAN_LIMIT,
+      user: { id: updatedUser.id, email: updatedUser.email },
+      hasAccess: updatedUser.has_access ?? true,
+      plan_status: updatedUser.plan_status ?? "free",
+      plan_source: updatedUser.plan_source ?? null,
+      trial_chars_used: updatedUser.trial_chars_used ?? 0,
+      trial_chars_limit: updatedUser.trial_chars_limit ?? FREE_PLAN_LIMIT,
     });
   } catch (err) {
     console.error("Signup error:", err);
@@ -973,7 +1054,7 @@ app.post("/auth/signup", async (req, res) => {
 
 app.post("/auth/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, referralToken } = req.body;
 
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
       return res.status(400).json({ error: "Email and password required" });
@@ -989,19 +1070,37 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const hasAccess = await userHasActiveSubscription(user.id);
+    // Process referral token on login if user doesn't already have a partner plan
+    if (referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
+      try {
+        const referral = await findValidReferral(referralToken);
+        if (referral) {
+          await grantPartnerPlan(user.id, referral.partner_id, "fasou", "partner");
+          await claimReferral(referralToken, user.id);
+          console.log(`Partner plan granted on login: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
+        }
+      } catch (refErr) {
+        console.error("Referral processing error on login:", refErr.message);
+      }
+    }
 
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
+    // Re-fetch user to get updated plan info
+    const updatedUser = (referralToken && user.plan_source !== "partner") ? await getUserById(user.id) : user;
+
+    const hasAccess = await userHasActiveSubscription(updatedUser.id);
+
+    const token = jwt.sign({ userId: updatedUser.id }, process.env.JWT_SECRET, {
       expiresIn: "30d",
     });
 
     res.json({
       token,
-      user: { id: user.id, email: user.email },
+      user: { id: updatedUser.id, email: updatedUser.email },
       hasAccess,
-      plan_status: user.plan_status || null,
-      trial_chars_used: user.trial_chars_used ?? 0,
-      trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
+      plan_status: updatedUser.plan_status || null,
+      plan_source: updatedUser.plan_source || null,
+      trial_chars_used: updatedUser.trial_chars_used ?? 0,
+      trial_chars_limit: updatedUser.trial_chars_limit ?? FREE_PLAN_LIMIT,
     });
   } catch (err) {
     console.error("Login error:", err);
@@ -1180,6 +1279,9 @@ app.get("/me", requireAuth, async (req, res) => {
       hasAccess,
       has_access: hasAccess,
       plan_status: user.plan_status || null,
+      plan_source: user.plan_source || null,
+      partner_id: user.partner_id || null,
+      plan_granted_at: user.plan_granted_at || null,
       trial_chars_used: user.trial_chars_used ?? 0,
       trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
       trial_started_at: user.trial_started_at || null,

@@ -510,6 +510,86 @@ async function initDatabase() {
     `);
     console.log("Migrated existing free users from 25000 to FREE_PLAN_LIMIT chars");
 
+    // --- Partner referral funnel tables ---
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS partners (
+        id SERIAL PRIMARY KEY,
+        slug VARCHAR(64) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        plan_to_grant VARCHAR(64) NOT NULL,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS partner_referrals (
+        id SERIAL PRIMARY KEY,
+        partner_id INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        referral_token VARCHAR(128) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        claimed_by_user_id INTEGER REFERENCES users(id),
+        status VARCHAR(32) DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMPTZ NOT NULL,
+        landing_page_hit_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        chrome_store_click_at TIMESTAMPTZ
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_partner_referrals_token ON partner_referrals(referral_token)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_partner_referrals_partner_id ON partner_referrals(partner_id)
+    `);
+
+    // Seed partner data
+    await client.query(`
+      INSERT INTO partners (slug, name, plan_to_grant, active)
+      VALUES ('fasou', 'Fasou', 'fasou', TRUE)
+      ON CONFLICT (slug) DO NOTHING
+    `);
+
+    // New user columns for partner tracking
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'plan_source'
+        ) THEN
+          ALTER TABLE users ADD COLUMN plan_source TEXT;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'partner_id'
+        ) THEN
+          ALTER TABLE users ADD COLUMN partner_id INTEGER REFERENCES partners(id);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'plan_granted_at'
+        ) THEN
+          ALTER TABLE users ADD COLUMN plan_granted_at TIMESTAMPTZ;
+        END IF;
+      END $$;
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -600,7 +680,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -618,7 +698,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
@@ -1270,6 +1350,159 @@ async function getUserXp(userId) {
   }
 }
 
+// --- Partner referral functions ---
+
+async function findPartnerBySlug(slug) {
+  if (!process.env.DATABASE_URL) return null;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, slug, name, plan_to_grant, active FROM partners WHERE slug = $1 AND active = TRUE",
+      [slug]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error finding partner by slug:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function createPartnerReferral(partnerId, expiresInDays = 30) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+  const client = await pool.connect();
+  try {
+    const token = crypto.randomUUID();
+    const result = await client.query(
+      `INSERT INTO partner_referrals (partner_id, referral_token, status, expires_at, landing_page_hit_at)
+       VALUES ($1, $2, 'pending', NOW() + ($3 || ' days')::INTERVAL, NOW())
+       RETURNING id, partner_id, referral_token, status, expires_at, landing_page_hit_at`,
+      [partnerId, token, expiresInDays]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error creating partner referral:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function findValidReferral(token) {
+  if (!process.env.DATABASE_URL) return null;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT id, partner_id, referral_token, email, claimed_by_user_id, status, expires_at, landing_page_hit_at, chrome_store_click_at
+       FROM partner_referrals
+       WHERE referral_token = $1
+         AND status = 'pending'
+         AND claimed_by_user_id IS NULL
+         AND expires_at > NOW()`,
+      [token]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error finding valid referral:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function markReferralClicked(token) {
+  if (!process.env.DATABASE_URL) return;
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE partner_referrals SET chrome_store_click_at = NOW() WHERE referral_token = $1 AND chrome_store_click_at IS NULL`,
+      [token]
+    );
+  } catch (error) {
+    console.error("Error marking referral clicked:", error);
+  } finally {
+    client.release();
+  }
+}
+
+async function claimReferral(token, userId) {
+  if (!process.env.DATABASE_URL) return null;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE partner_referrals
+       SET claimed_by_user_id = $1, status = 'completed'
+       WHERE referral_token = $2
+         AND status = 'pending'
+         AND claimed_by_user_id IS NULL
+         AND expires_at > NOW()
+       RETURNING id, partner_id, referral_token, claimed_by_user_id, status`,
+      [userId, token]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error claiming referral:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function grantPartnerPlan(userId, partnerId, plan, planSource = 'partner') {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+  const client = await pool.connect();
+  try {
+    let charLimit;
+    if (plan === 'fasou') charLimit = 250000;
+    else charLimit = 250000;
+
+    const result = await client.query(
+      `UPDATE users
+       SET plan_status = $1,
+           plan_source = $2,
+           partner_id = $3,
+           plan_granted_at = NOW(),
+           has_access = TRUE,
+           trial_chars_limit = $5,
+           trial_chars_used = 0,
+           chars_used_at_payg_start = 0,
+           subscription_id = NULL,
+           stripe_item_id = NULL,
+           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
+       WHERE id = $4
+       RETURNING id, email, plan_status, plan_source, partner_id, plan_granted_at, has_access, trial_chars_limit`,
+      [plan, planSource, partnerId, userId, charLimit]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error granting partner plan:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getPartnerReferralStats() {
+  if (!process.env.DATABASE_URL) return { pending: 0, completed: 0, expired: 0 };
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'pending' AND expires_at > NOW()) AS pending,
+        COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+        COUNT(*) FILTER (WHERE status = 'pending' AND expires_at <= NOW()) AS expired
+      FROM partner_referrals
+    `);
+    return result.rows[0] || { pending: 0, completed: 0, expired: 0 };
+  } catch (error) {
+    console.error("Error getting partner referral stats:", error);
+    return { pending: 0, completed: 0, expired: 0 };
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDatabase,
   findTranslationsByKeys,
@@ -1306,4 +1539,11 @@ module.exports = {
   atomicCheckAndIncrementChars,
   setUserExtensionStatus,
   disableUserExtension,
+  findPartnerBySlug,
+  createPartnerReferral,
+  findValidReferral,
+  markReferralClicked,
+  claimReferral,
+  grantPartnerPlan,
+  getPartnerReferralStats,
 };
