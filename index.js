@@ -3,6 +3,7 @@ require("dotenv").config();
 const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
@@ -187,6 +188,7 @@ app.use(
     origin: "*",
   })
 );
+app.use(cookieParser());
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) {
@@ -985,6 +987,12 @@ app.post("/auth/signup", async (req, res) => {
   try {
     const { email, password, referralToken } = req.body;
 
+    // Read invite from cookie or body
+    const inviteFromCookie = req.cookies?.invite;
+    const inviteFromBody = req.body?.invite;
+    const invite = inviteFromBody || inviteFromCookie || null;
+    console.log(`[signup] invite=${invite} email=${email} inviteFromCookie=${inviteFromCookie} inviteFromBody=${inviteFromBody}`);
+
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
       return res.status(400).json({ error: "Email and password required" });
     }
@@ -1012,9 +1020,28 @@ app.post("/auth/signup", async (req, res) => {
 
     const user = await createUser(email, passwordHash, stripeCustomerId);
 
-    // Process partner referral if token present
+    // Determine role: invite-based fasou takes priority
     let planGranted = null;
-    if (referralToken && typeof referralToken === "string") {
+
+    if (invite === "fasou" && !planGranted) {
+      try {
+        // Find the fasou partner to use grantPartnerPlan
+        const fasouPartner = await findPartnerBySlug("fasou");
+        if (fasouPartner) {
+          planGranted = await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
+          console.log(`[signup] Invite FASOU plan granted: user=${user.id} email=${email}`);
+        } else {
+          // Fallback: use setUserFasouPlan directly
+          planGranted = await setUserFasouPlan(user.id);
+          console.log(`[signup] FASOU plan set via setUserFasouPlan: user=${user.id}`);
+        }
+      } catch (inviteErr) {
+        console.error("Invite FASOU grant failed on signup:", inviteErr.message);
+      }
+    }
+
+    // Process partner referral if token present (only if not already upgraded by invite)
+    if (!planGranted && referralToken && typeof referralToken === "string") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
@@ -1034,6 +1061,11 @@ app.post("/auth/signup", async (req, res) => {
     const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
       expiresIn: "30d",
     });
+
+    // Clear invite cookie so it can't be reused
+    if (invite) {
+      res.cookie("invite", "", { maxAge: 0, path: "/" });
+    }
 
     const updatedUser = planGranted ? await getUserById(user.id) : user;
 
@@ -1056,6 +1088,12 @@ app.post("/auth/login", async (req, res) => {
   try {
     const { email, password, referralToken } = req.body;
 
+    // Read invite from cookie or body
+    const inviteFromCookie = req.cookies?.invite;
+    const inviteFromBody = req.body?.invite;
+    const invite = inviteFromBody || inviteFromCookie || null;
+    console.log(`[login] invite=${invite} email=${email} inviteFromCookie=${inviteFromCookie} inviteFromBody=${inviteFromBody}`);
+
     if (!email || !password || typeof email !== "string" || typeof password !== "string") {
       return res.status(400).json({ error: "Email and password required" });
     }
@@ -1070,13 +1108,34 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
+    // Determine if user should be upgraded
+    let planUpgraded = false;
+
+    // Invite-based fasou upgrade (if not already fasou)
+    if (invite === "fasou" && user.plan_status !== "fasou") {
+      try {
+        const fasouPartner = await findPartnerBySlug("fasou");
+        if (fasouPartner) {
+          await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
+          console.log(`[login] Invite FASOU plan granted on login: user=${user.id} email=${email}`);
+        } else {
+          await setUserFasouPlan(user.id);
+          console.log(`[login] FASOU plan set via setUserFasouPlan on login: user=${user.id}`);
+        }
+        planUpgraded = true;
+      } catch (inviteErr) {
+        console.error("Invite FASOU grant failed on login:", inviteErr.message);
+      }
+    }
+
     // Process referral token on login if user doesn't already have a partner plan
-    if (referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
+    if (!planUpgraded && referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
           await grantPartnerPlan(user.id, referral.partner_id, "fasou", "partner");
           await claimReferral(referralToken, user.id);
+          planUpgraded = true;
           console.log(`Partner plan granted on login: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
         }
       } catch (refErr) {
@@ -1084,8 +1143,13 @@ app.post("/auth/login", async (req, res) => {
       }
     }
 
+    // Clear invite cookie so it can't be reused
+    if (invite) {
+      res.cookie("invite", "", { maxAge: 0, path: "/" });
+    }
+
     // Re-fetch user to get updated plan info
-    const updatedUser = (referralToken && user.plan_source !== "partner") ? await getUserById(user.id) : user;
+    const updatedUser = planUpgraded ? await getUserById(user.id) : user;
 
     const hasAccess = await userHasActiveSubscription(updatedUser.id);
 
