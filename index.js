@@ -1261,7 +1261,17 @@ app.get("/extension/uninstalled", async (req, res) => {
   } catch (err) {
     console.error("/extension/uninstalled error (non-fatal):", err.message);
   }
-  res.status(200).send("ok");
+  res.status(200).send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hari Removed</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0}
+.card{text-align:center;padding:3rem;border-radius:16px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);max-width:480px;margin:1rem}
+h1{color:#4ade80;margin-bottom:.75rem;font-size:1.75rem}p{color:#a0a0b0;line-height:1.7;margin-bottom:1.5rem;font-size:1.05rem}
+.icon{font-size:3rem;margin-bottom:1rem}.btn{display:inline-block;padding:12px 28px;border-radius:8px;background:#4ade80;color:#1a1a2e;text-decoration:none;font-weight:600;font-size:1rem;transition:background 0.2s}
+.btn:hover{background:#22c55e}</style></head>
+<body><div class="card"><div class="icon">&#9889;</div><h1>Hari has been removed</h1>
+<p>You've uninstalled Hari from Chrome. Your translations, dictionary lookups, and saved words are still safe — just reinstall whenever you're ready to pick up where you left off.</p>
+<a class="btn" href="https://chromewebstore.google.com/detail/hari" target="_blank">Reinstall Hari</a>
+</div></body></html>`);
 });
 
 app.get("/me", requireAuth, async (req, res) => {
