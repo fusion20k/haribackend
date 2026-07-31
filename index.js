@@ -1268,7 +1268,7 @@ app.get("/extension/uninstalled", async (req, res) => {
 h1{color:#4ade80;margin-bottom:.75rem;font-size:1.75rem}p{color:#a0a0b0;line-height:1.7;margin-bottom:1.5rem;font-size:1.05rem}
 .icon{font-size:3rem;margin-bottom:1rem}.btn{display:inline-block;padding:12px 28px;border-radius:8px;background:#4ade80;color:#1a1a2e;text-decoration:none;font-weight:600;font-size:1rem;transition:background 0.2s}
 .btn:hover{background:#22c55e}</style></head>
-<body><div class="card"><div class="icon">&#9889;</div><h1>Hari has been removed</h1>
+<body><div class="card"><div class="icon">&#10007;</div><h1>Hari has been removed</h1>
 <p>You've uninstalled Hari from Chrome. Your translations, dictionary lookups, and saved words are still safe — just reinstall whenever you're ready to pick up where you left off.</p>
 <a class="btn" href="https://chromewebstore.google.com/detail/hari" target="_blank">Reinstall Hari</a>
 </div></body></html>`);
