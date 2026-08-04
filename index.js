@@ -332,7 +332,10 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             }
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             const currentUser = await getUserById(subRow.user_id);
-            if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
+            // NEVER revoke fasou users via webhook — their plan is invite/referral-based
+            if (currentUser && currentUser.plan_status === "fasou") {
+              console.log(`Skipping revoke for fasou user ${subRow.user_id}: plan_status is fasou`);
+            } else if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
               await cancelUserSubscription(subRow.user_id);
               console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
             } else {
@@ -351,7 +354,10 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
           const currentUser = await getUserById(subRow.user_id);
-          if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
+          // NEVER revoke fasou users via webhook — their plan is invite/referral-based
+          if (currentUser && currentUser.plan_status === "fasou") {
+            console.log(`Skipping revoke for fasou user ${subRow.user_id}: plan_status is fasou`);
+          } else if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
             await cancelUserSubscription(subRow.user_id);
             console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
           } else {
@@ -1022,6 +1028,7 @@ app.post("/auth/signup", async (req, res) => {
 
     // Determine role: invite-based fasou takes priority
     let planGranted = null;
+    let planError = null;
 
     if (invite === "fasou" && !planGranted) {
       try {
@@ -1035,8 +1042,12 @@ app.post("/auth/signup", async (req, res) => {
           planGranted = await setUserFasouPlan(user.id);
           console.log(`[signup] FASOU plan set via setUserFasouPlan: user=${user.id}`);
         }
+        if (!planGranted) {
+          planError = "FASOU plan assignment returned no result — user may not exist or DB error occurred";
+        }
       } catch (inviteErr) {
         console.error("Invite FASOU grant failed on signup:", inviteErr.message);
+        planError = `FASOU plan assignment failed: ${inviteErr.message}`;
       }
     }
 
@@ -1110,21 +1121,28 @@ app.post("/auth/login", async (req, res) => {
 
     // Determine if user should be upgraded
     let planUpgraded = false;
+    let planError = null;
 
     // Invite-based fasou upgrade (if not already fasou)
     if (invite === "fasou" && user.plan_status !== "fasou") {
       try {
         const fasouPartner = await findPartnerBySlug("fasou");
+        let result;
         if (fasouPartner) {
-          await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
+          result = await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
           console.log(`[login] Invite FASOU plan granted on login: user=${user.id} email=${email}`);
         } else {
-          await setUserFasouPlan(user.id);
+          result = await setUserFasouPlan(user.id);
           console.log(`[login] FASOU plan set via setUserFasouPlan on login: user=${user.id}`);
         }
-        planUpgraded = true;
+        if (!result) {
+          planError = "FASOU plan assignment returned no result — user may not exist or DB error occurred";
+        } else {
+          planUpgraded = true;
+        }
       } catch (inviteErr) {
         console.error("Invite FASOU grant failed on login:", inviteErr.message);
+        planError = `FASOU plan assignment failed: ${inviteErr.message}`;
       }
     }
 

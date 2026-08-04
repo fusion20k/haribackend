@@ -981,6 +981,13 @@ async function cancelUserSubscription(userId) {
 
   const client = await pool.connect();
   try {
+    // NEVER revert fasou users — their plan is invite/referral-based
+    const user = await client.query("SELECT plan_status FROM users WHERE id = $1", [userId]);
+    if (user.rows[0] && user.rows[0].plan_status === "fasou") {
+      console.log(`cancelUserSubscription: Skipping fasou user ${userId}`);
+      return null;
+    }
+
     const result = await client.query(
       `UPDATE users
        SET plan_status = 'free',
