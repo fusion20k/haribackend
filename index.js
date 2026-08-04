@@ -412,6 +412,16 @@ h1{margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
 </div></body></html>`);
 });
 
+app.get("/fasou/install", (req, res) => {
+  res.cookie("invite", "fasou", {
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: "/",
+    httpOnly: false,
+    sameSite: "lax",
+  });
+  res.redirect(302, "https://chromewebstore.google.com/detail/hari-tagalog/mheinmngfhebgbbaceolefnpmfepidae");
+});
+
 app.get("/debug/me", requireAuth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
