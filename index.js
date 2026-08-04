@@ -987,6 +987,23 @@ app.post("/api/partner/click", async (req, res) => {
   }
 });
 
+// --- Partner install redirect ---
+
+app.get("/fasou/install", (req, res) => {
+  const chromeStoreUrl = "https://chromewebstore.google.com/detail/hari/fbipjminpglenkancncgldeolninhkdc";
+
+  res.cookie("invite", "fasou", {
+    maxAge: 30 * 60 * 1000,
+    httpOnly: true,
+    sameSite: "lax",
+    secure: true,
+    path: "/",
+  });
+
+  console.log("[fasou/install] Set invite cookie, redirecting to Chrome Store");
+  res.redirect(302, chromeStoreUrl);
+});
+
 // --- Auth endpoints ---
 
 app.post("/auth/signup", async (req, res) => {
