@@ -340,6 +340,30 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'subscriptions' AND column_name = 'stripe_customer_id'
+        ) THEN
+          ALTER TABLE subscriptions ADD COLUMN stripe_customer_id VARCHAR(255);
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'subscriptions' AND column_name = 'affiliate_id'
+        ) THEN
+          ALTER TABLE subscriptions ADD COLUMN affiliate_id VARCHAR(64);
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'subscriptions' AND column_name = 'affiliate_source'
+        ) THEN
+          ALTER TABLE subscriptions ADD COLUMN affiliate_source VARCHAR(128);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS translation_usage (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -551,6 +575,29 @@ async function initDatabase() {
       INSERT INTO partners (slug, name, plan_to_grant, active)
       VALUES ('fasou', 'Fasou', 'fasou', TRUE)
       ON CONFLICT (slug) DO NOTHING
+    `);
+
+    // --- Affiliate commission tracking (Stripe promo-code based) ---
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS commissions (
+        id SERIAL PRIMARY KEY,
+        stripe_invoice_id VARCHAR(255) UNIQUE NOT NULL,
+        affiliate_id VARCHAR(64) NOT NULL,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        stripe_subscription_id VARCHAR(255),
+        amount_cents INTEGER NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_commissions_affiliate_id ON commissions(affiliate_id)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_commissions_status ON commissions(status)
     `);
 
     // New user columns for partner tracking
@@ -853,13 +900,58 @@ async function getSubscriptionByStripeId(stripeSubscriptionId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, user_id, stripe_subscription_id, status, current_period_end, created_at, updated_at FROM subscriptions WHERE stripe_subscription_id = $1",
+      "SELECT id, user_id, stripe_subscription_id, stripe_customer_id, status, affiliate_id, affiliate_source, current_period_end, created_at, updated_at FROM subscriptions WHERE stripe_subscription_id = $1",
       [stripeSubscriptionId]
     );
     return result.rows[0] || null;
   } catch (error) {
     console.error("Error getting subscription by Stripe ID:", error);
     return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function setSubscriptionAffiliate(stripeSubscriptionId, stripeCustomerId, affiliateId, affiliateSource) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE subscriptions
+       SET stripe_customer_id = COALESCE($2, stripe_customer_id),
+           affiliate_id = $3,
+           affiliate_source = $4,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_subscription_id = $1
+       RETURNING id, user_id, stripe_subscription_id, stripe_customer_id, affiliate_id, affiliate_source`,
+      [stripeSubscriptionId, stripeCustomerId, affiliateId, affiliateSource]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error setting subscription affiliate:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function insertCommission({ stripeInvoiceId, affiliateId, userId, stripeSubscriptionId, amountCents }) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `INSERT INTO commissions (stripe_invoice_id, affiliate_id, user_id, stripe_subscription_id, amount_cents, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       ON CONFLICT (stripe_invoice_id) DO NOTHING
+       RETURNING id, stripe_invoice_id, affiliate_id, user_id, stripe_subscription_id, amount_cents, status, created_at`,
+      [stripeInvoiceId, affiliateId, userId, stripeSubscriptionId, amountCents]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error inserting commission:", error);
+    throw error;
   } finally {
     client.release();
   }
@@ -1490,6 +1582,32 @@ async function grantPartnerPlan(userId, partnerId, plan, planSource = 'partner')
   }
 }
 
+// Records that a signup/login was associated with a Fasou referral cookie, for
+// analytics/welcome-message purposes only. Does NOT grant plan_status or raise
+// char limits — commission/affiliate attribution is decided solely by the Stripe
+// promotion code at checkout (see setSubscriptionAffiliate).
+async function recordFasouReferralSignal(userId, partnerId) {
+  if (!process.env.DATABASE_URL) return null;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE users
+       SET plan_source = COALESCE(plan_source, 'invite'),
+           partner_id = COALESCE(partner_id, $2),
+           plan_granted_at = COALESCE(plan_granted_at, NOW())
+       WHERE id = $1
+       RETURNING id, plan_source, partner_id, plan_granted_at`,
+      [userId, partnerId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error recording fasou referral signal:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
 async function getPartnerReferralStats() {
   if (!process.env.DATABASE_URL) return { pending: 0, completed: 0, expired: 0 };
   const client = await pool.connect();
@@ -1524,6 +1642,8 @@ module.exports = {
   createSubscription,
   updateSubscription,
   getSubscriptionByStripeId,
+  setSubscriptionAffiliate,
+  insertCommission,
   updateUserTrialStart,
   incrementUserTrialChars,
   updateUserPlanStatus,
@@ -1552,5 +1672,6 @@ module.exports = {
   markReferralClicked,
   claimReferral,
   grantPartnerPlan,
+  recordFasouReferralSignal,
   getPartnerReferralStats,
 };

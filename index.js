@@ -32,6 +32,8 @@ const {
   createSubscription,
   updateSubscription,
   getSubscriptionByStripeId,
+  setSubscriptionAffiliate,
+  insertCommission,
   updateUserTrialStart,
   incrementUserTrialChars,
   updateUserPlanStatus,
@@ -59,6 +61,7 @@ const {
   markReferralClicked,
   claimReferral,
   grantPartnerPlan,
+  recordFasouReferralSignal,
   getPartnerReferralStats,
 } = require("./db");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
@@ -213,11 +216,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        const userId = parseInt(session.metadata && session.metadata.userId);
+        const userId = parseInt(
+          (session.metadata && session.metadata.userId) || session.client_reference_id
+        );
         const subscriptionId = session.subscription;
 
         if (!userId || isNaN(userId)) {
-          console.error("checkout.session.completed: missing userId in metadata", session.id);
+          console.error("checkout.session.completed: missing userId in metadata/client_reference_id", session.id);
           break;
         }
 
@@ -233,6 +238,20 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             );
           } catch (dbErr) {
             console.error("checkout.session.completed: createSubscription error (non-fatal):", dbErr.message);
+          }
+
+          try {
+            const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
+              expand: ["discounts.promotion_code"],
+            });
+            const promo = fullSession.discounts?.[0]?.promotion_code;
+            const usedFasou = !!promo && promo.id === process.env.FASOU_PROMO_CODE_ID;
+            if (usedFasou) {
+              await setSubscriptionAffiliate(subscription.id, session.customer, "fasou", "promo_code:FASOU");
+              console.log(`Fasou promo code detected: user=${userId} sub=${subscription.id}`);
+            }
+          } catch (affErr) {
+            console.error("checkout.session.completed: affiliate detection error (non-fatal):", affErr.message);
           }
 
           const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
@@ -363,6 +382,29 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           } else {
             console.log(`Skipping revoke for user ${subRow.user_id}: current sub differs from deleted sub`);
           }
+        }
+        break;
+      }
+
+      case "invoice.paid": {
+        const invoice = event.data.object;
+        try {
+          if (invoice.subscription) {
+            const subRow = await getSubscriptionByStripeId(invoice.subscription);
+            if (subRow && subRow.affiliate_id === "fasou" && invoice.amount_paid > 0) {
+              const commissionCents = Math.round(invoice.amount_paid * 0.10);
+              await insertCommission({
+                stripeInvoiceId: invoice.id,
+                affiliateId: "fasou",
+                userId: subRow.user_id,
+                stripeSubscriptionId: invoice.subscription,
+                amountCents: commissionCents,
+              });
+              console.log(`Fasou commission recorded: invoice=${invoice.id} amount_cents=${commissionCents}`);
+            }
+          }
+        } catch (commErr) {
+          console.error("invoice.paid: commission tracking error (non-fatal):", commErr.message);
         }
         break;
       }
@@ -1036,28 +1078,20 @@ app.post("/auth/signup", async (req, res) => {
 
     const user = await createUser(email, passwordHash, stripeCustomerId);
 
-    // Determine role: invite-based fasou takes priority
     let planGranted = null;
-    let planError = null;
 
-    if (invite === "fasou" && !planGranted) {
+    // Fasou invite cookie is analytics/attribution-only now — it no longer grants
+    // extra plan limits. Commission attribution comes solely from the Stripe promo
+    // code at checkout (see /stripe/webhook, checkout.session.completed).
+    if (invite === "fasou") {
       try {
-        // Find the fasou partner to use grantPartnerPlan
         const fasouPartner = await findPartnerBySlug("fasou");
         if (fasouPartner) {
-          planGranted = await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
-          console.log(`[signup] Invite FASOU plan granted: user=${user.id} email=${email}`);
-        } else {
-          // Fallback: use setUserFasouPlan directly
-          planGranted = await setUserFasouPlan(user.id);
-          console.log(`[signup] FASOU plan set via setUserFasouPlan: user=${user.id}`);
-        }
-        if (!planGranted) {
-          planError = "FASOU plan assignment returned no result — user may not exist or DB error occurred";
+          await recordFasouReferralSignal(user.id, fasouPartner.id);
+          console.log(`[signup] Fasou referral signal recorded (no plan change): user=${user.id} email=${email}`);
         }
       } catch (inviteErr) {
-        console.error("Invite FASOU grant failed on signup:", inviteErr.message);
-        planError = `FASOU plan assignment failed: ${inviteErr.message}`;
+        console.error("Fasou referral signal recording failed on signup (non-fatal):", inviteErr.message);
       }
     }
 
@@ -1129,30 +1163,20 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // Determine if user should be upgraded
     let planUpgraded = false;
-    let planError = null;
 
-    // Invite-based fasou upgrade (if not already fasou)
-    if (invite === "fasou" && user.plan_status !== "fasou") {
+    // Fasou invite cookie is analytics/attribution-only now — it no longer grants
+    // extra plan limits. Commission attribution comes solely from the Stripe promo
+    // code at checkout (see /stripe/webhook, checkout.session.completed).
+    if (invite === "fasou") {
       try {
         const fasouPartner = await findPartnerBySlug("fasou");
-        let result;
         if (fasouPartner) {
-          result = await grantPartnerPlan(user.id, fasouPartner.id, "fasou", "invite");
-          console.log(`[login] Invite FASOU plan granted on login: user=${user.id} email=${email}`);
-        } else {
-          result = await setUserFasouPlan(user.id);
-          console.log(`[login] FASOU plan set via setUserFasouPlan on login: user=${user.id}`);
-        }
-        if (!result) {
-          planError = "FASOU plan assignment returned no result — user may not exist or DB error occurred";
-        } else {
-          planUpgraded = true;
+          await recordFasouReferralSignal(user.id, fasouPartner.id);
+          console.log(`[login] Fasou referral signal recorded (no plan change): user=${user.id} email=${email}`);
         }
       } catch (inviteErr) {
-        console.error("Invite FASOU grant failed on login:", inviteErr.message);
-        planError = `FASOU plan assignment failed: ${inviteErr.message}`;
+        console.error("Fasou referral signal recording failed on login (non-fatal):", inviteErr.message);
       }
     }
 
@@ -1412,6 +1436,44 @@ app.get("/me", requireAuth, async (req, res) => {
     res.json(meResponse);
   } catch (err) {
     console.error("/me error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Lightweight entitlement check for the extension — mirrors /me's access logic
+// without the extra profile/usage fields.
+app.get("/api/me/entitlements", requireAuth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const premium = user.plan_status === "free" ? true : await userHasActiveSubscription(req.userId);
+
+    res.json({
+      premium,
+      subscriptionStatus: user.plan_status || "inactive",
+    });
+  } catch (err) {
+    console.error("/api/me/entitlements error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Returns the existing Stripe Payment Link with client_reference_id set to the
+// logged-in Hari user, so the webhook can correlate the completed checkout back
+// to this user (used as a fallback alongside metadata.userId).
+app.get("/api/billing/upgrade-link", requireAuth, (req, res) => {
+  if (!process.env.STRIPE_PAYMENT_LINK_URL) {
+    return res.status(503).json({ error: "Payment link not configured" });
+  }
+  try {
+    const paymentLink = new URL(process.env.STRIPE_PAYMENT_LINK_URL);
+    paymentLink.searchParams.set("client_reference_id", String(req.userId));
+    res.json({ url: paymentLink.toString() });
+  } catch (err) {
+    console.error("/api/billing/upgrade-link error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
