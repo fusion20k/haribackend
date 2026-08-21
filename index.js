@@ -53,14 +53,12 @@ const {
   atomicCheckAndIncrementChars,
   setUserExtensionStatus,
   disableUserExtension,
-  setUserFasouPlan,
   getMonthlyActiveUsers,
   findPartnerBySlug,
   createPartnerReferral,
   findValidReferral,
   markReferralClicked,
   claimReferral,
-  grantPartnerPlan,
   recordFasouReferralSignal,
   getPartnerReferralStats,
 } = require("./db");
@@ -351,10 +349,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             }
           } else if (["canceled", "unpaid", "past_due"].includes(subscription.status)) {
             const currentUser = await getUserById(subRow.user_id);
-            // NEVER revoke fasou users via webhook — their plan is invite/referral-based
-            if (currentUser && currentUser.plan_status === "fasou") {
-              console.log(`Skipping revoke for fasou user ${subRow.user_id}: plan_status is fasou`);
-            } else if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
+            if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
               await cancelUserSubscription(subRow.user_id);
               console.log(`User ${subRow.user_id} access revoked, status: ${subscription.status}`);
             } else {
@@ -373,10 +368,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
           const currentUser = await getUserById(subRow.user_id);
-          // NEVER revoke fasou users via webhook — their plan is invite/referral-based
-          if (currentUser && currentUser.plan_status === "fasou") {
-            console.log(`Skipping revoke for fasou user ${subRow.user_id}: plan_status is fasou`);
-          } else if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
+          if (currentUser && (!currentUser.subscription_id || currentUser.subscription_id === subscription.id)) {
             await cancelUserSubscription(subRow.user_id);
             console.log(`User ${subRow.user_id} access revoked on subscription deletion`);
           } else {
@@ -562,7 +554,6 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
           SUM(CASE WHEN plan_status = 'pre' THEN 1 ELSE 0 END) AS premium_users,
           SUM(CASE WHEN plan_status = 'payg' THEN 1 ELSE 0 END) AS payg_users,
           SUM(CASE WHEN plan_status = 'free' THEN 1 ELSE 0 END) AS free_users,
-          SUM(CASE WHEN plan_status = 'fasou' THEN 1 ELSE 0 END) AS fasou_users,
           SUM(CASE WHEN created_at > NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END) AS new_signups_7d
         FROM users
       `);
@@ -578,7 +569,6 @@ app.get("/admin/overview", requireAdmin, async (req, res) => {
       premium_users: parseInt(overviewData.premium_users) || 0,
       payg_users: parseInt(overviewData.payg_users) || 0,
       free_users: parseInt(overviewData.free_users) || 0,
-      fasou_users: parseInt(overviewData.fasou_users) || 0,
       new_signups_7d: parseInt(overviewData.new_signups_7d) || 0,
       chars_used_this_month: usage.used,
       chars_quota: usage.total,
@@ -598,7 +588,7 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const plan = req.query.plan || null;
     const offset = (page - 1) * limit;
-    const validPlans = ["free", "pre", "active", "payg", "canceled", "fasou"];
+    const validPlans = ["free", "pre", "active", "payg", "canceled"];
     const planFilter = plan && validPlans.includes(plan) ? plan : null;
     const validSortColumns = ["created_at", "plan_status", "email", "id", "trial_chars_used", "trial_chars_limit"];
     const sortBy = validSortColumns.includes(req.query.sortBy) ? req.query.sortBy : "created_at";
@@ -630,24 +620,6 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     }
   } catch (err) {
     console.error("Admin users error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-app.post("/admin/set-fasou", requireAdmin, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId || !Number.isInteger(userId)) {
-      return res.status(400).json({ error: "userId must be an integer" });
-    }
-    const user = await setUserFasouPlan(userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-    console.log(`Admin set FASOU plan for user=${userId} by admin=${req.userId}`);
-    res.json({ user });
-  } catch (err) {
-    console.error("Admin set FASOU error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -981,7 +953,7 @@ app.get("/admin/payments", requireAdmin, async (req, res) => {
 
 async function userHasActiveSubscription(userId) {
   const user = await getUserById(userId);
-  if (user && (user.has_access === true || user.plan_status === "free" || user.plan_status === "fasou")) {
+  if (user && (user.has_access === true || user.plan_status === "free")) {
     return true;
   }
 
@@ -1095,15 +1067,16 @@ app.post("/auth/signup", async (req, res) => {
       }
     }
 
-    // Process partner referral if token present (only if not already upgraded by invite)
+    // Partner referral token is analytics/attribution-only, same as the invite
+    // cookie above — it no longer grants extra plan limits.
     if (!planGranted && referralToken && typeof referralToken === "string") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
-          planGranted = await grantPartnerPlan(user.id, referral.partner_id, "fasou", "partner");
+          planGranted = await recordFasouReferralSignal(user.id, referral.partner_id, "partner");
           if (planGranted) {
             await claimReferral(referralToken, user.id);
-            console.log(`Partner plan granted on signup: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
+            console.log(`Partner referral signal recorded on signup (no plan change): user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
           }
         } else {
           console.log(`Referral token invalid/expired/claimed on signup: ${referralToken.slice(0, 8)}...`);
@@ -1180,15 +1153,16 @@ app.post("/auth/login", async (req, res) => {
       }
     }
 
-    // Process referral token on login if user doesn't already have a partner plan
+    // Partner referral token is analytics/attribution-only, same as the invite
+    // cookie above — it no longer grants extra plan limits.
     if (!planUpgraded && referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
-          await grantPartnerPlan(user.id, referral.partner_id, "fasou", "partner");
+          await recordFasouReferralSignal(user.id, referral.partner_id, "partner");
           await claimReferral(referralToken, user.id);
           planUpgraded = true;
-          console.log(`Partner plan granted on login: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
+          console.log(`Partner referral signal recorded on login (no plan change): user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
         }
       } catch (refErr) {
         console.error("Referral processing error on login:", refErr.message);
@@ -1860,7 +1834,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg", "fasou"].includes(user.plan_status)
+      !["free", "active", "pre", "payg"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -2015,7 +1989,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     const billableChars = cacheChars + liveChars;
 
     let translateUpdatedUser = null;
-    if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
+    if (user && ["free", "pre"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
@@ -2311,7 +2285,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg", "fasou"].includes(user.plan_status)
+      !["free", "active", "pre", "payg"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -2340,7 +2314,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     let dictUpdatedUser = null;
-    if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
+    if (user && ["free", "pre"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
@@ -2522,7 +2496,7 @@ app.post("/tts", requireAuth, async (req, res) => {
   }
 
   let ttsUpdatedUser = null;
-  if (user && ["free", "pre", "fasou"].includes(user.plan_status)) {
+  if (user && ["free", "pre"].includes(user.plan_status)) {
     const reset = await resetUserCharsIfNeeded(req.userId);
     if (reset) { user = await getUserById(req.userId); }
     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);

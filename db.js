@@ -320,6 +320,18 @@ async function initDatabase() {
     console.log("Migrated canceled users to free plan");
 
     await client.query(`
+      UPDATE users
+      SET plan_status = 'free',
+          has_access = TRUE,
+          trial_chars_limit = ${FREE_PLAN_LIMIT},
+          trial_chars_used = 0,
+          free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE,
+          subscription_id = NULL
+      WHERE plan_status = 'fasou'
+    `);
+    console.log("Migrated fasou users to free plan (fasou plan status retired)");
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1073,13 +1085,6 @@ async function cancelUserSubscription(userId) {
 
   const client = await pool.connect();
   try {
-    // NEVER revert fasou users — their plan is invite/referral-based
-    const user = await client.query("SELECT plan_status FROM users WHERE id = $1", [userId]);
-    if (user.rows[0] && user.rows[0].plan_status === "fasou") {
-      console.log(`cancelUserSubscription: Skipping fasou user ${userId}`);
-      return null;
-    }
-
     const result = await client.query(
       `UPDATE users
        SET plan_status = 'free',
@@ -1371,34 +1376,6 @@ async function updateMeterEventAttempt(id, succeeded) {
   }
 }
 
-async function setUserFasouPlan(userId) {
-  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
-
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      `UPDATE users
-       SET plan_status = 'fasou',
-           has_access = TRUE,
-           trial_chars_limit = 250000,
-           trial_chars_used = 0,
-           chars_used_at_payg_start = 0,
-           subscription_id = NULL,
-           stripe_item_id = NULL,
-           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
-       WHERE id = $1
-       RETURNING id, email, plan_status, has_access, trial_chars_used, trial_chars_limit, free_chars_reset_date`,
-      [userId]
-    );
-    return result.rows[0] || null;
-  } catch (error) {
-    console.error("Error setting FASOU plan:", error);
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 async function getMonthlyActiveUsers(months = 12) {
   if (!process.env.DATABASE_URL) return [];
 
@@ -1548,56 +1525,22 @@ async function claimReferral(token, userId) {
   }
 }
 
-async function grantPartnerPlan(userId, partnerId, plan, planSource = 'partner') {
-  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
-  const client = await pool.connect();
-  try {
-    let charLimit;
-    if (plan === 'fasou') charLimit = 250000;
-    else charLimit = 250000;
-
-    const result = await client.query(
-      `UPDATE users
-       SET plan_status = $1,
-           plan_source = $2,
-           partner_id = $3,
-           plan_granted_at = NOW(),
-           has_access = TRUE,
-           trial_chars_limit = $5,
-           trial_chars_used = 0,
-           chars_used_at_payg_start = 0,
-           subscription_id = NULL,
-           stripe_item_id = NULL,
-           free_chars_reset_date = (NOW() + INTERVAL '30 days')::DATE
-       WHERE id = $4
-       RETURNING id, email, plan_status, plan_source, partner_id, plan_granted_at, has_access, trial_chars_limit`,
-      [plan, planSource, partnerId, userId, charLimit]
-    );
-    return result.rows[0] || null;
-  } catch (error) {
-    console.error("Error granting partner plan:", error);
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 // Records that a signup/login was associated with a Fasou referral cookie, for
 // analytics/welcome-message purposes only. Does NOT grant plan_status or raise
 // char limits — commission/affiliate attribution is decided solely by the Stripe
 // promotion code at checkout (see setSubscriptionAffiliate).
-async function recordFasouReferralSignal(userId, partnerId) {
+async function recordFasouReferralSignal(userId, partnerId, source = 'invite') {
   if (!process.env.DATABASE_URL) return null;
   const client = await pool.connect();
   try {
     const result = await client.query(
       `UPDATE users
-       SET plan_source = COALESCE(plan_source, 'invite'),
+       SET plan_source = COALESCE(plan_source, $3),
            partner_id = COALESCE(partner_id, $2),
            plan_granted_at = COALESCE(plan_granted_at, NOW())
        WHERE id = $1
        RETURNING id, plan_source, partner_id, plan_granted_at`,
-      [userId, partnerId]
+      [userId, partnerId, source]
     );
     return result.rows[0] || null;
   } catch (error) {
@@ -1649,7 +1592,6 @@ module.exports = {
   updateUserPlanStatus,
   cancelUserSubscription,
   activatePaygPlan,
-  setUserFasouPlan,
   getMonthlyActiveUsers,
   getUsage,
   incrementUsage,
@@ -1671,7 +1613,6 @@ module.exports = {
   findValidReferral,
   markReferralClicked,
   claimReferral,
-  grantPartnerPlan,
   recordFasouReferralSignal,
   getPartnerReferralStats,
 };
