@@ -1247,8 +1247,12 @@ app.post("/auth/login", async (req, res) => {
     }
 
     const user = await getUserByEmail(email);
-    if (!user || !user.password_hash) {
+    if (!user) {
       return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    if (!user.password_hash) {
+      return res.status(401).json({ error: "This account uses Google Sign-In. Please continue with Google instead." });
     }
 
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
