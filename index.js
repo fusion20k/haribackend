@@ -8,7 +8,6 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { OAuth2Client } = require("google-auth-library");
-const nodemailer = require("nodemailer");
 const rateLimit = require("express-rate-limit");
 
 const adminPool = new Pool({
@@ -115,31 +114,31 @@ const googleClient = process.env.GOOGLE_OAUTH_CLIENT_ID
   ? new OAuth2Client(process.env.GOOGLE_OAUTH_CLIENT_ID)
   : null;
 
-const mailTransporter =
-  process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
-    ? nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: parseInt(process.env.SMTP_PORT) || 587,
-        secure: String(process.env.SMTP_PORT) === "465",
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS,
-        },
-      })
-    : null;
-
 async function sendVerificationEmail(email, code) {
-  if (!mailTransporter) {
-    console.log(`[email-verification] SMTP not configured; verification code for ${email}: ${code}`);
+  if (!process.env.RESEND_API_KEY) {
+    console.log(`[email-verification] RESEND_API_KEY not configured; verification code for ${email}: ${code}`);
     return;
   }
-  await mailTransporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: email,
-    subject: "Your Hari verification code",
-    text: `Your verification code is ${code}. It expires in 10 minutes.`,
-    html: `<p>Your Hari verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
-  });
+  // Sent over Resend's HTTPS API rather than raw SMTP: Render (like many PaaS
+  // hosts) blocks outbound SMTP ports for anti-spam reasons, which made
+  // nodemailer hang for its full 2-minute connection timeout and fail every send.
+  await axios.post(
+    "https://api.resend.com/emails",
+    {
+      from: process.env.SMTP_FROM || process.env.RESEND_FROM,
+      to: email,
+      subject: "Your Hari verification code",
+      text: `Your verification code is ${code}. It expires in 10 minutes.`,
+      html: `<p>Your Hari verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    }
+  );
 }
 
 function generateVerificationCode() {
