@@ -39,6 +39,10 @@ const {
   getVerificationCode,
   incrementVerificationAttempts,
   deleteVerificationCode,
+  upsertPasswordResetCode,
+  getPasswordResetCode,
+  incrementPasswordResetAttempts,
+  deletePasswordResetCode,
   updateUserStripeCustomerId,
   getLatestSubscriptionForUser,
   createSubscription,
@@ -114,9 +118,9 @@ const googleClient = process.env.GOOGLE_OAUTH_CLIENT_ID
   ? new OAuth2Client(process.env.GOOGLE_OAUTH_CLIENT_ID)
   : null;
 
-async function sendVerificationEmail(email, code) {
+async function sendResendEmail({ to, subject, text, html }) {
   if (!process.env.RESEND_API_KEY) {
-    console.log(`[email-verification] RESEND_API_KEY not configured; verification code for ${email}: ${code}`);
+    console.log(`[email] RESEND_API_KEY not configured; would have sent "${subject}" to ${to}: ${text}`);
     return;
   }
   // Sent over Resend's HTTPS API rather than raw SMTP: Render (like many PaaS
@@ -126,10 +130,10 @@ async function sendVerificationEmail(email, code) {
     "https://api.resend.com/emails",
     {
       from: process.env.SMTP_FROM || process.env.RESEND_FROM,
-      to: email,
-      subject: "Your Hari verification code",
-      text: `Your verification code is ${code}. It expires in 10 minutes.`,
-      html: `<p>Your Hari verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
+      to,
+      subject,
+      text,
+      html,
     },
     {
       headers: {
@@ -139,6 +143,33 @@ async function sendVerificationEmail(email, code) {
       timeout: 10000,
     }
   );
+}
+
+async function sendVerificationEmail(email, code) {
+  await sendResendEmail({
+    to: email,
+    subject: "Your Hari verification code",
+    text: `Your verification code is ${code}. It expires in 10 minutes.`,
+    html: `<p>Your Hari verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
+  });
+}
+
+async function sendPasswordResetEmail(email, code) {
+  await sendResendEmail({
+    to: email,
+    subject: "Your Hari password reset code",
+    text: `Your password reset code is ${code}. It expires in 10 minutes. If you didn't request this, you can ignore this email.`,
+    html: `<p>Your Hari password reset code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p><p>If you didn't request this, you can ignore this email.</p>`,
+  });
+}
+
+async function sendGoogleAccountResetNotice(email) {
+  await sendResendEmail({
+    to: email,
+    subject: "Hari password reset request",
+    text: `Someone requested a password reset for this email, but this Hari account signs in with Google and has no password. Continue with Google Sign-In instead. If this wasn't you, no action is needed.`,
+    html: `<p>Someone requested a password reset for this email, but this Hari account signs in with Google and has no password.</p><p>Continue with Google Sign-In instead. If this wasn't you, no action is needed.</p>`,
+  });
 }
 
 function generateVerificationCode() {
@@ -167,6 +198,14 @@ async function issueAndSendVerificationCode(userId, email) {
   const expiresAt = new Date(Date.now() + VERIFICATION_CODE_TTL_MS);
   await upsertVerificationCode(userId, codeHash, expiresAt);
   await sendVerificationEmail(email, code);
+}
+
+async function issueAndSendPasswordResetCode(userId, email) {
+  const code = generateVerificationCode();
+  const codeHash = hashVerificationCode(code);
+  const expiresAt = new Date(Date.now() + VERIFICATION_CODE_TTL_MS);
+  await upsertPasswordResetCode(userId, codeHash, expiresAt);
+  await sendPasswordResetEmail(email, code);
 }
 
 function ipRateLimiter(windowMs, max) {
@@ -1500,6 +1539,94 @@ app.post("/auth/resend-verification", ipRateLimiter(15 * 60 * 1000, 15), emailRa
     res.json({ ok: true, email });
   } catch (err) {
     console.error("/auth/resend-verification error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/forgot-password", ipRateLimiter(15 * 60 * 1000, 15), emailRateLimiter(15 * 60 * 1000, 5), async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Please enter a valid email address" });
+    }
+
+    // Always respond generically below this point — never reveal whether the
+    // email is registered, verified, or Google-only.
+    try {
+      const user = await getUserByEmail(email);
+      if (user) {
+        if (!user.password_hash) {
+          await sendGoogleAccountResetNotice(email);
+        } else {
+          const record = await getPasswordResetCode(user.id);
+          const onCooldown =
+            record && Date.now() - new Date(record.last_sent_at).getTime() < VERIFICATION_RESEND_COOLDOWN_MS;
+          if (!onCooldown) {
+            await issueAndSendPasswordResetCode(user.id, email);
+          }
+        }
+      }
+    } catch (lookupErr) {
+      console.error("/auth/forgot-password processing error (non-fatal):", lookupErr.message);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("/auth/forgot-password error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/reset-password", ipRateLimiter(15 * 60 * 1000, 40), emailRateLimiter(15 * 60 * 1000, 15), async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+
+    if (!email || !code || !newPassword || typeof email !== "string" || typeof code !== "string" || typeof newPassword !== "string") {
+      return res.status(400).json({ error: "Email, code, and new password are required" });
+    }
+
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({ error: "Password must be at least 8 characters and include a letter and a number" });
+    }
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    const record = await getPasswordResetCode(user.id);
+    if (!record) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    if (record.attempts >= VERIFICATION_MAX_ATTEMPTS) {
+      await deletePasswordResetCode(user.id);
+      return res.status(400).json({ error: "Too many attempts. Please request a new code." });
+    }
+
+    if (new Date(record.expires_at).getTime() < Date.now()) {
+      await deletePasswordResetCode(user.id);
+      return res.status(400).json({ error: "Code expired. Please request a new code." });
+    }
+
+    if (!verificationCodeMatches(code, record.code_hash)) {
+      await incrementPasswordResetAttempts(user.id);
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    await deletePasswordResetCode(user.id);
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await updateUserPasswordHash(user.id, passwordHash);
+    const updatedUser = await getUserById(user.id);
+
+    res.json(await buildSessionResponse(updatedUser));
+  } catch (err) {
+    console.error("/auth/reset-password error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

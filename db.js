@@ -691,6 +691,17 @@ async function initDatabase() {
       )
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_codes (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        code_hash TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -1036,6 +1047,78 @@ async function deleteVerificationCode(userId) {
     await client.query("DELETE FROM email_verification_codes WHERE user_id = $1", [userId]);
   } catch (error) {
     console.error("Error deleting verification code:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function upsertPasswordResetCode(userId, codeHash, expiresAt) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO password_reset_codes (user_id, code_hash, expires_at, attempts, last_sent_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         code_hash = EXCLUDED.code_hash,
+         expires_at = EXCLUDED.expires_at,
+         attempts = 0,
+         last_sent_at = NOW()`,
+      [userId, codeHash, expiresAt]
+    );
+  } catch (error) {
+    console.error("Error upserting password reset code:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getPasswordResetCode(userId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT user_id, code_hash, expires_at, attempts, last_sent_at FROM password_reset_codes WHERE user_id = $1",
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting password reset code:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function incrementPasswordResetAttempts(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE password_reset_codes SET attempts = attempts + 1 WHERE user_id = $1",
+      [userId]
+    );
+  } catch (error) {
+    console.error("Error incrementing password reset attempts:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function deletePasswordResetCode(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("DELETE FROM password_reset_codes WHERE user_id = $1", [userId]);
+  } catch (error) {
+    console.error("Error deleting password reset code:", error);
     throw error;
   } finally {
     client.release();
@@ -1807,6 +1890,10 @@ module.exports = {
   getVerificationCode,
   incrementVerificationAttempts,
   deleteVerificationCode,
+  upsertPasswordResetCode,
+  getPasswordResetCode,
+  incrementPasswordResetAttempts,
+  deletePasswordResetCode,
   updateUserStripeCustomerId,
   getLatestSubscriptionForUser,
   createSubscription,
