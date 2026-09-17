@@ -649,6 +649,48 @@ async function initDatabase() {
       END $$;
     `);
 
+    // Google sign-in support: password is no longer required for Google-only accounts
+    await client.query(`ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL`);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'google_sub'
+        ) THEN
+          ALTER TABLE users ADD COLUMN google_sub VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'email_verified'
+        ) THEN
+          ALTER TABLE users ADD COLUMN email_verified BOOLEAN NOT NULL DEFAULT TRUE;
+        END IF;
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_verification_codes (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        code_hash TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     console.log("Database initialized successfully");
   } catch (error) {
     console.error("Database initialization error:", error);
@@ -739,7 +781,7 @@ async function getUserById(userId) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at FROM users WHERE id = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at, google_sub, email_verified FROM users WHERE id = $1",
       [userId]
     );
     return result.rows[0] || null;
@@ -757,7 +799,7 @@ async function getUserByEmail(email) {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at FROM users WHERE email = $1",
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at, google_sub, email_verified FROM users WHERE email = $1",
       [email]
     );
     return result.rows[0] || null;
@@ -819,6 +861,181 @@ async function createUser(email, passwordHash, stripeCustomerId = null) {
     return result.rows[0];
   } catch (error) {
     console.error("Error creating user:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function createUnverifiedUser(email, passwordHash, stripeCustomerId = null) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `INSERT INTO users (email, password_hash, stripe_customer_id, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date, email_verified)
+       VALUES ($1, $2, $3, 'free', TRUE, ${FREE_PLAN_LIMIT}, 0, (NOW() + INTERVAL '30 days')::DATE, FALSE)
+       RETURNING id, email, stripe_customer_id, created_at, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date, email_verified`,
+      [email, passwordHash, stripeCustomerId]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error creating unverified user:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function createGoogleUser(email, googleSub, stripeCustomerId = null) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `INSERT INTO users (email, password_hash, google_sub, stripe_customer_id, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date, email_verified)
+       VALUES ($1, NULL, $2, $3, 'free', TRUE, ${FREE_PLAN_LIMIT}, 0, (NOW() + INTERVAL '30 days')::DATE, TRUE)
+       RETURNING id, email, stripe_customer_id, created_at, plan_status, has_access, trial_chars_limit, trial_chars_used, free_chars_reset_date, google_sub, email_verified`,
+      [email, googleSub, stripeCustomerId]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error creating Google user:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getUserByGoogleSub(googleSub) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT id, email, password_hash, stripe_customer_id, has_access, created_at, plan_status, trial_chars_used, trial_chars_limit, trial_started_at, trial_converted_at, subscription_id, free_chars_reset_date, stripe_item_id, chars_used_at_payg_start, extension_enabled, extension_last_seen_at, plan_source, partner_id, plan_granted_at, google_sub, email_verified FROM users WHERE google_sub = $1",
+      [googleSub]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting user by Google sub:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function linkGoogleAccount(userId, googleSub) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE users SET google_sub = $1, email_verified = TRUE WHERE id = $2",
+      [googleSub, userId]
+    );
+  } catch (error) {
+    console.error("Error linking Google account:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function markUserEmailVerified(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("UPDATE users SET email_verified = TRUE WHERE id = $1", [userId]);
+  } catch (error) {
+    console.error("Error marking email verified:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateUserPasswordHash(userId, passwordHash) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, userId]);
+  } catch (error) {
+    console.error("Error updating password hash:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function upsertVerificationCode(userId, codeHash, expiresAt) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO email_verification_codes (user_id, code_hash, expires_at, attempts, last_sent_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         code_hash = EXCLUDED.code_hash,
+         expires_at = EXCLUDED.expires_at,
+         attempts = 0,
+         last_sent_at = NOW()`,
+      [userId, codeHash, expiresAt]
+    );
+  } catch (error) {
+    console.error("Error upserting verification code:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function getVerificationCode(userId) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT user_id, code_hash, expires_at, attempts, last_sent_at FROM email_verification_codes WHERE user_id = $1",
+      [userId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting verification code:", error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function incrementVerificationAttempts(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE email_verification_codes SET attempts = attempts + 1 WHERE user_id = $1",
+      [userId]
+    );
+  } catch (error) {
+    console.error("Error incrementing verification attempts:", error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function deleteVerificationCode(userId) {
+  if (!process.env.DATABASE_URL) throw new Error("Database not configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("DELETE FROM email_verification_codes WHERE user_id = $1", [userId]);
+  } catch (error) {
+    console.error("Error deleting verification code:", error);
     throw error;
   } finally {
     client.release();
@@ -1580,6 +1797,16 @@ module.exports = {
   getUserById,
   getUserByEmail,
   createUser,
+  createUnverifiedUser,
+  createGoogleUser,
+  getUserByGoogleSub,
+  linkGoogleAccount,
+  markUserEmailVerified,
+  updateUserPasswordHash,
+  upsertVerificationCode,
+  getVerificationCode,
+  incrementVerificationAttempts,
+  deleteVerificationCode,
   updateUserStripeCustomerId,
   getLatestSubscriptionForUser,
   createSubscription,

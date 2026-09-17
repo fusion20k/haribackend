@@ -7,6 +7,9 @@ const cookieParser = require("cookie-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
+const { OAuth2Client } = require("google-auth-library");
+const nodemailer = require("nodemailer");
+const rateLimit = require("express-rate-limit");
 
 const adminPool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -27,6 +30,16 @@ const {
   getUserById,
   getUserByEmail,
   createUser,
+  createUnverifiedUser,
+  createGoogleUser,
+  getUserByGoogleSub,
+  linkGoogleAccount,
+  markUserEmailVerified,
+  updateUserPasswordHash,
+  upsertVerificationCode,
+  getVerificationCode,
+  incrementVerificationAttempts,
+  deleteVerificationCode,
   updateUserStripeCustomerId,
   getLatestSubscriptionForUser,
   createSubscription,
@@ -66,6 +79,9 @@ const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage 
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
 const app = express();
+// Render (and most PaaS hosts) sit behind a reverse proxy, so req.ip needs the
+// forwarded client IP for accurate per-IP rate limiting on the auth endpoints.
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 10000;
 
 function mapLangCode(lang) {
@@ -76,6 +92,106 @@ function mapLangCode(lang) {
 function getPeriodEnd(sub) {
   const ts = sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end;
   return ts ? new Date(ts * 1000) : null;
+}
+
+// --- Auth hardening helpers ---
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidEmail(email) {
+  return typeof email === "string" && email.length <= 254 && EMAIL_REGEX.test(email);
+}
+
+function isStrongPassword(password) {
+  return (
+    typeof password === "string" &&
+    password.length >= 8 &&
+    /[A-Za-z]/.test(password) &&
+    /[0-9]/.test(password)
+  );
+}
+
+const googleClient = process.env.GOOGLE_OAUTH_CLIENT_ID
+  ? new OAuth2Client(process.env.GOOGLE_OAUTH_CLIENT_ID)
+  : null;
+
+const mailTransporter =
+  process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
+    ? nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: parseInt(process.env.SMTP_PORT) || 587,
+        secure: String(process.env.SMTP_PORT) === "465",
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS,
+        },
+      })
+    : null;
+
+async function sendVerificationEmail(email, code) {
+  if (!mailTransporter) {
+    console.log(`[email-verification] SMTP not configured; verification code for ${email}: ${code}`);
+    return;
+  }
+  await mailTransporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: "Your Hari verification code",
+    text: `Your verification code is ${code}. It expires in 10 minutes.`,
+    html: `<p>Your Hari verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
+  });
+}
+
+function generateVerificationCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+}
+
+function hashVerificationCode(code) {
+  return crypto.createHmac("sha256", process.env.JWT_SECRET).update(code).digest("hex");
+}
+
+function verificationCodeMatches(code, storedHash) {
+  const candidateHash = hashVerificationCode(code);
+  const a = Buffer.from(candidateHash, "hex");
+  const b = Buffer.from(storedHash, "hex");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+const VERIFICATION_CODE_TTL_MS = 10 * 60 * 1000;
+const VERIFICATION_MAX_ATTEMPTS = 5;
+const VERIFICATION_RESEND_COOLDOWN_MS = 45 * 1000;
+
+async function issueAndSendVerificationCode(userId, email) {
+  const code = generateVerificationCode();
+  const codeHash = hashVerificationCode(code);
+  const expiresAt = new Date(Date.now() + VERIFICATION_CODE_TTL_MS);
+  await upsertVerificationCode(userId, codeHash, expiresAt);
+  await sendVerificationEmail(email, code);
+}
+
+function ipRateLimiter(windowMs, max) {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests. Please try again later." },
+  });
+}
+
+function emailRateLimiter(windowMs, max) {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      const email = (req.body?.email || "").toString().trim().toLowerCase();
+      return email || req.ip;
+    },
+    message: { error: "Too many requests for this email. Please try again later." },
+  });
 }
 
 async function cancelStripeSubscriptionWithFinalUsage(subscriptionId) {
@@ -1013,7 +1129,7 @@ app.post("/api/partner/click", async (req, res) => {
 
 // --- Auth endpoints ---
 
-app.post("/auth/signup", async (req, res) => {
+app.post("/auth/signup", ipRateLimiter(15 * 60 * 1000, 20), emailRateLimiter(15 * 60 * 1000, 6), async (req, res) => {
   try {
     const { email, password, referralToken } = req.body;
 
@@ -1027,30 +1143,38 @@ app.post("/auth/signup", async (req, res) => {
       return res.status(400).json({ error: "Email and password required" });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Please enter a valid email address" });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({ error: "Password must be at least 8 characters and include a letter and a number" });
     }
 
     const existingUser = await getUserByEmail(email);
-    if (existingUser) {
+    if (existingUser && existingUser.email_verified) {
       return res.status(400).json({ error: "Email already registered" });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    let stripeCustomerId = null;
-    if (stripe) {
-      try {
-        const customer = await stripe.customers.create({ email });
-        stripeCustomerId = customer.id;
-      } catch (stripeErr) {
-        console.error("Stripe customer creation failed (non-fatal):", stripeErr.message);
+    let user;
+    if (existingUser && !existingUser.email_verified) {
+      // Previous signup never got verified — refresh the password and reissue a code
+      await updateUserPasswordHash(existingUser.id, passwordHash);
+      user = existingUser;
+    } else {
+      let stripeCustomerId = null;
+      if (stripe) {
+        try {
+          const customer = await stripe.customers.create({ email });
+          stripeCustomerId = customer.id;
+        } catch (stripeErr) {
+          console.error("Stripe customer creation failed (non-fatal):", stripeErr.message);
+        }
       }
+      user = await createUnverifiedUser(email, passwordHash, stripeCustomerId);
     }
-
-    const user = await createUser(email, passwordHash, stripeCustomerId);
-
-    let planGranted = null;
 
     // Fasou invite cookie is analytics/attribution-only now — it no longer grants
     // extra plan limits. Commission attribution comes solely from the Stripe promo
@@ -1069,12 +1193,12 @@ app.post("/auth/signup", async (req, res) => {
 
     // Partner referral token is analytics/attribution-only, same as the invite
     // cookie above — it no longer grants extra plan limits.
-    if (!planGranted && referralToken && typeof referralToken === "string") {
+    if (referralToken && typeof referralToken === "string") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
-          planGranted = await recordFasouReferralSignal(user.id, referral.partner_id, "partner");
-          if (planGranted) {
+          const granted = await recordFasouReferralSignal(user.id, referral.partner_id, "partner");
+          if (granted) {
             await claimReferral(referralToken, user.id);
             console.log(`Partner referral signal recorded on signup (no plan change): user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
           }
@@ -1086,26 +1210,19 @@ app.post("/auth/signup", async (req, res) => {
       }
     }
 
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
-      expiresIn: "30d",
-    });
+    try {
+      await issueAndSendVerificationCode(user.id, email);
+    } catch (emailErr) {
+      console.error("Failed to send verification email:", emailErr.message);
+      return res.status(500).json({ error: "Failed to send verification email. Please try again." });
+    }
 
     // Clear invite cookie so it can't be reused
     if (invite) {
       res.cookie("invite", "", { maxAge: 0, path: "/" });
     }
 
-    const updatedUser = planGranted ? await getUserById(user.id) : user;
-
-    res.json({
-      token,
-      user: { id: updatedUser.id, email: updatedUser.email },
-      hasAccess: updatedUser.has_access ?? true,
-      plan_status: updatedUser.plan_status ?? "free",
-      plan_source: updatedUser.plan_source ?? null,
-      trial_chars_used: updatedUser.trial_chars_used ?? 0,
-      trial_chars_limit: updatedUser.trial_chars_limit ?? FREE_PLAN_LIMIT,
-    });
+    res.json({ pendingVerification: true, email });
   } catch (err) {
     console.error("Signup error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -1126,8 +1243,12 @@ app.post("/auth/login", async (req, res) => {
       return res.status(400).json({ error: "Email and password required" });
     }
 
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Please enter a valid email address" });
+    }
+
     const user = await getUserByEmail(email);
-    if (!user) {
+    if (!user || !user.password_hash) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
@@ -1194,6 +1315,188 @@ app.post("/auth/login", async (req, res) => {
     });
   } catch (err) {
     console.error("Login error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+async function buildSessionResponse(user) {
+  const hasAccess = await userHasActiveSubscription(user.id);
+  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
+    expiresIn: "30d",
+  });
+  return {
+    token,
+    user: { id: user.id, email: user.email },
+    hasAccess,
+    plan_status: user.plan_status || null,
+    plan_source: user.plan_source || null,
+    trial_chars_used: user.trial_chars_used ?? 0,
+    trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
+  };
+}
+
+app.post("/auth/google", ipRateLimiter(15 * 60 * 1000, 30), async (req, res) => {
+  try {
+    if (!googleClient) {
+      return res.status(503).json({ error: "Google sign-in is not configured" });
+    }
+
+    const { id_token, nonce, referralToken } = req.body;
+
+    if (!id_token || typeof id_token !== "string") {
+      return res.status(400).json({ error: "id_token is required" });
+    }
+
+    if (!nonce || typeof nonce !== "string") {
+      return res.status(400).json({ error: "nonce is required" });
+    }
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: id_token,
+        audience: process.env.GOOGLE_OAUTH_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (verifyErr) {
+      console.error("Google id_token verification failed:", verifyErr.message);
+      return res.status(401).json({ error: "Invalid Google token" });
+    }
+
+    if (!payload || !payload.sub || !payload.email) {
+      return res.status(401).json({ error: "Invalid Google token" });
+    }
+
+    if (!payload.email_verified) {
+      return res.status(401).json({ error: "Google account email is not verified" });
+    }
+
+    if (payload.nonce !== nonce) {
+      return res.status(401).json({ error: "Invalid Google token" });
+    }
+
+    let user = await getUserByGoogleSub(payload.sub);
+
+    if (!user) {
+      const existingUser = await getUserByEmail(payload.email);
+      if (existingUser) {
+        await linkGoogleAccount(existingUser.id, payload.sub);
+        user = await getUserById(existingUser.id);
+      } else {
+        let stripeCustomerId = null;
+        if (stripe) {
+          try {
+            const customer = await stripe.customers.create({ email: payload.email });
+            stripeCustomerId = customer.id;
+          } catch (stripeErr) {
+            console.error("Stripe customer creation failed (non-fatal):", stripeErr.message);
+          }
+        }
+        user = await createGoogleUser(payload.email, payload.sub, stripeCustomerId);
+      }
+    }
+
+    if (referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
+      try {
+        const referral = await findValidReferral(referralToken);
+        if (referral) {
+          await recordFasouReferralSignal(user.id, referral.partner_id, "partner");
+          await claimReferral(referralToken, user.id);
+          user = await getUserById(user.id);
+          console.log(`Partner referral signal recorded on Google sign-in: user=${user.id} partner_id=${referral.partner_id} token=${referralToken.slice(0, 8)}...`);
+        }
+      } catch (refErr) {
+        console.error("Referral processing error on Google sign-in:", refErr.message);
+      }
+    }
+
+    res.json(await buildSessionResponse(user));
+  } catch (err) {
+    console.error("/auth/google error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/verify-email", ipRateLimiter(15 * 60 * 1000, 40), emailRateLimiter(15 * 60 * 1000, 15), async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code || typeof email !== "string" || typeof code !== "string") {
+      return res.status(400).json({ error: "Email and code are required" });
+    }
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    if (user.email_verified) {
+      return res.status(400).json({ error: "Email already verified. Please log in." });
+    }
+
+    const record = await getVerificationCode(user.id);
+    if (!record) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    if (record.attempts >= VERIFICATION_MAX_ATTEMPTS) {
+      await deleteVerificationCode(user.id);
+      return res.status(400).json({ error: "Too many attempts. Please request a new code." });
+    }
+
+    if (new Date(record.expires_at).getTime() < Date.now()) {
+      await deleteVerificationCode(user.id);
+      return res.status(400).json({ error: "Code expired. Please request a new code." });
+    }
+
+    if (!verificationCodeMatches(code, record.code_hash)) {
+      await incrementVerificationAttempts(user.id);
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+
+    await deleteVerificationCode(user.id);
+    await markUserEmailVerified(user.id);
+    const updatedUser = await getUserById(user.id);
+
+    res.json(await buildSessionResponse(updatedUser));
+  } catch (err) {
+    console.error("/auth/verify-email error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/auth/resend-verification", ipRateLimiter(15 * 60 * 1000, 15), emailRateLimiter(15 * 60 * 1000, 5), async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "No pending verification found for this email" });
+    }
+
+    if (user.email_verified) {
+      return res.status(400).json({ error: "Email already verified. Please log in." });
+    }
+
+    const record = await getVerificationCode(user.id);
+    if (record && Date.now() - new Date(record.last_sent_at).getTime() < VERIFICATION_RESEND_COOLDOWN_MS) {
+      return res.status(429).json({ error: "Please wait before requesting another code." });
+    }
+
+    try {
+      await issueAndSendVerificationCode(user.id, email);
+    } catch (emailErr) {
+      console.error("Failed to resend verification email:", emailErr.message);
+      return res.status(500).json({ error: "Failed to send verification email. Please try again." });
+    }
+
+    res.json({ ok: true, email });
+  } catch (err) {
+    console.error("/auth/resend-verification error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
