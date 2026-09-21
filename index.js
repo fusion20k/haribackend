@@ -368,13 +368,36 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        const userId = parseInt(
+        let userId = parseInt(
           (session.metadata && session.metadata.userId) || session.client_reference_id
         );
         const subscriptionId = session.subscription;
 
         if (!userId || isNaN(userId)) {
-          console.error("checkout.session.completed: missing userId in metadata/client_reference_id", session.id);
+          // Fallback for checkouts that never carried our tracking (e.g. someone
+          // reached the raw Stripe Payment Link directly instead of going through
+          // /api/billing/upgrade-link, so there's no metadata.userId or
+          // client_reference_id). Stripe still always captures the payer's email,
+          // so match that against an existing Hari account as a last resort.
+          const checkoutEmail = session.customer_details?.email || session.customer_email;
+          const userByEmail = checkoutEmail ? await getUserByEmail(checkoutEmail) : null;
+          if (userByEmail) {
+            userId = userByEmail.id;
+            console.log(`checkout.session.completed: resolved userId=${userId} via email fallback (${checkoutEmail}) for session ${session.id}`);
+          }
+        }
+
+        if (!userId || isNaN(userId)) {
+          console.error("checkout.session.completed: could not resolve userId via metadata/client_reference_id/email", session.id);
+          try {
+            await sendResendEmail({
+              to: process.env.ADMIN_EMAIL,
+              subject: "Hari: unmatched Stripe checkout — manual reconciliation needed",
+              text: `A Stripe checkout completed but couldn't be matched to any Hari account.\n\nSession: ${session.id}\nCustomer: ${session.customer}\nEmail: ${session.customer_details?.email || session.customer_email || "unknown"}\nAmount: ${session.amount_total} ${session.currency}\n\nThis customer paid but has no plan update — please reconcile manually.`,
+            });
+          } catch (alertErr) {
+            console.error("Failed to send unmatched-checkout admin alert (non-fatal):", alertErr.message);
+          }
           break;
         }
 
