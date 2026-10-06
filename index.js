@@ -253,6 +253,28 @@ async function cancelStripeSubscriptionWithFinalUsage(subscriptionId) {
   }
 }
 
+// Single source of truth for "given a Stripe subscription, what should this
+// user's plan look like in our DB" — used by every webhook event that can
+// create/activate a subscription AND by the synchronous checkout-verify
+// endpoint, so the two paths can't drift out of sync with each other.
+async function applySubscriptionPlanUpdate(userId, subscription) {
+  await createSubscription(userId, subscription.id, subscription.status, getPeriodEnd(subscription));
+
+  const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+
+  if (isPayg && subscription.status === "active") {
+    const stripeItemId = subscription.items.data[0].id;
+    await activatePaygPlan(userId, subscription.id, stripeItemId);
+    console.log(`PAYG activated: user=${userId} sub=${subscription.id} item=${stripeItemId}`);
+  } else if (subscription.status === "trialing") {
+    await updateUserTrialStart(userId, subscription.id);
+    console.log(`Trial started: user=${userId} sub=${subscription.id}`);
+  } else if (subscription.status === "active") {
+    await updateUserPlanStatus(userId, "pre", true, new Date(), subscription.id);
+    console.log(`Subscription active: user=${userId} sub=${subscription.id}`);
+  }
+}
+
 async function azureTranslate(texts, sourceLang, targetLang) {
   const from = mapLangCode(sourceLang);
   const to = mapLangCode(targetLang);
@@ -404,15 +426,13 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         if (subscriptionId) {
           const subscription = await stripe.subscriptions.retrieve(subscriptionId);
 
+          const userBeforeUpdate = await getUserById(userId);
+          const previousSubscriptionId = userBeforeUpdate ? userBeforeUpdate.subscription_id : null;
+
           try {
-            await createSubscription(
-              userId,
-              subscription.id,
-              subscription.status,
-              getPeriodEnd(subscription)
-            );
+            await applySubscriptionPlanUpdate(userId, subscription);
           } catch (dbErr) {
-            console.error("checkout.session.completed: createSubscription error (non-fatal):", dbErr.message);
+            console.error("checkout.session.completed: applySubscriptionPlanUpdate error (non-fatal):", dbErr.message);
           }
 
           try {
@@ -429,27 +449,12 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             console.error("checkout.session.completed: affiliate detection error (non-fatal):", affErr.message);
           }
 
-          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
-
-          if (isPayg && subscription.status === "active") {
-            const stripeItemId = subscription.items.data[0].id;
-            await activatePaygPlan(userId, subscription.id, stripeItemId);
-            console.log(`PAYG activated: user=${userId} sub=${subscription.id} item=${stripeItemId}`);
-          } else if (subscription.status === "trialing") {
-            await updateUserTrialStart(userId, subscription.id);
-            console.log(`Trial started: user=${userId} sub=${subscription.id}`);
-          } else if (subscription.status === "active") {
-            const userBeforeUpdate = await getUserById(userId);
-            const previousSubscriptionId = userBeforeUpdate ? userBeforeUpdate.subscription_id : null;
-            await updateUserPlanStatus(userId, "pre", true, new Date(), subscription.id);
-            console.log(`Subscription active: user=${userId}`);
-            if (previousSubscriptionId && previousSubscriptionId !== subscription.id) {
-              try {
-                await cancelStripeSubscriptionWithFinalUsage(previousSubscriptionId);
-                console.log(`Canceled old sub ${previousSubscriptionId} after upgrade for user=${userId}`);
-              } catch (e) {
-                console.error("Failed to cancel old sub on upgrade:", e.message);
-              }
+          if (subscription.status === "active" && previousSubscriptionId && previousSubscriptionId !== subscription.id) {
+            try {
+              await cancelStripeSubscriptionWithFinalUsage(previousSubscriptionId);
+              console.log(`Canceled old sub ${previousSubscriptionId} after upgrade for user=${userId}`);
+            } catch (e) {
+              console.error("Failed to cancel old sub on upgrade:", e.message);
             }
           }
         }
@@ -465,28 +470,9 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
         if (userId && !isNaN(userId)) {
           try {
-            await createSubscription(
-              userId,
-              subscription.id,
-              subscription.status,
-              getPeriodEnd(subscription)
-            );
+            await applySubscriptionPlanUpdate(userId, subscription);
           } catch (dbErr) {
-            console.error("customer.subscription.created: createSubscription error (non-fatal):", dbErr.message);
-          }
-
-          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
-
-          if (isPayg && subscription.status === "active") {
-            const stripeItemId = subscription.items.data[0].id;
-            await activatePaygPlan(userId, subscription.id, stripeItemId);
-            console.log(`PAYG activated via subscription.created: user=${userId} sub=${subscription.id} item=${stripeItemId}`);
-          } else if (subscription.status === "trialing") {
-            await updateUserTrialStart(userId, subscription.id);
-            console.log(`Trial started via subscription.created: user=${userId}`);
-          } else if (subscription.status === "active") {
-            await updateUserPlanStatus(userId, "pre", true, new Date(), subscription.id);
-            console.log(`Active via subscription.created: user=${userId}`);
+            console.error("customer.subscription.created: applySubscriptionPlanUpdate error (non-fatal):", dbErr.message);
           }
         }
         break;
@@ -1826,44 +1812,55 @@ p{font-size:1rem;font-weight:500;line-height:1.65;color:#555;max-width:400px;mar
 </div></body></html>`);
 });
 
+async function buildMeResponse(user) {
+  const hasAccess = user.plan_status === "free" ? true : await userHasActiveSubscription(user.id);
+
+  const meResponse = {
+    id: user.id,
+    email: user.email,
+    hasAccess,
+    has_access: hasAccess,
+    plan_status: user.plan_status || null,
+    plan_source: user.plan_source || null,
+    partner_id: user.partner_id || null,
+    plan_granted_at: user.plan_granted_at || null,
+    trial_chars_used: user.trial_chars_used ?? 0,
+    trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
+    trial_started_at: user.trial_started_at || null,
+    free_chars_reset_date: user.free_chars_reset_date || null,
+    extension_enabled: user.extension_enabled ?? null,
+    extension_last_seen_at: user.extension_last_seen_at || null,
+    extension_effectively_enabled:
+      user.extension_enabled === true &&
+      user.extension_last_seen_at != null &&
+      new Date(user.extension_last_seen_at) > new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+    payg_chars_used: null,
+    payg_chars_limit: null,
+    payg_soft_limit_warning: null,
+  };
+
+  if (user.plan_status === "payg") {
+    const paygUsed = (user.trial_chars_used ?? 0) - (user.chars_used_at_payg_start ?? 0);
+    const paygLimit = user.trial_chars_limit ?? 20000000;
+    meResponse.payg_chars_used = paygUsed;
+    meResponse.payg_chars_limit = paygLimit;
+    meResponse.payg_soft_limit_warning =
+      paygUsed >= paygLimit
+        ? "You have exceeded the 20M character soft limit. Contact support if needed."
+        : null;
+  }
+
+  return meResponse;
+}
+
 app.get("/me", requireAuth, async (req, res) => {
   try {
-    let user = await getUserById(req.userId);
+    const user = await getUserById(req.userId);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const hasAccess = user.plan_status === "free" ? true : await userHasActiveSubscription(req.userId);
-
-    const meResponse = {
-      id: user.id,
-      email: user.email,
-      hasAccess,
-      has_access: hasAccess,
-      plan_status: user.plan_status || null,
-      plan_source: user.plan_source || null,
-      partner_id: user.partner_id || null,
-      plan_granted_at: user.plan_granted_at || null,
-      trial_chars_used: user.trial_chars_used ?? 0,
-      trial_chars_limit: user.trial_chars_limit ?? FREE_PLAN_LIMIT,
-      trial_started_at: user.trial_started_at || null,
-      free_chars_reset_date: user.free_chars_reset_date || null,
-      extension_enabled: user.extension_enabled ?? null,
-      extension_last_seen_at: user.extension_last_seen_at || null,
-      extension_effectively_enabled:
-        user.extension_enabled === true &&
-        user.extension_last_seen_at != null &&
-        new Date(user.extension_last_seen_at) > new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
-      payg_chars_used: null,
-      payg_chars_limit: null,
-    };
-
-    if (user.plan_status === "payg") {
-      meResponse.payg_chars_used = (user.trial_chars_used ?? 0) - (user.chars_used_at_payg_start ?? 0);
-      meResponse.payg_chars_limit = user.trial_chars_limit ?? 20000000;
-    }
-
-    res.json(meResponse);
+    res.json(await buildMeResponse(user));
   } catch (err) {
     console.error("/me error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -1904,6 +1901,61 @@ app.get("/api/billing/upgrade-link", requireAuth, (req, res) => {
     res.json({ url: paymentLink.toString() });
   } catch (err) {
     console.error("/api/billing/upgrade-link error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Synchronously applies a just-completed checkout's plan update instead of
+// waiting on the async Stripe webhook. The client should call this (passing
+// the session_id Stripe appended to success_url) right after checkout/
+// switch-plan redirects back, so /me reflects the new plan immediately rather
+// than depending on webhook delivery latency.
+app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: "Payment system not configured" });
+  }
+
+  const sessionId = req.query.session_id;
+  if (!sessionId || typeof sessionId !== "string") {
+    return res.status(400).json({ error: "session_id is required" });
+  }
+
+  try {
+    const user = await getUserById(req.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["subscription"],
+    });
+
+    // Confirm this session actually belongs to the authenticated user before
+    // acting on it — don't let someone apply an arbitrary session_id to their
+    // own account.
+    const sessionUserId = parseInt(
+      (session.metadata && session.metadata.userId) || session.client_reference_id
+    );
+    const belongsToUser =
+      (sessionUserId && sessionUserId === req.userId) ||
+      (user.stripe_customer_id && session.customer === user.stripe_customer_id);
+
+    if (!belongsToUser) {
+      return res.status(403).json({ error: "This checkout session does not belong to your account" });
+    }
+
+    if (session.status !== "complete") {
+      return res.json({ pending: true, ...(await buildMeResponse(user)) });
+    }
+
+    if (session.subscription && typeof session.subscription === "object") {
+      await applySubscriptionPlanUpdate(req.userId, session.subscription);
+    }
+
+    const updatedUser = await getUserById(req.userId);
+    res.json({ pending: false, ...(await buildMeResponse(updatedUser)) });
+  } catch (err) {
+    console.error("/api/billing/checkout-verify error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -2452,11 +2504,10 @@ app.post("/translate", requireAuth, async (req, res) => {
       if (!allowed) {
         if (user.plan_status === "free") {
           return res.status(402).json({
-            allowed: false,
-            reason: "FREE_LIMIT_REACHED",
-            limit: FREE_PLAN_LIMIT,
-            used: user.trial_chars_used,
-            remaining: 0,
+            error: "trial_exhausted",
+            message: "You have used your free translation limit.",
+            trial_chars_used: user.trial_chars_used,
+            trial_chars_limit: FREE_PLAN_LIMIT,
           });
         }
         return res.status(402).json({
@@ -2681,10 +2732,11 @@ app.post("/translate", requireAuth, async (req, res) => {
         translations,
         payg_chars_used: updatedCharsUsed - paygBaseline,
         payg_chars_limit: softLimit,
+        payg_soft_limit_warning:
+          updatedCharsUsed >= softLimit
+            ? "You have exceeded the 20M character soft limit. Contact support if needed."
+            : null,
       };
-      if (updatedCharsUsed >= softLimit) {
-        paygResponse.payg_soft_limit_warning = "You have exceeded the 20M character soft limit. Contact support if needed.";
-      }
       return res.json(paygResponse);
     }
 
@@ -2777,11 +2829,10 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       if (!allowed) {
         if (user.plan_status === "free") {
           return res.status(402).json({
-            allowed: false,
-            reason: "FREE_LIMIT_REACHED",
-            limit: FREE_PLAN_LIMIT,
-            used: user.trial_chars_used,
-            remaining: 0,
+            error: "trial_exhausted",
+            message: "You have used your free translation limit.",
+            trial_chars_used: user.trial_chars_used,
+            trial_chars_limit: FREE_PLAN_LIMIT,
           });
         }
         return res.status(402).json({
@@ -2843,10 +2894,11 @@ app.post("/dictionary", requireAuth, async (req, res) => {
         ...entry,
         payg_chars_used: updatedCharsUsed - paygBaseline,
         payg_chars_limit: softLimit,
+        payg_soft_limit_warning:
+          updatedCharsUsed >= softLimit
+            ? "You have exceeded the 20M character soft limit. Contact support if needed."
+            : null,
       };
-      if (updatedCharsUsed >= softLimit) {
-        paygResponse.payg_soft_limit_warning = "You have exceeded the 20M character soft limit. Contact support if needed.";
-      }
       return res.json(paygResponse);
     }
 
@@ -2959,11 +3011,10 @@ app.post("/tts", requireAuth, async (req, res) => {
     if (!allowed) {
       if (user.plan_status === "free") {
         return res.status(402).json({
-          allowed: false,
-          reason: "FREE_LIMIT_REACHED",
-          limit: FREE_PLAN_LIMIT,
-          used: user.trial_chars_used,
-          remaining: 0,
+          error: "trial_exhausted",
+          message: "You have used your free translation limit.",
+          trial_chars_used: user.trial_chars_used,
+          trial_chars_limit: FREE_PLAN_LIMIT,
         });
       }
       return res.status(402).json({
