@@ -203,6 +203,7 @@ function mountPremium(app, deps) {
   const audioCache = new AudioCache(500);
   const llmLimiter = makeUserLimiter(60_000, 30);
   const ttsLimiter = makeUserLimiter(60_000, 60);
+  const sttLimiter = makeUserLimiter(60_000, 40);
 
   /** Loads the user and rejects anything that isn't Premium, PAYG or admin. */
   async function requirePremium(req, res, next) {
@@ -352,6 +353,43 @@ function mountPremium(app, deps) {
     } catch (err) {
       console.error("[premium-tts] error:", err.message);
       res.status(502).json({ error: "tts_unavailable" });
+    }
+  });
+
+  // --- Speech to text for Zeron (the extension records 16 kHz mono WAV from the chosen mic) ---
+  const wavBody = express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "2.5mb" });
+  app.post("/premium/stt", requireAuth, wavBody, requirePremium, sttLimiter, async (req, res) => {
+    if (!process.env.AZURE_SPEECH_KEY) return res.status(503).json({ error: "stt_not_configured" });
+    const audio = req.body;
+    if (!Buffer.isBuffer(audio) || audio.length < 1000) return res.status(400).json({ error: "no_audio" });
+    const seconds = Math.max(0, (audio.length - 44) / 32000); // 16 kHz * 16-bit mono
+    if (seconds > 60) return res.status(413).json({ error: "audio_too_long" });
+    const language = req.query.lang === "en-US" ? "en-US" : "fil-PH";
+    const reserved = Math.ceil(seconds * 15); // roughly what that much speech costs as text
+    try {
+      if (!(await reserveChars(req, res, reserved))) return;
+      const region = process.env.AZURE_SPEECH_REGION || "eastus";
+      const response = await fetch(
+        `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${language}&format=simple&profanity=raw`,
+        {
+          method: "POST",
+          headers: {
+            "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
+            "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+            Accept: "application/json",
+          },
+          body: audio,
+        }
+      );
+      if (!response.ok) throw new Error(`azure_stt_${response.status}: ${await response.text()}`);
+      const data = await response.json();
+      const text = data.RecognitionStatus === "Success" ? String(data.DisplayText || "").trim() : "";
+      await settleChars(req, reserved, text.length, "stt");
+      logTranslationUsage(req.userId, ["stt"], [false], "stt", language, language, "stt");
+      res.json({ text, status: data.RecognitionStatus || "Unknown" });
+    } catch (err) {
+      console.error("[premium-stt] error:", err.message);
+      res.status(502).json({ error: "stt_unavailable" });
     }
   });
 
