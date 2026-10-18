@@ -1929,4 +1929,5 @@ module.exports = {
   claimReferral,
   recordFasouReferralSignal,
   getPartnerReferralStats,
+  pool,
 };

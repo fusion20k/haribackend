@@ -77,7 +77,9 @@ const {
   claimReferral,
   recordFasouReferralSignal,
   getPartnerReferralStats,
+  pool,
 } = require("./db");
+const { mountGrowth, recordSignupSource, sourceFromToken } = require("./growth");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
@@ -366,6 +368,8 @@ app.use(
   })
 );
 app.use(cookieParser());
+
+if (process.env.DATABASE_URL) mountGrowth(app, { pool, stripe });
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) {
@@ -1238,9 +1242,12 @@ app.post("/auth/signup", ipRateLimiter(15 * 60 * 1000, 20), emailRateLimiter(15 
       }
     }
 
+    // Marketing source from the website ("src_<code>"): attribution only
+    await recordSignupSource(pool, user.id, referralToken);
+
     // Partner referral token is analytics/attribution-only, same as the invite
     // cookie above — it no longer grants extra plan limits.
-    if (referralToken && typeof referralToken === "string") {
+    if (referralToken && typeof referralToken === "string" && !sourceFromToken(referralToken)) {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
@@ -1325,9 +1332,11 @@ app.post("/auth/login", async (req, res) => {
       }
     }
 
+    await recordSignupSource(pool, user.id, referralToken);
+
     // Partner referral token is analytics/attribution-only, same as the invite
     // cookie above — it no longer grants extra plan limits.
-    if (!planUpgraded && referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
+    if (!planUpgraded && referralToken && typeof referralToken === "string" && !sourceFromToken(referralToken) && user.plan_source !== "partner") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
@@ -1447,7 +1456,9 @@ app.post("/auth/google", ipRateLimiter(15 * 60 * 1000, 30), async (req, res) => 
       }
     }
 
-    if (referralToken && typeof referralToken === "string" && user.plan_source !== "partner") {
+    await recordSignupSource(pool, user.id, referralToken);
+
+    if (referralToken && typeof referralToken === "string" && !sourceFromToken(referralToken) && user.plan_source !== "partner") {
       try {
         const referral = await findValidReferral(referralToken);
         if (referral) {
