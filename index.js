@@ -374,7 +374,7 @@ if (process.env.DATABASE_URL) mountGrowth(app, { pool, stripe });
 if (process.env.DATABASE_URL) {
   mountPremium(app, {
     requireAuth, stripe, getUserById, resetUserCharsIfNeeded, atomicCheckAndIncrementChars,
-    incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage,
+    incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage, pool,
   });
 }
 

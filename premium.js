@@ -103,14 +103,19 @@ function looksTaglish(text) {
   return en / words.length >= 0.2;
 }
 
-async function azureTts(text, { gender, style, rate }) {
+async function azureTts(text, { gender, style, rate, azureVoice }) {
   if (!process.env.AZURE_SPEECH_KEY) throw new Error("azure_tts_not_configured");
   const region = process.env.AZURE_SPEECH_REGION || "eastus";
   const ratePct = `${Math.round((rate - 1) * 100)}%`;
   const safe = escapeXml(text);
   const taglish = style === "taglish" || (style === "auto" && looksTaglish(text));
   let ssml;
-  if (taglish) {
+  if (azureVoice) {
+    // a voice the user picked in the sidebar
+    ssml = azureVoice.multilingual
+      ? `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${azureVoice.name}"><lang xml:lang="fil-PH"><prosody rate="${ratePct}">${safe}</prosody></lang></voice></speak>`
+      : `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${azureVoice.name}"><prosody rate="${ratePct}">${safe}</prosody></voice></speak>`;
+  } else if (taglish) {
     // DragonHD multilingual voices switch between English and Filipino mid-sentence naturally.
     const voice = gender === "male" ? "en-US-Andrew:DragonHDLatestNeural" : "en-US-Ava:DragonHDLatestNeural";
     ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="fil-PH"><voice name="${voice}"><lang xml:lang="fil-PH"><prosody rate="${ratePct}">${safe}</prosody></lang></voice></speak>`;
@@ -238,6 +243,15 @@ function defaultTtsProvider() {
 // Relative cost weight charged against the user's character allowance.
 const TTS_WEIGHT = { azure: 2, google: 2, elevenlabs: 4 };
 
+// Voices Premium/PAYG users can pick in the sidebar. "aisyah" is the default.
+const PREMIUM_VOICES = {
+  aisyah: { provider: "elevenlabs", gender: "female" },
+  blessica: { provider: "azure", gender: "female", azureVoice: { name: "fil-PH-BlessicaNeural", multilingual: false } },
+  angelo: { provider: "azure", gender: "male", azureVoice: { name: "fil-PH-AngeloNeural", multilingual: false } },
+  ava: { provider: "azure", gender: "female", azureVoice: { name: "en-US-Ava:DragonHDLatestNeural", multilingual: true } },
+  andrew: { provider: "azure", gender: "male", azureVoice: { name: "en-US-Andrew:DragonHDLatestNeural", multilingual: true } },
+};
+
 async function synthesize(text, opts, forcedProvider) {
   const preferred = forcedProvider || defaultTtsProvider();
   const order = [preferred, "azure"].filter((p, i, a) => TTS_PROVIDERS[p] && a.indexOf(p) === i);
@@ -264,6 +278,62 @@ function mountPremium(app, deps) {
   } = deps;
 
   const audioCache = new AudioCache(500);
+  const { pool } = deps;
+
+  // Shared audio cache: once any user has heard a word or phrase in a voice, everyone reuses it,
+  // across restarts. Cache hits cost nothing (no provider call, nothing charged to the user).
+  const DB_CACHE_MAX_TEXT = 240;
+  const DB_CACHE_MAX_ROWS = parseInt(process.env.TTS_CACHE_MAX_ROWS) || 25000;
+  let dbCacheReady = false;
+  let dbInserts = 0;
+  if (pool) {
+    pool.query(`CREATE TABLE IF NOT EXISTS premium_tts_cache (
+        cache_key TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        audio BYTEA NOT NULL,
+        bytes INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_used TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`)
+      .then(() => pool.query("CREATE INDEX IF NOT EXISTS premium_tts_cache_last_used ON premium_tts_cache (last_used)"))
+      .then(() => { dbCacheReady = true; })
+      .catch((err) => console.error("[premium-tts] cache table:", err.message));
+  }
+
+  async function dbCacheGet(key) {
+    if (!dbCacheReady) return null;
+    try {
+      const r = await pool.query("SELECT provider, audio, last_used FROM premium_tts_cache WHERE cache_key = $1", [key]);
+      if (!r.rowCount) return null;
+      const row = r.rows[0];
+      if (Date.now() - new Date(row.last_used).getTime() > 86400000) {
+        pool.query("UPDATE premium_tts_cache SET last_used = NOW() WHERE cache_key = $1", [key]).catch(() => {});
+      }
+      return { provider: row.provider, audio: row.audio };
+    } catch (err) {
+      console.error("[premium-tts] cache read:", err.message);
+      return null;
+    }
+  }
+
+  async function dbCachePut(key, provider, audio) {
+    if (!dbCacheReady) return;
+    try {
+      await pool.query(
+        "INSERT INTO premium_tts_cache (cache_key, provider, audio, bytes) VALUES ($1, $2, $3, $4) ON CONFLICT (cache_key) DO NOTHING",
+        [key, provider, audio, audio.length]
+      );
+      if (++dbInserts % 200 === 0) {
+        await pool.query(
+          `DELETE FROM premium_tts_cache WHERE cache_key IN (
+             SELECT cache_key FROM premium_tts_cache ORDER BY last_used DESC OFFSET $1)`,
+          [DB_CACHE_MAX_ROWS]
+        );
+      }
+    } catch (err) {
+      console.error("[premium-tts] cache write:", err.message);
+    }
+  }
   const llmLimiter = makeUserLimiter(60_000, 30);
   const ttsLimiter = makeUserLimiter(60_000, 60);
   const sttLimiter = makeUserLimiter(60_000, 40);
@@ -378,6 +448,8 @@ function mountPremium(app, deps) {
         plan,
         premium: PREMIUM_PLANS.includes(plan),
         voiceProvider: defaultTtsProvider(),
+        voices: Object.keys(PREMIUM_VOICES),
+        elevenlabs: !!process.env.ELEVENLABS_API_KEY,
       });
     } catch (err) {
       res.status(500).json({ error: "premium_unavailable" });
@@ -388,26 +460,41 @@ function mountPremium(app, deps) {
   app.post("/premium/tts", ...guard, ttsLimiter, async (req, res) => {
     const text = clampStr(req.body.text, 600);
     if (!text) return res.status(400).json({ error: "Invalid text" });
-    const gender = req.body.gender === "male" ? "male" : "female";
     const style = ["tagalog", "taglish", "auto"].includes(req.body.style) ? req.body.style : "auto";
     const rate = Math.min(1.2, Math.max(0.6, Number(req.body.rate) || 1));
-    // Only admins can force a provider, for side-by-side voice evaluation.
-    const forced = req.premiumUser.plan_status === "active" && TTS_PROVIDERS[req.body.provider] ? req.body.provider : null;
+    const choice = PREMIUM_VOICES[req.body.voice] ? req.body.voice : null;
+    const picked = choice ? PREMIUM_VOICES[choice] : null;
+    const gender = picked ? picked.gender : (req.body.gender === "male" ? "male" : "female");
+    // Admins can still force a provider for side-by-side voice evaluation.
+    const adminForced = req.premiumUser.plan_status === "active" && TTS_PROVIDERS[req.body.provider] ? req.body.provider : null;
+    const forced = adminForced || (picked ? picked.provider : null);
+    const intended = forced || defaultTtsProvider();
 
-    const cacheKey = crypto.createHash("sha1").update([forced || "", gender, style, rate, text].join("|")).digest("hex");
-    const cached = audioCache.get(cacheKey);
-    if (cached) {
+    // The key names the voice actually wanted, so audio from a temporary fallback is never
+    // stored under it. ElevenLabs uses one voice for everyone, so gender doesn't split its cache.
+    const voiceKey = choice || (intended === "elevenlabs" ? "aisyah" : `${intended}:${gender}`);
+    const cacheKey = crypto.createHash("sha1").update(["v2", voiceKey, style, rate, text].join("|")).digest("hex");
+    const send = (audio, provider) => {
       res.set("Content-Type", "audio/mpeg");
-      res.set("X-Hari-Voice", cached.provider);
-      return res.send(cached.audio);
+      res.set("X-Hari-Voice", provider);
+      res.send(audio);
+    };
+    const memHit = audioCache.get(cacheKey);
+    if (memHit) return send(memHit.audio, memHit.provider);
+    const dbHit = text.length <= DB_CACHE_MAX_TEXT ? await dbCacheGet(cacheKey) : null;
+    if (dbHit) {
+      audioCache.set(cacheKey, dbHit);
+      return send(dbHit.audio, dbHit.provider);
     }
 
     try {
-      const preferred = forced || defaultTtsProvider();
-      const weighted = text.length * (TTS_WEIGHT[preferred] || 2);
+      const weighted = text.length * (TTS_WEIGHT[intended] || 2);
       if (!(await reserveChars(req, res, weighted))) return;
-      const { audio, provider } = await synthesize(text, { gender, style, rate }, forced);
-      audioCache.set(cacheKey, { audio, provider });
+      const { audio, provider } = await synthesize(text, { gender, style, rate, azureVoice: picked && picked.azureVoice }, forced);
+      if (provider === intended) {
+        audioCache.set(cacheKey, { audio, provider });
+        if (text.length <= DB_CACHE_MAX_TEXT) dbCachePut(cacheKey, provider, audio);
+      }
       await settleChars(req, weighted, 0, "tts");
       logTranslationUsage(req.userId, [text], [false], "tts", "fil", "fil", "tts");
       res.set("Content-Type", "audio/mpeg");
@@ -479,6 +566,7 @@ You are Zeron, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
 ${mode === "roleplay"
     ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic.`
     : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
+Talk the way people do out loud: usually one to three short sentences per reply, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
 Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
@@ -602,4 +690,4 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
   }));
 }
 
-module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS };
+module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES };
