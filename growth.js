@@ -25,6 +25,11 @@ async function recordSignupSource(pool, userId, token) {
 
 async function ensureGrowthColumns(pool) {
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64)");
+  // the website's tracking.js sends page_url with every page visit; without this column Supabase
+  // rejected those inserts, so no website visits were being recorded at all
+  await pool.query("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS page_url TEXT");
+  // let Supabase's REST API (which the website writes through) see the new column right away
+  await pool.query("NOTIFY pgrst, 'reload schema'");
 }
 
 function keyMatches(given) {
