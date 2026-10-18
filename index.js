@@ -80,6 +80,7 @@ const {
   pool,
 } = require("./db");
 const { mountGrowth, recordSignupSource, sourceFromToken } = require("./growth");
+const { mountPremium } = require("./premium");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
@@ -370,6 +371,12 @@ app.use(
 app.use(cookieParser());
 
 if (process.env.DATABASE_URL) mountGrowth(app, { pool, stripe });
+if (process.env.DATABASE_URL) {
+  mountPremium(app, {
+    requireAuth, stripe, getUserById, resetUserCharsIfNeeded, atomicCheckAndIncrementChars,
+    incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage,
+  });
+}
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) {
