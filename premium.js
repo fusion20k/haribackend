@@ -131,24 +131,81 @@ async function azureTts(text, { gender, style, rate }) {
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function elevenLabsTts(text, { gender, rate }) {
+// ElevenLabs: one voice for every Premium/PAYG user (Aisyah by default) on Eleven v4 Turbo.
+// The voice is found by name in the ElevenLabs account unless ELEVENLABS_VOICE_ID is set.
+// If the API rejects the main model, the fallback model is tried before Azure takes over.
+const ELEVEN_API = "https://api.elevenlabs.io";
+const eleven = { voiceId: null, lookupFailedAt: 0, modelLogged: false };
+
+async function resolveElevenVoice(key) {
+  if (process.env.ELEVENLABS_VOICE_ID) return process.env.ELEVENLABS_VOICE_ID.trim();
+  if (eleven.voiceId) return eleven.voiceId;
+  if (Date.now() - eleven.lookupFailedAt < 10 * 60 * 1000) throw new Error("elevenlabs_voice_not_found");
+  const wanted = (process.env.ELEVENLABS_VOICE_NAME || "Aisyah").trim().toLowerCase();
+  const headers = { "xi-api-key": key, Accept: "application/json" };
+  const pick = (voices) => (voices || []).find((v) => String(v.name || "").trim().toLowerCase().startsWith(wanted));
+  let match = null;
+  try {
+    const r = await fetch(`${ELEVEN_API}/v2/voices?search=${encodeURIComponent(wanted)}&page_size=20`, { headers });
+    if (r.ok) match = pick((await r.json()).voices);
+  } catch (_) { /* try the v1 list below */ }
+  if (!match) {
+    const r = await fetch(`${ELEVEN_API}/v1/voices`, { headers });
+    if (r.ok) match = pick((await r.json()).voices);
+  }
+  if (!match) {
+    eleven.lookupFailedAt = Date.now();
+    console.error(`[premium-tts] ElevenLabs voice "${wanted}" not found. Add it to My Voices in ElevenLabs, or set ELEVENLABS_VOICE_ID.`);
+    throw new Error("elevenlabs_voice_not_found");
+  }
+  eleven.voiceId = match.voice_id;
+  console.log(`[premium-tts] ElevenLabs voice: ${match.name} (${match.voice_id})`);
+  return eleven.voiceId;
+}
+
+async function elevenLabsTts(text, { style, rate }) {
   const key = process.env.ELEVENLABS_API_KEY;
   if (!key) throw new Error("elevenlabs_not_configured");
-  const voiceId = gender === "male"
-    ? (process.env.ELEVENLABS_VOICE_MALE || "pNInz6obpgDQGcFmaJgB")
-    : (process.env.ELEVENLABS_VOICE_FEMALE || "21m00Tcm4TlvDq8ikWAM");
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
-    method: "POST",
-    headers: { "xi-api-key": key, "Content-Type": "application/json", Accept: "audio/mpeg" },
-    body: JSON.stringify({
-      text,
-      model_id: process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2",
-      language_code: "fil",
-      voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.25, speed: Math.min(1.2, Math.max(0.7, rate)) },
-    }),
-  });
-  if (!response.ok) throw new Error(`elevenlabs_${response.status}: ${await response.text()}`);
-  return Buffer.from(await response.arrayBuffer());
+  const voiceId = await resolveElevenVoice(key);
+  const models = [process.env.ELEVENLABS_MODEL || "eleven_v4_turbo", process.env.ELEVENLABS_FALLBACK_MODEL || "eleven_flash_v2_5"]
+    .filter((m, i, a) => m && a.indexOf(m) === i);
+  let lastErr;
+  for (const model of models) {
+    // first try with every option; if the model rejects one, retry with the plain request
+    const attempts = [true, false];
+    for (const full of attempts) {
+      const body = {
+        text,
+        model_id: model,
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      };
+      if (full) {
+        if (style === "tagalog") body.language_code = "fil";
+        if (rate !== 1) body.voice_settings.speed = Math.min(1.2, Math.max(0.7, rate));
+      }
+      const response = await fetch(`${ELEVEN_API}/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+        method: "POST",
+        headers: { "xi-api-key": key, "Content-Type": "application/json", Accept: "audio/mpeg" },
+        body: JSON.stringify(body),
+      });
+      if (response.ok) {
+        if (!eleven.modelLogged || model !== models[0]) {
+          console.log(`[premium-tts] ElevenLabs model in use: ${model}`);
+          eleven.modelLogged = true;
+        }
+        return Buffer.from(await response.arrayBuffer());
+      }
+      const detail = await response.text();
+      lastErr = new Error(`elevenlabs_${response.status} (${model}): ${detail.slice(0, 300)}`);
+      // bad key, no credits, or rate limited: other models won't help, let Azure take this one
+      if ([401, 402, 403, 429].includes(response.status) || response.status >= 500) throw lastErr;
+      if (response.status === 404 && /voice/i.test(detail)) { eleven.voiceId = null; throw lastErr; }
+      const optionProblem = full && (body.language_code || body.voice_settings.speed) && [400, 422].includes(response.status);
+      if (!optionProblem) break; // model itself was rejected: move on to the fallback model
+    }
+    console.error(`[premium-tts] ${lastErr.message}`);
+  }
+  throw lastErr || new Error("elevenlabs_failed");
 }
 
 async function googleTts(text, { gender, rate }) {
@@ -172,11 +229,17 @@ async function googleTts(text, { gender, rate }) {
 }
 
 const TTS_PROVIDERS = { azure: azureTts, elevenlabs: elevenLabsTts, google: googleTts };
+
+/** PREMIUM_TTS_PROVIDER wins; otherwise ElevenLabs as soon as its key is set, else Azure. */
+function defaultTtsProvider() {
+  if (process.env.PREMIUM_TTS_PROVIDER) return process.env.PREMIUM_TTS_PROVIDER;
+  return process.env.ELEVENLABS_API_KEY ? "elevenlabs" : "azure";
+}
 // Relative cost weight charged against the user's character allowance.
 const TTS_WEIGHT = { azure: 2, google: 2, elevenlabs: 4 };
 
 async function synthesize(text, opts, forcedProvider) {
-  const preferred = forcedProvider || process.env.PREMIUM_TTS_PROVIDER || "azure";
+  const preferred = forcedProvider || defaultTtsProvider();
   const order = [preferred, "azure"].filter((p, i, a) => TTS_PROVIDERS[p] && a.indexOf(p) === i);
   let lastErr;
   for (const provider of order) {
@@ -314,7 +377,7 @@ function mountPremium(app, deps) {
       res.json({
         plan,
         premium: PREMIUM_PLANS.includes(plan),
-        voiceProvider: process.env.PREMIUM_TTS_PROVIDER || "azure",
+        voiceProvider: defaultTtsProvider(),
       });
     } catch (err) {
       res.status(500).json({ error: "premium_unavailable" });
@@ -340,7 +403,7 @@ function mountPremium(app, deps) {
     }
 
     try {
-      const preferred = forced || process.env.PREMIUM_TTS_PROVIDER || "azure";
+      const preferred = forced || defaultTtsProvider();
       const weighted = text.length * (TTS_WEIGHT[preferred] || 2);
       if (!(await reserveChars(req, res, weighted))) return;
       const { audio, provider } = await synthesize(text, { gender, style, rate }, forced);
