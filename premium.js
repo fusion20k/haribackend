@@ -316,8 +316,11 @@ function mountPremium(app, deps) {
 
   // Shared audio cache: once any user has heard a word or phrase in a voice, everyone reuses it,
   // across restarts. Cache hits cost nothing (no provider call, nothing charged to the user).
-  const DB_CACHE_MAX_TEXT = 240;
-  const DB_CACHE_MAX_ROWS = parseInt(process.env.TTS_CACHE_MAX_ROWS) || 25000;
+  // Only words and short phrases go to the database: they're what repeats across users. Long Zeron
+  // lines are unique per conversation and stay in the memory caches. A hard size cap keeps the
+  // table well inside Supabase's free 500 MB database.
+  const DB_CACHE_MAX_TEXT = parseInt(process.env.TTS_CACHE_MAX_TEXT) || 100;
+  const DB_CACHE_MAX_BYTES = (parseInt(process.env.TTS_CACHE_MAX_MB) || 150) * 1024 * 1024;
   let dbCacheReady = false;
   let dbInserts = 0;
   if (pool) {
@@ -350,6 +353,21 @@ function mountPremium(app, deps) {
     }
   }
 
+  // Drop the least recently used clips once the table passes the size cap (trims to 90% of it).
+  async function dbCacheTrim() {
+    const total = await pool.query("SELECT COALESCE(SUM(bytes), 0)::bigint AS total FROM premium_tts_cache");
+    const used = Number(total.rows[0].total);
+    if (used <= DB_CACHE_MAX_BYTES) return;
+    const r = await pool.query(
+      `DELETE FROM premium_tts_cache WHERE cache_key IN (
+         SELECT cache_key FROM (
+           SELECT cache_key, SUM(bytes) OVER (ORDER BY last_used DESC) AS running FROM premium_tts_cache
+         ) t WHERE running > $1)`,
+      [Math.floor(DB_CACHE_MAX_BYTES * 0.9)]
+    );
+    console.log(`[premium-tts] cache trimmed: ${(used / 1048576).toFixed(1)} MB over the cap, removed ${r.rowCount} old clips`);
+  }
+
   async function dbCachePut(key, provider, audio) {
     if (!dbCacheReady) return;
     try {
@@ -357,13 +375,7 @@ function mountPremium(app, deps) {
         "INSERT INTO premium_tts_cache (cache_key, provider, audio, bytes) VALUES ($1, $2, $3, $4) ON CONFLICT (cache_key) DO NOTHING",
         [key, provider, audio, audio.length]
       );
-      if (++dbInserts % 200 === 0) {
-        await pool.query(
-          `DELETE FROM premium_tts_cache WHERE cache_key IN (
-             SELECT cache_key FROM premium_tts_cache ORDER BY last_used DESC OFFSET $1)`,
-          [DB_CACHE_MAX_ROWS]
-        );
-      }
+      if (++dbInserts % 50 === 1) await dbCacheTrim();
     } catch (err) {
       console.error("[premium-tts] cache write:", err.message);
     }
