@@ -150,22 +150,55 @@ async function resolveElevenVoice(key) {
   const headers = { "xi-api-key": key, Accept: "application/json" };
   const pick = (voices) => (voices || []).find((v) => String(v.name || "").trim().toLowerCase().startsWith(wanted));
   let match = null;
+  let denied = null;
   try {
     const r = await fetch(`${ELEVEN_API}/v2/voices?search=${encodeURIComponent(wanted)}&page_size=20`, { headers });
     if (r.ok) match = pick((await r.json()).voices);
+    else if (r.status === 401 || r.status === 403) denied = `${r.status} ${(await r.text()).slice(0, 200)}`;
   } catch (_) { /* try the v1 list below */ }
   if (!match) {
     const r = await fetch(`${ELEVEN_API}/v1/voices`, { headers });
     if (r.ok) match = pick((await r.json()).voices);
+    else if (r.status === 401 || r.status === 403) denied = `${r.status} ${(await r.text()).slice(0, 200)}`;
   }
   if (!match) {
     eleven.lookupFailedAt = Date.now();
-    console.error(`[premium-tts] ElevenLabs voice "${wanted}" not found. Add it to My Voices in ElevenLabs, or set ELEVENLABS_VOICE_ID.`);
+    if (denied) {
+      console.error(`[premium-tts] ElevenLabs refused to list voices (${denied}). Either give the API key the "Voices: Read" permission in ElevenLabs, or set ELEVENLABS_VOICE_ID in Render to Aisyah's voice ID.`);
+    } else {
+      console.error(`[premium-tts] ElevenLabs voice "${wanted}" not found in this account's My Voices. Add it there, or set ELEVENLABS_VOICE_ID.`);
+    }
     throw new Error("elevenlabs_voice_not_found");
   }
   eleven.voiceId = match.voice_id;
   console.log(`[premium-tts] ElevenLabs voice: ${match.name} (${match.voice_id})`);
   return eleven.voiceId;
+}
+
+function elevenHint(status, detail) {
+  const d = String(detail || '').toLowerCase();
+  if (d.includes('quota') || d.includes('credits') || status === 402) return ' -> out of ElevenLabs characters/balance: top up or wait for the monthly reset.';
+  if (d.includes('permission') || d.includes('missing_permissions')) return ' -> the API key is missing the "Text to Speech" permission. Edit the key in ElevenLabs.';
+  if (d.includes('invalid_api_key') || d.includes('invalid api key') || status === 401) return ' -> ELEVENLABS_API_KEY is wrong or was deleted. Paste a fresh key into Render.';
+  if (d.includes('voice') && (d.includes('not found') || status === 404)) return ' -> voice not available to this key. Add Aisyah to My Voices or fix ELEVENLABS_VOICE_ID.';
+  if (d.includes('paid') || d.includes('subscription') || d.includes('library')) return ' -> this voice needs a paid ElevenLabs plan (Starter or higher).';
+  if (status === 400 || status === 422) return ' -> model or setting rejected, trying the fallback model.';
+  return '';
+}
+
+/** Runs once at startup so the Render log says plainly which voice Premium users will hear. */
+async function elevenStartupCheck() {
+  const provider = defaultTtsProvider();
+  if (provider !== 'elevenlabs') {
+    console.log(`[premium-tts] Premium voice: ${provider}${process.env.ELEVENLABS_API_KEY ? '' : ' (ELEVENLABS_API_KEY is not set in Render, so Aisyah is off)'}`);
+    return;
+  }
+  try {
+    const audio = await elevenLabsTts('Kumusta.', { style: 'auto', rate: 1 });
+    console.log(`[premium-tts] Premium voice check OK: ElevenLabs is working (${audio.length} bytes test clip).`);
+  } catch (err) {
+    console.error(`[premium-tts] Premium voice check FAILED, users will hear Azure until this is fixed: ${err.message}`);
+  }
 }
 
 async function elevenLabsTts(text, { style, rate }) {
@@ -201,7 +234,7 @@ async function elevenLabsTts(text, { style, rate }) {
         return Buffer.from(await response.arrayBuffer());
       }
       const detail = await response.text();
-      lastErr = new Error(`elevenlabs_${response.status} (${model}): ${detail.slice(0, 300)}`);
+      lastErr = new Error(`elevenlabs_${response.status} (${model}): ${detail.slice(0, 300)}${elevenHint(response.status, detail)}`);
       // bad key, no credits, or rate limited: other models won't help, let Azure take this one
       if ([401, 402, 403, 429].includes(response.status) || response.status >= 500) throw lastErr;
       if (response.status === 404 && /voice/i.test(detail)) { eleven.voiceId = null; throw lastErr; }
@@ -279,6 +312,7 @@ function mountPremium(app, deps) {
 
   const audioCache = new AudioCache(500);
   const { pool } = deps;
+  setTimeout(() => { elevenStartupCheck().catch(() => {}); }, 3000);
 
   // Shared audio cache: once any user has heard a word or phrase in a voice, everyone reuses it,
   // across restarts. Cache hits cost nothing (no provider call, nothing charged to the user).
