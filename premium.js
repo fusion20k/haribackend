@@ -75,6 +75,27 @@ async function llmJson(system, user, { maxTokens = 900, temperature = 0.6, histo
   return { data: JSON.parse(content), outChars: content.length };
 }
 
+function normWords(t) {
+  return String(t || "").toLowerCase().replace(/[^\p{L}\p{N}\s'-]/gu, " ").split(/\s+/).filter(Boolean);
+}
+
+/** Drops corrections that don't quote the learner's latest message (the model sometimes repeats old ones). */
+function correctionsFor(latest, list) {
+  if (!Array.isArray(list)) return [];
+  const said = new Set(normWords(latest));
+  return list
+    .filter((c) => c && c.original && c.corrected)
+    .filter((c) => {
+      const words = normWords(c.original);
+      if (!words.length) return false;
+      const hits = words.filter((w) => said.has(w)).length;
+      return hits / words.length >= 0.6;
+    })
+    .filter((c) => normWords(c.original).join(" ") !== normWords(c.corrected).join(" "))
+    .slice(0, 5)
+    .map((c) => ({ original: String(c.original), corrected: String(c.corrected), explanation: String(c.explanation || "") }));
+}
+
 const TAGALOG_EXPERT =
   "You are an expert Filipino (Tagalog) teacher who grew up in Metro Manila. You know how people really talk today, " +
   "including natural Taglish code-switching, po/opo politeness, and regional nuance. Be accurate: never invent words. " +
@@ -178,7 +199,7 @@ async function resolveElevenVoice(key) {
 function elevenHint(status, detail) {
   const d = String(detail || '').toLowerCase();
   if (d.includes('quota') || d.includes('credits') || status === 402) return ' -> out of ElevenLabs characters/balance: top up or wait for the monthly reset.';
-  if (d.includes('permission') || d.includes('missing_permissions')) return ' -> the API key is missing the "Text to Speech" permission. Edit the key in ElevenLabs.';
+  if (d.includes('permission') || d.includes('missing_permissions')) return ' -> the API key is missing a permission. In ElevenLabs, edit the key and allow Text to Speech, Speech to Text and Voices (read).';
   if (d.includes('invalid_api_key') || d.includes('invalid api key') || status === 401) return ' -> ELEVENLABS_API_KEY is wrong or was deleted. Paste a fresh key into Render.';
   if (d.includes('voice') && (d.includes('not found') || status === 404)) return ' -> voice not available to this key. Add Aisyah to My Voices or fix ELEVENLABS_VOICE_ID.';
   if (d.includes('paid') || d.includes('subscription') || d.includes('library')) return ' -> this voice needs a paid ElevenLabs plan (Starter or higher).';
@@ -555,15 +576,46 @@ function mountPremium(app, deps) {
   // --- Speech to text for Zeron (the extension records 16 kHz mono WAV from the chosen mic) ---
   const wavBody = express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "2.5mb" });
   app.post("/premium/stt", requireAuth, wavBody, requirePremium, sttLimiter, async (req, res) => {
-    if (!process.env.AZURE_SPEECH_KEY) return res.status(503).json({ error: "stt_not_configured" });
+    if (!process.env.AZURE_SPEECH_KEY && !process.env.ELEVENLABS_API_KEY) return res.status(503).json({ error: "stt_not_configured" });
     const audio = req.body;
     if (!Buffer.isBuffer(audio) || audio.length < 1000) return res.status(400).json({ error: "no_audio" });
     const seconds = Math.max(0, (audio.length - 44) / 32000); // 16 kHz * 16-bit mono
     if (seconds > 60) return res.status(413).json({ error: "audio_too_long" });
-    const language = req.query.lang === "en-US" ? "en-US" : "fil-PH";
+    const lang = ["en-US", "auto"].includes(req.query.lang) ? req.query.lang : "fil-PH";
+    const language = lang === "en-US" ? "en-US" : "fil-PH"; // Azure needs a fixed language
     const reserved = Math.ceil(seconds * 15); // roughly what that much speech costs as text
     try {
       if (!(await reserveChars(req, res, reserved))) return;
+
+      // ElevenLabs Scribe v2 understands Tagalog and Taglish far better than Azure's fil-PH model,
+      // and the Creator plan includes 100 hours a month. Azure stays as the backup.
+      if (process.env.ELEVENLABS_API_KEY) {
+        try {
+          const form = new FormData();
+          form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
+          if (lang !== "auto") form.append("language_code", lang === "en-US" ? "en" : "fil");
+          form.append("tag_audio_events", "false");
+          form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
+          const r = await fetch(`${ELEVEN_API}/v1/speech-to-text`, {
+            method: "POST",
+            headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
+            body: form,
+          });
+          if (!r.ok) {
+            const detail = await r.text();
+            throw new Error(`scribe_${r.status}: ${detail.slice(0, 300)}${elevenHint(r.status, detail)}`);
+          }
+          const data = await r.json();
+          const text = String(data.text || "").replace(/\s+/g, " ").trim();
+          await settleChars(req, reserved, text.length, "stt");
+          logTranslationUsage(req.userId, ["stt"], [false], "stt", lang, lang, "stt");
+          return res.json({ text, status: "Success", engine: "elevenlabs" });
+        } catch (err) {
+          console.error("[premium-stt] ElevenLabs Scribe failed, using Azure:", err.message);
+          if (!process.env.AZURE_SPEECH_KEY) throw err;
+        }
+      }
+
       const region = process.env.AZURE_SPEECH_REGION || "eastus";
       const response = await fetch(
         `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${language}&format=simple&profanity=raw`,
@@ -616,13 +668,15 @@ Talk the way people do out loud: usually one to three short sentences per reply,
 Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
-If the learner's last message has Tagalog mistakes or sounds unnatural, include corrections. Never correct English the learner uses on purpose to ask a question.
+Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
+If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a Filipino would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
 
 Return JSON:
 {
   "reply": string (your next line, in Tagalog/Taglish appropriate to their level),
   "replyEnglish": string (English translation of reply),
-  "corrections": [{ "original": string, "corrected": string, "explanation": string (short, English) }],
+  "corrections": [{ "original": string (exact words from the latest message), "corrected": string, "explanation": string (short, English) }],
+  "tagalogVersion": { "tagalog": string, "note": string (short English note on a key word or pattern, or "") } (or { "tagalog": "", "note": "" } if the message was Tagalog),
   "tip": string (optional one-sentence grammar or culture tip in English, or ""),
   "suggestedReplies": [string] (2-3 short Tagalog things the learner could say next)
 }`;
@@ -632,7 +686,10 @@ Return JSON:
       clean: (d) => ({
         reply: String(d.reply || ""),
         replyEnglish: String(d.replyEnglish || ""),
-        corrections: Array.isArray(d.corrections) ? d.corrections.slice(0, 5) : [],
+        corrections: correctionsFor(history[history.length - 1].content, d.corrections),
+        tagalogVersion: d.tagalogVersion && d.tagalogVersion.tagalog
+          ? { tagalog: String(d.tagalogVersion.tagalog), note: String(d.tagalogVersion.note || "") }
+          : null,
         tip: String(d.tip || ""),
         suggestedReplies: Array.isArray(d.suggestedReplies) ? d.suggestedReplies.slice(0, 3).map(String) : [],
       }),
@@ -719,7 +776,7 @@ Return JSON:
 
   // --- 5. Video subtitles: translate caption lines in a batch -------------------------------
   app.post("/premium/subtitles", ...guard, llmLimiter, llmRoute("subtitles", (req) => {
-    const lines = clampList(req.body.lines, 12, (l) => {
+    const lines = clampList(req.body.lines, 24, (l) => {
       const text = clampStr(l?.text, 300);
       return text ? { id: clampStr(String(l.id ?? ""), 40), text } : null;
     });
@@ -730,7 +787,7 @@ You are subtitling a video for a ${level} Tagalog learner. For each caption line
 Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string (short English note on slang/idiom/grammar worth knowing, or "") }] }`;
     const user = JSON.stringify(lines);
     return {
-      system, user, maxTokens: 1600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
+      system, user, maxTokens: 3600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
       clean: (d) => ({ lines: Array.isArray(d.lines) ? d.lines : [] }),
     };
   }));
