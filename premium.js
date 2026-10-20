@@ -504,6 +504,21 @@ function htmlToText(html) {
     .trim();
 }
 
+// Tagalog vs the other big Philippine languages, by their most common little words.
+const TL_MARKERS = new Set(["ang", "ng", "mga", "na", "at", "ay", "hindi", "ito", "siya", "nang", "naman", "rin", "din", "kung", "para", "po", "lang", "ni", "kay", "niya"]);
+const OTHER_MARKERS = new Set(["ug", "nga", "og", "dili", "kini", "kana", "niini", "usab", "mao", "karon", "atong", "didto", "gikan", "ti", "dagiti", "ken", "iti", "isu", "idi", "ngem", "ket", "daytoy"]);
+function isTagalogText(text) {
+  const words = String(text || "").toLowerCase().match(/\p{L}+/gu) || [];
+  if (words.length < 15) return false;
+  let tl = 0;
+  let other = 0;
+  for (const w of words) {
+    if (TL_MARKERS.has(w)) tl++;
+    if (OTHER_MARKERS.has(w)) other++;
+  }
+  return tl / words.length >= 0.08 && tl > other * 3;
+}
+
 function parseFeed(xml, source) {
   const items = String(xml || "").match(/<item[\s>][\s\S]*?<\/item>/gi) || [];
   return items.map((item) => {
@@ -512,7 +527,7 @@ function parseFeed(xml, source) {
     const body = htmlToText(feedField(item, "content:encoded") || feedField(item, "description"));
     const date = Date.parse(feedField(item, "pubDate")) || 0;
     return { title, link, source, date, text: body.slice(0, 3000) };
-  }).filter((a) => a.title && /^https:\/\//.test(a.link) && a.text.length > 200);
+  }).filter((a) => a.title && /^https:\/\//.test(a.link) && a.text.length > 200 && isTagalogText(a.text));
 }
 
 function mountPremium(app, deps) {
@@ -1070,7 +1085,7 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
     next();
   }, llmRoute("shadowguide", (req) => {
     const text = clampStr(req.body.text, 300).replace(/\s+/g, " ");
-    const words = targetWords(text);
+    const words = targetWords(text).slice(0, 30);
     if (!words.length) throw new Error("text is required");
     const system = `${TAGALOG_EXPERT}
 The learner will repeat this line out loud. Describe how each word is pronounced in standard Manila Tagalog.
@@ -1089,7 +1104,7 @@ Return JSON:
 Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use the stress that fits this sentence.`;
     const user = JSON.stringify({ line: text, words });
     return {
-      system, user, maxTokens: 900, temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
+      system, user, maxTokens: Math.min(2600, 400 + words.length * 90), temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
       clean: (d) => {
         const out = {
           meaning: clampStr(d.meaning, 400),
@@ -1132,6 +1147,52 @@ Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use t
     }
   });
 
+  // --- 9. Look up a Tagalog word as used in a sentence (Reading Level Meter articles and
+  // learning mode on pages that are already in Tagalog). The /dictionary route needs the English
+  // word Hari swapped in, which a native Tagalog page doesn't have.
+  const lookupCache = new AudioCache(3000);
+  const lookupKey = (req) => `${clampStr(req.body.word, 60).toLowerCase()}|${clampStr(req.body.context, 160).toLowerCase()}`;
+  app.post("/premium/lookup", ...guard, llmLimiter, (req, res, next) => {
+    const hit = lookupCache.get(lookupKey(req));
+    if (hit) return res.json(hit);
+    next();
+  }, llmRoute("lookup", (req) => {
+    const word = clampStr(req.body.word, 60);
+    const context = clampStr(req.body.context, 400);
+    if (!plainWord(word)) throw new Error("word is required");
+    const key = lookupKey(req);
+    const system = `${TAGALOG_EXPERT}
+Explain a Tagalog word for a learner, as it is used in the given sentence (if any).
+Return JSON:
+{
+  "englishTranslation": string (its meaning here, short),
+  "partOfSpeech": string (noun, verb, adjective, particle...),
+  "pronunciation": string (syllables with the stressed one in capitals, e.g. "bu-KAS"),
+  "root": string (the root word if this form is inflected, e.g. "kain" for "kumain", else ""),
+  "example": { "tl": string (a short, everyday example sentence), "en": string },
+  "culturalNotes": string (one short usage or grammar note in English, or ""),
+  "wordBreakdown": [{ "tagalog": string, "pos": string, "english": string }] (affix and root parts if inflected, else [])
+}`;
+    const user = JSON.stringify({ word, sentence: context });
+    return {
+      system, user, maxTokens: 500, temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
+      clean: (d) => {
+        const out = {
+          word,
+          englishTranslation: clampStr(d.englishTranslation, 200),
+          partOfSpeech: clampStr(d.partOfSpeech, 40),
+          pronunciation: clampStr(d.pronunciation, 80),
+          root: clampStr(d.root, 60),
+          example: d.example && typeof d.example === "object" ? { tl: clampStr(d.example.tl, 200), en: clampStr(d.example.en, 200) } : null,
+          culturalNotes: clampStr(d.culturalNotes, 300),
+          wordBreakdown: clampList(d.wordBreakdown, 4, (b) => (b && b.tagalog ? { tagalog: clampStr(b.tagalog, 40), pos: clampStr(b.pos, 30), english: clampStr(b.english, 80) } : null)),
+        };
+        lookupCache.set(key, out);
+        return out;
+      },
+    };
+  }));
+
 }
 
-module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed };
+module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
