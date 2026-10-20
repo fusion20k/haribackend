@@ -507,10 +507,20 @@ function scoreFromAzure(targetText, data) {
 // ---------------------------------------------------------------------------
 // Reading Level Meter: real Tagalog articles from news sites with full-text feeds
 // ---------------------------------------------------------------------------
+// Topic feeds come first so a story shared with a general news feed keeps its topic.
 const TAGALOG_FEEDS = [
-  { source: "Bombo Radyo", url: "https://www.bomboradyo.com/feed/" },
-  { source: "RMN", url: "https://www.rmn.ph/feed/" },
+  { source: "Pinoy Collection", topic: "stories", url: "https://pinoycollection.com/category/maikling-kwento/feed/" },
+  { source: "Pinoy Collection", topic: "stories", url: "https://pinoycollection.com/category/maikling-kwento/feed/?paged=2" },
+  { source: "Pinoy Collection", topic: "stories", url: "https://pinoycollection.com/category/maikling-kwento/feed/?paged=3" },
+  { source: "Pinoy Collection", topic: "stories", url: "https://pinoycollection.com/feed/" },
+  { source: "Bombo Radyo", topic: "showbiz", url: "https://www.bomboradyo.com/category/entertainment/feed/" },
+  { source: "Bombo Radyo", topic: "sports", url: "https://www.bomboradyo.com/category/sports/feed/" },
+  { source: "Bombo Radyo", topic: "news", url: "https://www.bomboradyo.com/feed/" },
+  { source: "RMN", topic: "news", url: "https://www.rmn.ph/feed/" },
 ];
+const ARTICLES_PER_TOPIC = { stories: 20, showbiz: 12, sports: 12, news: 12 };
+// school study guides (chapter summaries, "elements of a short story") aren't fun reading
+const STUDY_GUIDE = /\b(buod|kabanata|mga elemento|kahulugan|halimbawa|uri at|aralin)\b|\(\d+ (kwento|tula)\)/i;
 
 function decodeEntities(s) {
   return String(s || "")
@@ -1184,13 +1194,23 @@ Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use t
         const lists = await Promise.all(TAGALOG_FEEDS.map(async (f) => {
           try {
             const r = await fetch(f.url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; HariReader/1.0)" }, signal: AbortSignal.timeout(10000) });
-            return r.ok ? parseFeed(await r.text(), f.source) : [];
+            return r.ok ? parseFeed(await r.text(), f.source).map((a) => ({ ...a, topic: f.topic })) : [];
           } catch (err) {
             console.warn("[premium-reading] feed failed:", f.source, err.message);
             return [];
           }
         }));
-        const items = lists.flat().sort((a, b) => b.date - a.date).slice(0, 30);
+        const seen = new Set();
+        const perTopic = {};
+        const items = [];
+        for (const a of lists.flat()) {
+          const key = a.link.split("?")[0];
+          if (seen.has(key)) continue;
+          seen.add(key);
+          if (a.topic === "stories" && STUDY_GUIDE.test(a.title)) continue;
+          (perTopic[a.topic] = perTopic[a.topic] || []).push(a);
+        }
+        for (const list of Object.values(perTopic)) items.push(...list.sort((a, b) => b.date - a.date).slice(0, ARTICLES_PER_TOPIC[list[0].topic] || 12));
         if (items.length) articleCache = { at: Date.now(), items };
       }
       res.json({ articles: articleCache.items });
