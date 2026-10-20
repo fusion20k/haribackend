@@ -1,5 +1,5 @@
 // Premium + PAYG features: better voice, Danao (AI tutor), practice exercises with
-// "Explain My Mistake", "Say It Like a Filipino" and video subtitle translation.
+// "Explain My Mistake", "Say It Like a Native" and video subtitle translation.
 // Every route here is limited to plan_status pre / payg / active; free users get 403 premium_required.
 const crypto = require("crypto");
 const express = require("express");
@@ -753,7 +753,7 @@ Return JSON:
     };
   }));
 
-  // --- 6. Say It Like a Filipino ---------------------------------------------------------
+  // --- 6. Say It Like a Native ---------------------------------------------------------
   app.post("/premium/say-it", ...guard, llmLimiter, llmRoute("sayit", (req) => {
     const text = clampStr(req.body.text, 500);
     const context = clampStr(req.body.context, 200);
