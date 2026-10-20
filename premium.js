@@ -1,5 +1,6 @@
 // Premium + PAYG features: better voice, Danao (AI tutor), practice exercises with
-// "Explain My Mistake", "Say It Like a Native" and video subtitle translation.
+// "Explain My Mistake", "Say It Like a Native", video subtitle translation, the Shadowing Coach
+// and the Reading Level Meter's article feed.
 // Every route here is limited to plan_status pre / payg / active; free users get 403 premium_required.
 const crypto = require("crypto");
 const express = require("express");
@@ -328,6 +329,191 @@ async function synthesize(text, opts, forcedProvider) {
 // ---------------------------------------------------------------------------
 // Mount
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Shadowing Coach: compare what the learner said with the line they were copying
+// ---------------------------------------------------------------------------
+
+/** Lowercase, accents and punctuation removed, so "Kumusta?" and "kumustá" compare equal. */
+function plainWord(w) {
+  return String(w || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+function wordSimilarity(a, b) {
+  const x = plainWord(a);
+  const y = plainWord(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  return Math.max(0, 1 - levenshtein(x, y) / Math.max(x.length, y.length));
+}
+
+/** Target words that carry sound (punctuation-only tokens dropped), keeping the learner's spelling for display. */
+function targetWords(text) {
+  return String(text || "").split(/\s+/).map((w) => w.trim()).filter((w) => plainWord(w));
+}
+
+/**
+ * Order-preserving alignment of target words to heard words that maximises total similarity.
+ * Returns, for each target word, the index of the heard word it matched (or -1).
+ */
+function alignWords(target, heard) {
+  const n = target.length;
+  const m = heard.length;
+  const sim = target.map((t) => heard.map((h) => wordSimilarity(t, h)));
+  const best = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      const pair = sim[i][j] >= 0.4 ? sim[i][j] + best[i + 1][j + 1] : -1;
+      best[i][j] = Math.max(best[i + 1][j], best[i][j + 1], pair);
+    }
+  }
+  const out = new Array(n).fill(-1);
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (sim[i][j] >= 0.4 && best[i][j] === sim[i][j] + best[i + 1][j + 1]) { out[i] = j; i++; j++; }
+    else if (best[i][j] === best[i + 1][j]) i++;
+    else j++;
+  }
+  return out;
+}
+
+function wordStatus(score) {
+  return score >= 85 ? "good" : score >= 55 ? "close" : "missed";
+}
+
+const clamp100 = (v) => Math.max(0, Math.min(100, Math.round(v)));
+
+/**
+ * Score from a transcript (ElevenLabs Scribe with word timings, or plain text).
+ * heardWords: [{ text, start, end }] or null; heardText: the full transcript.
+ */
+function scoreFromTranscript(targetText, heardWords, heardText) {
+  const target = targetWords(targetText);
+  const heard = heardWords && heardWords.length
+    ? heardWords.filter((w) => plainWord(w.text))
+    : targetWords(heardText).map((t) => ({ text: t }));
+  const match = alignWords(target, heard.map((h) => h.text));
+  const words = target.map((word, i) => {
+    const h = match[i] >= 0 ? heard[match[i]] : null;
+    const score = h ? clamp100(wordSimilarity(word, h.text) * 100) : 0;
+    return { word, heard: h ? h.text : "", score, status: wordStatus(score) };
+  });
+  const accuracy = words.length ? clamp100(words.reduce((a, w) => a + w.score, 0) / words.length) : 0;
+  const completeness = words.length ? clamp100((100 * words.filter((w) => w.score >= 55).length) / words.length) : 0;
+
+  // pace and hesitation from word timings, when the recogniser gives them
+  let fluency = null;
+  let pace = null;
+  const timed = heard.filter((w) => typeof w.start === "number" && typeof w.end === "number");
+  if (timed.length >= 2) {
+    const dur = Math.max(0.3, timed[timed.length - 1].end - timed[0].start);
+    const syllables = timed.reduce((a, w) => a + Math.max(1, (plainWord(w.text).match(/[aeiou]+/g) || []).length), 0);
+    pace = Math.round((syllables / dur) * 10) / 10;
+    let gaps = 0;
+    for (let k = 1; k < timed.length; k++) if (timed[k].start - timed[k - 1].end > 0.6) gaps++;
+    fluency = clamp100(100 - gaps * 12 - (pace < 2.8 ? (2.8 - pace) * 18 : 0) - (pace > 8 ? 10 : 0));
+    fluency = Math.max(30, fluency);
+  }
+  const overall = clamp100(accuracy * 0.6 + completeness * 0.25 + (fluency == null ? accuracy : fluency) * 0.15);
+  return { overall, accuracy, completeness, fluency, prosody: null, pace, words, heard: String(heardText || "").trim() };
+}
+
+/** Azure pronunciation assessment result (format=detailed) to the same shape. Null if it holds no scores. */
+function scoreFromAzure(targetText, data) {
+  const nb = data && Array.isArray(data.NBest) ? data.NBest[0] : null;
+  if (!nb) return null;
+  const pa = nb.PronunciationAssessment || nb;
+  if (typeof pa.AccuracyScore !== "number" || typeof pa.PronScore !== "number") return null;
+  const target = targetWords(targetText);
+  const az = (nb.Words || [])
+    .map((w) => ({ text: w.Word, a: w.PronunciationAssessment || w }))
+    .filter((w) => w.a.ErrorType !== "Insertion");
+  const match = alignWords(target, az.map((w) => w.text));
+  const words = target.map((word, i) => {
+    const w = match[i] >= 0 ? az[match[i]] : null;
+    const omitted = !w || w.a.ErrorType === "Omission";
+    const score = omitted ? 0 : clamp100(w.a.AccuracyScore);
+    const status = omitted ? "missed" : score >= 80 ? "good" : score >= 60 ? "close" : "missed";
+    return { word, heard: omitted ? "" : w.text, score, status };
+  });
+  return {
+    overall: clamp100(pa.PronScore),
+    accuracy: clamp100(pa.AccuracyScore),
+    completeness: clamp100(pa.CompletenessScore ?? 100),
+    fluency: typeof pa.FluencyScore === "number" ? clamp100(pa.FluencyScore) : null,
+    prosody: typeof pa.ProsodyScore === "number" ? clamp100(pa.ProsodyScore) : null,
+    pace: null,
+    words,
+    heard: String(nb.Display || data.DisplayText || "").trim(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reading Level Meter: real Tagalog articles from news sites with full-text feeds
+// ---------------------------------------------------------------------------
+const TAGALOG_FEEDS = [
+  { source: "Bombo Radyo", url: "https://www.bomboradyo.com/feed/" },
+  { source: "RMN", url: "https://www.rmn.ph/feed/" },
+];
+
+function decodeEntities(s) {
+  return String(s || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&nbsp;/g, " ").replace(/&hellip;/g, "...").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+function feedField(item, tag) {
+  const m = item.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  if (!m) return "";
+  return m[1].replace(/^\s*<!\[CDATA\[/, "").replace(/\]\]>\s*$/, "");
+}
+
+function htmlToText(html) {
+  return decodeEntities(
+    String(html || "")
+      .replace(/<(script|style|figure|figcaption)[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<\/(p|div|h\d|li|br)>|<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .normalize("NFKC") // some headlines use styled Unicode letters (bold/italic); make them plain
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, "") // invisible direction marks
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .trim();
+}
+
+function parseFeed(xml, source) {
+  const items = String(xml || "").match(/<item[\s>][\s\S]*?<\/item>/gi) || [];
+  return items.map((item) => {
+    const title = htmlToText(feedField(item, "title"));
+    const link = decodeEntities(feedField(item, "link")).trim();
+    const body = htmlToText(feedField(item, "content:encoded") || feedField(item, "description"));
+    const date = Date.parse(feedField(item, "pubDate")) || 0;
+    return { title, link, source, date, text: body.slice(0, 3000) };
+  }).filter((a) => a.title && /^https:\/\//.test(a.link) && a.text.length > 200);
+}
 
 function mountPremium(app, deps) {
   const {
@@ -795,6 +981,157 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
       clean: (d) => ({ lines: Array.isArray(d.lines) ? d.lines : [] }),
     };
   }));
+  // --- 7. Shadowing Coach -------------------------------------------------------------------
+  // Score: Azure pronunciation assessment when it grades the language, otherwise a word-by-word
+  // comparison of what ElevenLabs Scribe heard (with timings for pace) against the target line.
+  app.post("/premium/shadow/score", requireAuth, wavBody, requirePremium, sttLimiter, async (req, res) => {
+    const target = clampStr(req.query.text, 300);
+    if (!targetWords(target).length) return res.status(400).json({ error: "text_required" });
+    if (!process.env.AZURE_SPEECH_KEY && !process.env.ELEVENLABS_API_KEY) return res.status(503).json({ error: "stt_not_configured" });
+    const audio = req.body;
+    if (!Buffer.isBuffer(audio) || audio.length < 1000) return res.status(400).json({ error: "no_audio" });
+    const seconds = Math.max(0, (audio.length - 44) / 32000);
+    if (seconds > 30) return res.status(413).json({ error: "audio_too_long" });
+    const reserved = Math.ceil(seconds * 15);
+    try {
+      if (!(await reserveChars(req, res, reserved))) return;
+      let result = null;
+      const region = process.env.AZURE_SPEECH_REGION || "eastus";
+
+      if (process.env.AZURE_SPEECH_KEY && process.env.PREMIUM_PRON_ASSESS !== "off") {
+        try {
+          const config = { ReferenceText: target, GradingSystem: "HundredMark", Granularity: "Word", Dimension: "Comprehensive", EnableMiscue: true, EnableProsodyAssessment: true };
+          const r = await fetch(
+            `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=fil-PH&format=detailed`,
+            {
+              method: "POST",
+              headers: {
+                "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
+                "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+                "Pronunciation-Assessment": Buffer.from(JSON.stringify(config)).toString("base64"),
+                Accept: "application/json",
+              },
+              body: audio,
+            }
+          );
+          if (r.ok) result = scoreFromAzure(target, await r.json());
+          else console.warn("[premium-shadow] Azure assessment", r.status, (await r.text()).slice(0, 200));
+          if (result) result.engine = "azure";
+        } catch (err) {
+          console.warn("[premium-shadow] Azure assessment failed:", err.message);
+        }
+      }
+
+      if (!result && process.env.ELEVENLABS_API_KEY) {
+        try {
+          const form = new FormData();
+          form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
+          form.append("language_code", "fil");
+          form.append("tag_audio_events", "false");
+          form.append("timestamps_granularity", "word");
+          form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
+          const r = await fetch(`${ELEVEN_API}/v1/speech-to-text`, { method: "POST", headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }, body: form });
+          if (!r.ok) throw new Error(`scribe_${r.status}: ${(await r.text()).slice(0, 200)}`);
+          const data = await r.json();
+          const words = Array.isArray(data.words) ? data.words.filter((w) => !w.type || w.type === "word") : null;
+          result = scoreFromTranscript(target, words, data.text);
+          result.engine = "elevenlabs";
+        } catch (err) {
+          console.error("[premium-shadow] Scribe failed:", err.message);
+        }
+      }
+
+      if (!result && process.env.AZURE_SPEECH_KEY) {
+        const r = await fetch(
+          `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=fil-PH&format=simple&profanity=raw`,
+          { method: "POST", headers: { "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY, "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000", Accept: "application/json" }, body: audio }
+        );
+        if (!r.ok) throw new Error(`azure_stt_${r.status}`);
+        const data = await r.json();
+        result = scoreFromTranscript(target, null, data.RecognitionStatus === "Success" ? data.DisplayText : "");
+        result.engine = "azure-text";
+      }
+      if (!result) throw new Error("no_engine");
+      await settleChars(req, reserved, 0, "shadow");
+      logTranslationUsage(req.userId, ["shadow"], [false], "shadow", "fil", "fil", "stt");
+      res.json(result);
+    } catch (err) {
+      console.error("[premium-shadow] error:", err.message);
+      res.status(502).json({ error: "shadow_unavailable" });
+    }
+  });
+
+  // Stress and syllable guide for a line (one LLM call per distinct line, then cached).
+  const shadowGuideCache = new AudioCache(500);
+  const guideKey = (text) => plainWord(text) ? text.toLowerCase().replace(/\s+/g, " ").trim() : "";
+  app.post("/premium/shadow/guide", ...guard, llmLimiter, (req, res, next) => {
+    const hit = shadowGuideCache.get(guideKey(clampStr(req.body.text, 300)));
+    if (hit) return res.json(hit);
+    next();
+  }, llmRoute("shadowguide", (req) => {
+    const text = clampStr(req.body.text, 300).replace(/\s+/g, " ");
+    const words = targetWords(text);
+    if (!words.length) throw new Error("text is required");
+    const system = `${TAGALOG_EXPERT}
+The learner will repeat this line out loud. Describe how each word is pronounced in standard Manila Tagalog.
+Return JSON:
+{
+  "meaning": string (natural English translation),
+  "words": [{
+    "word": string (exactly as given, same order),
+    "syllables": [string] (Tagalog syllables of the word as spelled, e.g. ["ka","i","bi","gan"]),
+    "stress": number (0-based index of the stressed syllable),
+    "glottal": boolean (true if the word ends in a glottal stop, e.g. "bata" child, "hindi"),
+    "note": string (short English tip if this word is commonly mispronounced by English speakers, or "")
+  }],
+  "tip": string (one short English sentence on the hardest part of saying this line naturally)
+}
+Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use the stress that fits this sentence.`;
+    const user = JSON.stringify({ line: text, words });
+    return {
+      system, user, maxTokens: 900, temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
+      clean: (d) => {
+        const out = {
+          meaning: clampStr(d.meaning, 400),
+          tip: clampStr(d.tip, 300),
+          words: words.map((w, i) => {
+            const g = Array.isArray(d.words) ? (d.words.find((x) => x && plainWord(x.word) === plainWord(w)) || d.words[i]) : null;
+            const syllables = g && Array.isArray(g.syllables) ? g.syllables.map((x) => clampStr(String(x), 12)).filter(Boolean).slice(0, 12) : [];
+            const stress = g && Number.isInteger(g.stress) && g.stress >= 0 && g.stress < syllables.length ? g.stress : Math.max(0, syllables.length - 2);
+            return { word: w, syllables: syllables.length ? syllables : [w], stress: syllables.length ? stress : 0, glottal: !!(g && g.glottal), note: g ? clampStr(g.note, 200) : "" };
+          }),
+        };
+        shadowGuideCache.set(guideKey(text), out);
+        return out;
+      },
+    };
+  }));
+
+  // --- 8. Reading Level Meter: today's Tagalog articles (scored for readability on the device) --
+  let articleCache = { at: 0, items: [] };
+  const readingLimiter = makeUserLimiter(60_000, 20);
+  app.post("/premium/reading/articles", ...guard, readingLimiter, async (req, res) => {
+    try {
+      if (Date.now() - articleCache.at > 30 * 60_000 || !articleCache.items.length) {
+        const lists = await Promise.all(TAGALOG_FEEDS.map(async (f) => {
+          try {
+            const r = await fetch(f.url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; HariReader/1.0)" }, signal: AbortSignal.timeout(10000) });
+            return r.ok ? parseFeed(await r.text(), f.source) : [];
+          } catch (err) {
+            console.warn("[premium-reading] feed failed:", f.source, err.message);
+            return [];
+          }
+        }));
+        const items = lists.flat().sort((a, b) => b.date - a.date).slice(0, 30);
+        if (items.length) articleCache = { at: Date.now(), items };
+      }
+      res.json({ articles: articleCache.items });
+    } catch (err) {
+      console.error("[premium-reading] error:", err.message);
+      res.status(502).json({ error: "reading_unavailable" });
+    }
+  });
+
 }
 
-module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES };
+module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed };
