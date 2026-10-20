@@ -401,6 +401,11 @@ function wordStatus(score) {
   return score >= 85 ? "good" : score >= 55 ? "close" : "missed";
 }
 
+/** Similarity 0..1 to a strict 0..100 score: half-right is 0, one letter off in a long word is about 80. */
+function strictScore(sim) {
+  return Math.max(0, Math.min(100, Math.round(((sim - 0.5) / 0.5) * 100)));
+}
+
 const clamp100 = (v) => Math.max(0, Math.min(100, Math.round(v)));
 
 /**
@@ -415,7 +420,7 @@ function scoreFromTranscript(targetText, heardWords, heardText) {
   const match = alignWords(target, heard.map((h) => h.text));
   const words = target.map((word, i) => {
     const h = match[i] >= 0 ? heard[match[i]] : null;
-    const score = h ? clamp100(wordSimilarity(word, h.text) * 100) : 0;
+    const score = h ? strictScore(wordSimilarity(word, h.text)) : 0;
     return { word, heard: h ? h.text : "", score, status: wordStatus(score) };
   });
   const accuracy = words.length ? clamp100(words.reduce((a, w) => a + w.score, 0) / words.length) : 0;
@@ -434,8 +439,38 @@ function scoreFromTranscript(targetText, heardWords, heardText) {
     fluency = clamp100(100 - gaps * 12 - (pace < 2.8 ? (2.8 - pace) * 18 : 0) - (pace > 8 ? 10 : 0));
     fluency = Math.max(30, fluency);
   }
-  const overall = clamp100(accuracy * 0.6 + completeness * 0.25 + (fluency == null ? accuracy : fluency) * 0.15);
+  if (fluency != null) fluency = Math.min(fluency, accuracy + 25);
+  // smooth delivery only counts as much as the words were right
+  const overall = clamp100(accuracy * 0.7 + completeness * 0.15 + (fluency == null ? accuracy : fluency) * 0.15 * (accuracy / 100));
   return { overall, accuracy, completeness, fluency, prosody: null, pace, words, heard: String(heardText || "").trim() };
+}
+
+/**
+ * Azure can be generous when it force-aligns speech to the reference line, so its scores are capped
+ * by what was actually heard: each word and the totals take the lower of the two.
+ */
+function capByTranscript(az, heard) {
+  if (!heard) return az;
+  const words = az.words.map((w, i) => {
+    const h = heard.words[i];
+    const hs = h ? h.score : 0;
+    // Azure sometimes drops a Tagalog word it didn't recognize that was said clearly
+    const score = w.score === 0 && hs >= 85 ? hs - 15 : Math.min(w.score, hs);
+    return { word: w.word, heard: h ? h.heard : "", score, status: wordStatus(score) };
+  });
+  const accuracy = Math.min(az.accuracy, heard.accuracy);
+  const capped = (v) => (v == null ? null : Math.min(v, accuracy + 25)); // smooth but wrong is not fluent
+  return {
+    ...az,
+    words,
+    overall: Math.min(az.overall, heard.overall),
+    accuracy,
+    completeness: Math.min(az.completeness, heard.completeness),
+    fluency: capped(az.fluency == null ? heard.fluency : Math.min(az.fluency, heard.fluency == null ? 100 : heard.fluency)),
+    prosody: capped(az.prosody),
+    pace: heard.pace,
+    heard: heard.heard || az.heard,
+  };
 }
 
 /** Azure pronunciation assessment result (format=detailed) to the same shape. Null if it holds no scores. */
@@ -465,6 +500,7 @@ function scoreFromAzure(targetText, data) {
     pace: null,
     words,
     heard: String(nb.Display || data.DisplayText || "").trim(),
+    lexical: String(nb.Lexical || nb.Display || "").trim(),
   };
 }
 
@@ -1013,9 +1049,31 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
       let result = null;
       const region = process.env.AZURE_SPEECH_REGION || "eastus";
 
-      if (process.env.AZURE_SPEECH_KEY && process.env.PREMIUM_PRON_ASSESS !== "off") {
+      // What was actually said (ElevenLabs Scribe, with word timings) and Azure's pronunciation
+      // assessment run side by side; Azure's scores never exceed what the transcript supports.
+      const scribe = async () => {
+        if (!process.env.ELEVENLABS_API_KEY) return null;
         try {
-          const config = { ReferenceText: target, GradingSystem: "HundredMark", Granularity: "Word", Dimension: "Comprehensive", EnableMiscue: true, EnableProsodyAssessment: true };
+          const form = new FormData();
+          form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
+          form.append("language_code", "fil");
+          form.append("tag_audio_events", "false");
+          form.append("timestamps_granularity", "word");
+          form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
+          const r = await fetch(`${ELEVEN_API}/v1/speech-to-text`, { method: "POST", headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }, body: form });
+          if (!r.ok) throw new Error(`scribe_${r.status}: ${(await r.text()).slice(0, 200)}`);
+          const data = await r.json();
+          const words = Array.isArray(data.words) ? data.words.filter((w) => !w.type || w.type === "word") : null;
+          return scoreFromTranscript(target, words, data.text);
+        } catch (err) {
+          console.error("[premium-shadow] Scribe failed:", err.message);
+          return null;
+        }
+      };
+      const azure = async () => {
+        if (!process.env.AZURE_SPEECH_KEY || process.env.PREMIUM_PRON_ASSESS === "off") return null;
+        try {
+          const config = { ReferenceText: target, GradingSystem: "HundredMark", Granularity: "Word", Dimension: "Comprehensive", EnableMiscue: "True", EnableProsodyAssessment: "True" };
           const r = await fetch(
             `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=fil-PH&format=detailed`,
             {
@@ -1029,32 +1087,27 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
               body: audio,
             }
           );
-          if (r.ok) result = scoreFromAzure(target, await r.json());
-          else console.warn("[premium-shadow] Azure assessment", r.status, (await r.text()).slice(0, 200));
-          if (result) result.engine = "azure";
+          if (!r.ok) {
+            console.warn("[premium-shadow] Azure assessment", r.status, (await r.text()).slice(0, 200));
+            return null;
+          }
+          return scoreFromAzure(target, await r.json());
         } catch (err) {
           console.warn("[premium-shadow] Azure assessment failed:", err.message);
+          return null;
         }
+      };
+      const [heard, assessed] = await Promise.all([scribe(), azure()]);
+      if (assessed) {
+        // without Scribe, Azure's own recognized words are the check
+        const check = heard || scoreFromTranscript(target, null, assessed.lexical);
+        result = capByTranscript(assessed, check);
+        result.engine = heard ? "azure+elevenlabs" : "azure";
+      } else if (heard) {
+        result = heard;
+        result.engine = "elevenlabs";
       }
-
-      if (!result && process.env.ELEVENLABS_API_KEY) {
-        try {
-          const form = new FormData();
-          form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
-          form.append("language_code", "fil");
-          form.append("tag_audio_events", "false");
-          form.append("timestamps_granularity", "word");
-          form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
-          const r = await fetch(`${ELEVEN_API}/v1/speech-to-text`, { method: "POST", headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }, body: form });
-          if (!r.ok) throw new Error(`scribe_${r.status}: ${(await r.text()).slice(0, 200)}`);
-          const data = await r.json();
-          const words = Array.isArray(data.words) ? data.words.filter((w) => !w.type || w.type === "word") : null;
-          result = scoreFromTranscript(target, words, data.text);
-          result.engine = "elevenlabs";
-        } catch (err) {
-          console.error("[premium-shadow] Scribe failed:", err.message);
-        }
-      }
+      if (result) delete result.lexical;
 
       if (!result && process.env.AZURE_SPEECH_KEY) {
         const r = await fetch(
