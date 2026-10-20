@@ -99,7 +99,11 @@ function correctionsFor(latest, list) {
 const TAGALOG_EXPERT =
   "You are an expert Filipino (Tagalog) teacher who grew up in Metro Manila. You know how people really talk today, " +
   "including natural Taglish code-switching, po/opo politeness, and regional nuance. Be accurate: never invent words. " +
-  "Explanations are in clear, friendly English. Respond with valid JSON only, matching the requested shape exactly.";
+  "Explanations are in clear, friendly English. " +
+  // many learners are Filipino Americans, so never frame phrasing as what "a Filipino" or "Filipinos" say
+  "When describing natural phrasing, say \"a native speaker\" or \"natives\", never \"a Filipino\" or \"Filipinos\" " +
+  "(for example \"here is how a native speaker would say it\"). " +
+  "Respond with valid JSON only, matching the requested shape exactly.";
 
 // ---------------------------------------------------------------------------
 // Voice providers. PREMIUM_TTS_PROVIDER picks the first choice (azure | elevenlabs | google);
@@ -669,7 +673,7 @@ Language mix: beginner = mostly simple Tagalog with English support; intermediat
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
 Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
-If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a Filipino would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
+If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a native speaker would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
 
 Return JSON:
 {
@@ -759,7 +763,7 @@ Return JSON:
     const context = clampStr(req.body.context, 200);
     if (!text) throw new Error("text is required");
     const system = `${TAGALOG_EXPERT}
-The learner wants to express something in natural Filipino. Give how real Filipinos would actually say it, not a literal translation.
+The learner wants to express something in natural Filipino. Give how native speakers would actually say it, not a literal translation.
 Return JSON:
 {
   "casual": { "tagalog": string, "note": string (who/when, English) },
@@ -783,7 +787,7 @@ Return JSON:
     if (!lines.length) throw new Error("lines are required");
     const level = normLevel(req.body.level);
     const system = `${TAGALOG_EXPERT}
-You are subtitling a video for a ${level} Tagalog learner. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a Filipino would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors. Always also give English.
+You are subtitling a video for a ${level} Tagalog learner. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors. Always also give English.
 Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string (short English note on slang/idiom/grammar worth knowing, or "") }] }`;
     const user = JSON.stringify(lines);
     return {
