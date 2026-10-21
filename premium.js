@@ -938,9 +938,12 @@ Return JSON:
         reply: String(d.reply || ""),
         replyEnglish: String(d.replyEnglish || ""),
         corrections: correctionsFor(history[history.length - 1].content, d.corrections),
-        tagalogVersion: d.tagalogVersion && d.tagalogVersion.tagalog
-          ? { tagalog: String(d.tagalogVersion.tagalog), note: String(d.tagalogVersion.note || "") }
-          : null,
+        // the model is asked for { tagalog, note } but sometimes answers with just the string
+        tagalogVersion: typeof d.tagalogVersion === "string" && d.tagalogVersion.trim()
+          ? { tagalog: d.tagalogVersion.trim(), note: "" }
+          : d.tagalogVersion && d.tagalogVersion.tagalog
+            ? { tagalog: String(d.tagalogVersion.tagalog), note: String(d.tagalogVersion.note || "") }
+            : null,
         tip: String(d.tip || ""),
         suggestedReplies: Array.isArray(d.suggestedReplies) ? d.suggestedReplies.slice(0, 3).map(String) : [],
       }),
