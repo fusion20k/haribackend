@@ -26,6 +26,25 @@ function normLevel(level) {
   return LEVELS.includes(level) ? level : "beginner";
 }
 
+/** What each learner level means in practice, so every feature scales difficulty the same way. */
+const LEVEL_GUIDE = {
+  beginner:
+    "BEGINNER: sentences of 3 to 6 words; only very common everyday words (greetings, family, food, home, numbers, time); " +
+    "simple present or basic past tense; ang/ng/sa and po/opo only in their most common uses; no idioms or rare words; " +
+    "Taglish is fine; explanations short and simple.",
+  intermediate:
+    "INTERMEDIATE: sentences of 6 to 10 words; common everyday vocabulary plus some less frequent words; " +
+    "past, present and future aspect of verbs; linkers (na/-ng), connectors (kasi, pero, kaya, kapag) and pronoun order; " +
+    "occasional common expressions; mostly Tagalog with light Taglish.",
+  advanced:
+    "ADVANCED: sentences of 10 to 16 words, including two-clause sentences; richer and less common vocabulary; " +
+    "object, locative and benefactive verb focus (-in, -an, i-), aspect nuances, idioms and proverbs; " +
+    "formal vs casual register; natural Tagalog with little English.",
+};
+function levelGuide(level) {
+  return LEVEL_GUIDE[normLevel(level)];
+}
+
 /** Per-user sliding window limiter so one account can't hammer the LLM/TTS providers. */
 function makeUserLimiter(windowMs, max) {
   const hits = new Map();
@@ -917,6 +936,7 @@ ${mode === "roleplay"
     : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
 Talk the way people do out loud: usually one to three short sentences per reply, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
 Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
+Match your Tagalog to this level: ${levelGuide(level)}
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
 Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
@@ -964,13 +984,32 @@ Return JSON:
       translate: `{ "exercises": [{ "english": string (everyday phrase), "tagalog": string (most natural answer), "acceptable": [string] (other correct answers), "hint": string (English) }] }`,
       listening: `{ "exercises": [{ "kind": "phrase" | "dialogue", "lines": [{ "speaker": "A" | "B", "tagalog": string, "english": string }] (1 line for phrase, 2-4 for dialogue), "question": string (English comprehension question), "choices": [string] (4 English choices), "answerIndex": number, "explanation": string (English) }] }`,
     };
-    const system = `${TAGALOG_EXPERT}\nCreate ${count} ${type} exercises for a ${level} learner. Use everyday, modern situations (family, food, commuting, work, texting). Vary sentence structure. Return JSON exactly shaped like:\n${shapes[type]}`;
+    const perLevel = {
+      beginner: { builder: "3 to 6 tiles and 1 distractor", listening: "single short phrases or 2-line dialogues", hint: "always give a helpful hint" },
+      intermediate: { builder: "6 to 10 tiles and 2 distractors", listening: "phrases or 2-3 line dialogues", hint: "give a short hint" },
+      advanced: { builder: "10 to 16 tiles and 3 distractors that test grammar (wrong focus or aspect)", listening: "3-4 line dialogues with natural speed and idioms", hint: "keep hints minimal" },
+    }[level];
+    const system = `${TAGALOG_EXPERT}
+Create ${count} ${type} exercises for a ${level} learner. Use everyday, modern situations (family, food, commuting, work, texting). Vary sentence structure.
+Difficulty MUST match the level exactly: ${levelGuide(level)}
+${type === "builder" ? `Sentence Builder at this level: ${perLevel.builder}.` : type === "listening" ? `Listening at this level: ${perLevel.listening}.` : ""} Hints: ${perLevel.hint}.
+Return JSON exactly shaped like:
+${shapes[type]}`;
     const user = words.length
       ? `Build the exercises around these words the learner saved (use at least one per exercise where natural): ${words.join("; ")}`
       : "Use common high-frequency vocabulary.";
     return {
       system, user, maxTokens: 1400, temperature: 0.9, inChars: Math.ceil(system.length / 4 + user.length),
-      clean: (d) => ({ type, exercises: Array.isArray(d.exercises) ? d.exercises.slice(0, count) : [] }),
+      clean: (d) => {
+        let exercises = Array.isArray(d.exercises) ? d.exercises.filter((e) => e && typeof e === "object") : [];
+        // keep Sentence Builder lengths inside the level's range when the model drifts (if any fit)
+        if (type === "builder") {
+          const [lo, hi] = { beginner: [2, 7], intermediate: [5, 11], advanced: [9, 20] }[level];
+          const fits = exercises.filter((e) => Array.isArray(e.tiles) && e.tiles.length >= lo && e.tiles.length <= hi);
+          if (fits.length) exercises = fits;
+        }
+        return { type, level, exercises: exercises.slice(0, count) };
+      },
     };
   }));
 
@@ -984,6 +1023,7 @@ Return JSON:
     if (!prompt || !answer) throw new Error("prompt and answer are required");
     const system = `${TAGALOG_EXPERT}
 A ${level} learner answered a ${kind} exercise. Judge meaning, grammar (focus/aspect, markers ang/ng/sa, linkers na/-ng, pronoun order, po/opo) and naturalness. Accept any answer a native speaker would accept, even if different from the reference.
+Level: ${levelGuide(level)} For a beginner, count small spelling slips and missing po as "almost" and keep explanations to one simple sentence; for advanced, also point out register and naturalness.
 Return JSON:
 {
   "verdict": "correct" | "almost" | "incorrect",
@@ -1037,7 +1077,7 @@ Return JSON:
     if (!lines.length) throw new Error("lines are required");
     const level = normLevel(req.body.level);
     const system = `${TAGALOG_EXPERT}
-You are subtitling a video for a ${level} Tagalog learner. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors. Always also give English.
+You are subtitling a video for a ${level} Tagalog learner (${levelGuide(level)}). Keep the Tagalog at that level where you can without changing the meaning. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors. Always also give English.
 Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string (short English note on slang/idiom/grammar worth knowing, or "") }] }`;
     const user = JSON.stringify(lines);
     return {
