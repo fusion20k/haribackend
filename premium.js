@@ -599,6 +599,7 @@ function mountPremium(app, deps) {
   const {
     requireAuth, stripe, getUserById, resetUserCharsIfNeeded, atomicCheckAndIncrementChars,
     incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage,
+    meterPaygChars,
   } = deps;
 
   const audioCache = new AudioCache(500);
@@ -682,6 +683,9 @@ function mountPremium(app, deps) {
       if (!user || !PREMIUM_PLANS.includes(user.plan_status)) {
         return res.status(403).json({ error: "premium_required" });
       }
+      if (user.plan_status === "payg" && !user.stripe_customer_id) {
+        return res.status(402).json({ error: "payg_billing_required" });
+      }
       if (user.plan_status !== "active") {
         const reset = await resetUserCharsIfNeeded(req.userId);
         if (reset) user = await getUserById(req.userId);
@@ -730,24 +734,18 @@ function mountPremium(app, deps) {
       }
       if (user.plan_status === "payg") {
         await incrementUserTrialChars(req.userId, total);
-        const units = Math.ceil(total / 1000);
-        if (user.stripe_customer_id && stripe && units > 0) {
-          const identifier = `${kind}:${req.userId}:${req.get("x-idempotency-key") || crypto.randomUUID()}`;
-          try {
-            await stripe.billing.meterEvents.create({
-              event_name: "translation_chars",
-              payload: { value: String(units), stripe_customer_id: user.stripe_customer_id },
-              identifier,
-            });
-          } catch (e) {
-            console.error(`[premium] ${kind} PAYG meter failed (non-fatal):`, e.message);
-            await insertPendingMeterEvent(req.userId, user.stripe_customer_id, "translation_chars", units, identifier);
-          }
-        }
+        // exact characters go into the running total; Stripe gets whole thousands (see meterPaygChars)
+        const identifier = `${kind}:${req.userId}:${req.get("x-idempotency-key") || crypto.randomUUID()}`;
+        await meterPaygChars(req.userId, user.stripe_customer_id, total, identifier);
       }
     } catch (err) {
       console.error(`[premium] settle ${kind} failed (non-fatal):`, err.message);
     }
+  }
+
+  /** PAYG: a result served from cache is still a use of the feature, billed at its plain length. */
+  async function billCachedPayg(req, chars, kind) {
+    if (req.premiumUser && req.premiumUser.plan_status === "payg" && chars > 0) await settleChars(req, chars, 0, kind);
   }
 
   /** Shared wrapper for every LLM-backed route. build(req) returns { system, user, history?, maxTokens?, inChars, clean(data) }. */
@@ -817,10 +815,14 @@ function mountPremium(app, deps) {
       res.send(audio);
     };
     const memHit = audioCache.get(cacheKey);
-    if (memHit) return send(memHit.audio, memHit.provider);
+    if (memHit) {
+      await billCachedPayg(req, text.length, "tts-cached");
+      return send(memHit.audio, memHit.provider);
+    }
     const dbHit = text.length <= DB_CACHE_MAX_TEXT ? await dbCacheGet(cacheKey) : null;
     if (dbHit) {
       audioCache.set(cacheKey, dbHit);
+      await billCachedPayg(req, text.length, "tts-cached");
       return send(dbHit.audio, dbHit.provider);
     }
 
@@ -1186,8 +1188,9 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
   const shadowGuideCache = new AudioCache(500);
   const guideKey = (text) => plainWord(text) ? text.toLowerCase().replace(/\s+/g, " ").trim() : "";
   app.post("/premium/shadow/guide", ...guard, llmLimiter, (req, res, next) => {
-    const hit = shadowGuideCache.get(guideKey(clampStr(req.body.text, 300)));
-    if (hit) return res.json(hit);
+    const text = clampStr(req.body.text, 300);
+    const hit = shadowGuideCache.get(guideKey(text));
+    if (hit) return billCachedPayg(req, text.length, "shadowguide-cached").then(() => res.json(hit));
     next();
   }, llmRoute("shadowguide", (req) => {
     const text = clampStr(req.body.text, 300).replace(/\s+/g, " ");
@@ -1270,7 +1273,7 @@ Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use t
   const lookupKey = (req) => `${clampStr(req.body.word, 60).toLowerCase()}|${clampStr(req.body.context, 160).toLowerCase()}`;
   app.post("/premium/lookup", ...guard, llmLimiter, (req, res, next) => {
     const hit = lookupCache.get(lookupKey(req));
-    if (hit) return res.json(hit);
+    if (hit) return billCachedPayg(req, clampStr(req.body.word, 60).length + clampStr(req.body.context, 400).length, "lookup-cached").then(() => res.json(hit));
     next();
   }, llmRoute("lookup", (req) => {
     const word = clampStr(req.body.word, 60);

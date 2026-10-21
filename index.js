@@ -64,6 +64,7 @@ const {
   syncUserXp,
   getUserXp,
   insertPendingMeterEvent,
+  addPaygUsage,
   getPendingMeterEvents,
   updateMeterEventAttempt,
   atomicCheckAndIncrementChars,
@@ -363,6 +364,27 @@ async function llmDictionary(word, english, context) {
   return JSON.parse(content);
 }
 
+/**
+ * Bills PAYG usage. Characters go into the user's running total and only whole thousands are sent
+ * to Stripe (the remainder carries over), so short requests like a word's audio are no longer
+ * rounded up to a full 1,000 characters each. Returns the number of thousands billed now.
+ */
+async function meterPaygChars(userId, stripeCustomerId, chars, identifier) {
+  const units = await addPaygUsage(userId, chars);
+  if (!units || !stripeCustomerId || !stripe) return 0;
+  try {
+    await stripe.billing.meterEvents.create({
+      event_name: "translation_chars",
+      payload: { value: String(units), stripe_customer_id: stripeCustomerId },
+      identifier,
+    });
+  } catch (e) {
+    console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
+    await insertPendingMeterEvent(userId, stripeCustomerId, "translation_chars", units, identifier);
+  }
+  return units;
+}
+
 app.use(
   cors({
     origin: "*",
@@ -374,7 +396,7 @@ if (process.env.DATABASE_URL) mountGrowth(app, { pool, stripe });
 if (process.env.DATABASE_URL) {
   mountPremium(app, {
     requireAuth, stripe, getUserById, resetUserCharsIfNeeded, atomicCheckAndIncrementChars,
-    incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage, pool,
+    incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage, pool, meterPaygChars,
   });
 }
 
@@ -2741,23 +2763,8 @@ app.post("/translate", requireAuth, async (req, res) => {
       await incrementUserTrialChars(req.userId, billableChars);
 
       const freshUser = await getUserById(req.userId);
-      if (freshUser?.stripe_customer_id && stripe && billableChars > 0) {
-        const charsToReport = Math.ceil(billableChars / 1000);
-        try {
-          await stripe.billing.meterEvents.create({
-            event_name: "translation_chars",
-            payload: {
-              value: String(charsToReport),
-              stripe_customer_id: freshUser.stripe_customer_id,
-            },
-            identifier: meterIdentifier,
-          });
-          console.log(`[payg] billed user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} units=${charsToReport}`);
-        } catch (e) {
-          console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
-          await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", charsToReport, meterIdentifier);
-        }
-      }
+      const units = await meterPaygChars(req.userId, freshUser?.stripe_customer_id, billableChars, meterIdentifier);
+      console.log(`[payg] user=${req.userId} cache=${cacheChars} live=${liveChars} total=${billableChars} billed_units=${units}`);
 
       const charsUsedBefore = user.trial_chars_used ?? 0;
       const updatedCharsUsed = charsUsedBefore + billableChars;
@@ -2902,25 +2909,8 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     if (user && user.plan_status === "payg") {
       await incrementUserTrialChars(req.userId, totalChars);
       const freshUser = await getUserById(req.userId);
-      if (freshUser?.stripe_customer_id && stripe) {
-        const charsToReport = Math.ceil(totalChars / 1000);
-        if (charsToReport > 0) {
-          try {
-            await stripe.billing.meterEvents.create({
-              event_name: "translation_chars",
-              payload: {
-                value: String(charsToReport),
-                stripe_customer_id: freshUser.stripe_customer_id,
-              },
-              identifier: meterIdentifier,
-            });
-            console.log(`[payg] billed user=${req.userId} total=${totalChars} units=${charsToReport}`);
-          } catch (e) {
-            console.error("PAYG Stripe meter event failed (non-fatal):", e.message);
-            await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", charsToReport, meterIdentifier);
-          }
-        }
-      }
+      const units = await meterPaygChars(req.userId, freshUser?.stripe_customer_id, totalChars, meterIdentifier);
+      console.log(`[payg] user=${req.userId} dictionary total=${totalChars} billed_units=${units}`);
       const charsUsedBefore = user.trial_chars_used ?? 0;
       const updatedCharsUsed = charsUsedBefore + totalChars;
       const paygBaseline = user.chars_used_at_payg_start ?? 0;
@@ -3105,23 +3095,8 @@ app.post("/tts", requireAuth, async (req, res) => {
     if (user && user.plan_status === "payg") {
       await incrementUserTrialChars(req.userId, weightedChars);
       const freshUser = await getUserById(req.userId);
-      if (freshUser?.stripe_customer_id && stripe && weightedChars > 0) {
-        const unitsToReport = Math.ceil(weightedChars / 1000);
-        try {
-          await stripe.billing.meterEvents.create({
-            event_name: "translation_chars",
-            payload: {
-              value: String(unitsToReport),
-              stripe_customer_id: freshUser.stripe_customer_id,
-            },
-            identifier: meterIdentifier,
-          });
-          console.log(`[tts] billed user=${req.userId} raw=${ttsChars} weighted=${weightedChars} units=${unitsToReport}`);
-        } catch (e) {
-          console.error("TTS PAYG Stripe meter event failed (non-fatal):", e.message);
-          await insertPendingMeterEvent(req.userId, freshUser.stripe_customer_id, "translation_chars", unitsToReport, meterIdentifier);
-        }
-      }
+      const units = await meterPaygChars(req.userId, freshUser?.stripe_customer_id, weightedChars, meterIdentifier);
+      console.log(`[tts] user=${req.userId} raw=${ttsChars} weighted=${weightedChars} billed_units=${units}`);
     }
 
     res.set("Content-Type", "audio/mpeg");

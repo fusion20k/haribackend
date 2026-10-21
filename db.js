@@ -472,6 +472,12 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_pending_meter_events_status ON pending_meter_events(status)
     `);
 
+    // PAYG characters used but not yet sent to Stripe (always under 1,000): usage is billed in
+    // whole thousands, and the remainder carries over to the next request
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS payg_unbilled_chars INTEGER NOT NULL DEFAULT 0
+    `);
+
     const oldKeyCheck = await client.query(`
       SELECT 1 FROM translations
       WHERE key ~ '^[^:]+:[0-9a-f]{1,8}$'
@@ -1613,6 +1619,30 @@ async function getWebsiteActivity(days) {
   }
 }
 
+/**
+ * Adds PAYG characters to the user's running total and returns how many whole thousands are now
+ * due (0 if under 1,000). Those thousands are taken off the total here, so each character is billed
+ * once even when requests arrive at the same time.
+ */
+async function addPaygUsage(userId, chars) {
+  if (!process.env.DATABASE_URL) return 0;
+  const n = Math.max(0, Math.round(Number(chars) || 0));
+  if (!n) return 0;
+  const added = await pool.query(
+    `UPDATE users SET payg_unbilled_chars = payg_unbilled_chars + $2 WHERE id = $1 RETURNING payg_unbilled_chars`,
+    [userId, n]
+  );
+  const total = added.rows[0] ? added.rows[0].payg_unbilled_chars : 0;
+  const units = Math.floor(total / 1000);
+  if (!units) return 0;
+  // only one of two racing requests can take the same thousands; the other bills them later
+  const taken = await pool.query(
+    `UPDATE users SET payg_unbilled_chars = payg_unbilled_chars - $2 WHERE id = $1 AND payg_unbilled_chars >= $2 RETURNING 1`,
+    [userId, units * 1000]
+  );
+  return taken.rows.length ? units : 0;
+}
+
 async function insertPendingMeterEvent(userId, stripeCustomerId, eventName, units, identifier) {
   if (!process.env.DATABASE_URL) return;
 
@@ -1917,6 +1947,7 @@ module.exports = {
   syncUserXp,
   getUserXp,
   insertPendingMeterEvent,
+  addPaygUsage,
   getPendingMeterEvents,
   updateMeterEventAttempt,
   atomicCheckAndIncrementChars,
