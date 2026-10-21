@@ -2334,6 +2334,23 @@ app.get("/stats", requireAuth, async (req, res) => {
   }
 });
 
+// Word of the Day extras: words added here reach every Hari user within a day, no extension
+// release needed. Edit wotd-extra.json (same fields as the extension's word list) and deploy.
+let wotdExtraCache = { at: 0, body: null };
+app.get("/wotd/extra", (req, res) => {
+  try {
+    if (!wotdExtraCache.body || Date.now() - wotdExtraCache.at > 10 * 60 * 1000) {
+      const raw = JSON.parse(require("fs").readFileSync(require("path").join(__dirname, "wotd-extra.json"), "utf8"));
+      wotdExtraCache = { at: Date.now(), body: { words: Array.isArray(raw.words) ? raw.words : [] } };
+    }
+    res.set("Cache-Control", "public, max-age=3600");
+    res.json(wotdExtraCache.body);
+  } catch (err) {
+    console.error("/wotd/extra error:", err.message);
+    res.json({ words: [] });
+  }
+});
+
 app.get("/usage", async (req, res) => {
   try {
     const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;

@@ -1,0 +1,7 @@
+{
+  "about": "Extra Word of the Day entries, merged into every user's rotation within a day. Fields: word, pronunciation, english, example, exampleTranslation, wordType (NOUN, VERB, ADJ, PHRASE...), culturalNote, kind (\"daily\" or \"culture\"), essential (true to show early). Words already in the extension are ignored.",
+  "words": [
+    {"word": "Pakikiramdam", "pronunciation": "pah-kee-kee-ram-DAM", "english": "Sensing others' feelings without being told", "example": "Gamitin mo ang pakikiramdam bago ka magsalita.", "exampleTranslation": "Read the room before you speak.", "wordType": "NOUN", "culturalNote": "A prized social skill: noticing what people feel or need without them saying it outright.", "kind": "culture"},
+    {"word": "Tampuhan", "pronunciation": "tam-poo-HAN", "english": "A sulking spat between people who are close", "example": "Konting tampuhan lang iyan, magbabati rin sila.", "exampleTranslation": "That's just a little sulk, they'll make up soon.", "wordType": "NOUN", "culturalNote": "Tampo is quiet hurt expected to be noticed and soothed, common between family, friends and couples.", "kind": "culture"}
+  ]
+}
