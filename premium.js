@@ -1,4 +1,4 @@
-// Premium + PAYG features: better voice, Danao (AI tutor), practice exercises with
+// Premium + PAYG features: better voice, Thea (AI tutor), practice exercises with
 // "Explain My Mistake", "Say It Like a Native", video subtitle translation, the Shadowing Coach
 // and the Reading Level Meter's article feed.
 // Every route here is limited to plan_status pre / payg / active; free users get 403 premium_required.
@@ -588,7 +588,7 @@ function mountPremium(app, deps) {
 
   // Shared audio cache: once any user has heard a word or phrase in a voice, everyone reuses it,
   // across restarts. Cache hits cost nothing (no provider call, nothing charged to the user).
-  // Only words and short phrases go to the database: they're what repeats across users. Long Danao
+  // Only words and short phrases go to the database: they're what repeats across users. Long Thea
   // lines are unique per conversation and stay in the memory caches. A hard size cap keeps the
   // table well inside Supabase's free 500 MB database.
   const DB_CACHE_MAX_TEXT = parseInt(process.env.TTS_CACHE_MAX_TEXT) || 100;
@@ -824,7 +824,7 @@ function mountPremium(app, deps) {
     }
   });
 
-  // --- Speech to text for Danao (the extension records 16 kHz mono WAV from the chosen mic) ---
+  // --- Speech to text for Thea (the extension records 16 kHz mono WAV from the chosen mic) ---
   const wavBody = express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "2.5mb" });
   app.post("/premium/stt", requireAuth, wavBody, requirePremium, sttLimiter, async (req, res) => {
     if (!process.env.AZURE_SPEECH_KEY && !process.env.ELEVENLABS_API_KEY) return res.status(503).json({ error: "stt_not_configured" });
@@ -892,7 +892,7 @@ function mountPremium(app, deps) {
     }
   });
 
-  // --- 2. Danao, the AI tutor -----------------------------------------------------------
+  // --- 2. Thea, the AI tutor -----------------------------------------------------------
   app.post("/premium/tutor", ...guard, llmLimiter, llmRoute("tutor", (req) => {
     const level = normLevel(req.body.level);
     const mode = req.body.mode === "roleplay" ? "roleplay" : "chat";
@@ -911,7 +911,7 @@ function mountPremium(app, deps) {
 
     const system = `${TAGALOG_EXPERT}
 
-You are Danao, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
+You are Thea, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
 ${mode === "roleplay"
     ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic.`
     : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
