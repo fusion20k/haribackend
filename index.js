@@ -620,28 +620,98 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/checkout-success", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Hari - Success</title>
-<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0}
-.card{text-align:center;padding:3rem;border-radius:16px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);max-width:420px}
-h1{color:#4ade80;margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
-.icon{font-size:3rem;margin-bottom:1rem}</style></head>
-<body><div class="card"><div class="icon">&#10003;</div><h1>You're all set!</h1>
-<p>Your subscription is active. You can close this tab and return to your browser — Hari is ready to use.</p>
-</div></body></html>`);
+// Checkout result pages, in the same look as haritagalog.com (warm beige, Playfair + Inter, teal and gold).
+function checkoutPage({ title, eyebrow, heading, body, steps = [], cta = null, tone = "teal", icon = "check" }) {
+  const accent = tone === "gold" ? "#b8913e" : "#0F766E";
+  const check = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+  const back = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<link rel="icon" type="image/svg+xml" href="https://haritagalog.com/assets/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 20px;
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif; color: #1a1a1a;
+    background: radial-gradient(ellipse 90% 75% at 50% 50%, transparent 50%, rgba(0, 0, 0, 0.14) 100%), #e2d8c9; }
+  .wrap { width: 100%; max-width: 520px; text-align: center; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; font-size: 20px; color: #1a1a1a; text-decoration: none; margin-bottom: 34px; }
+  .brand i { width: 38px; height: 38px; border-radius: 50%; background: #0F766E; display: grid; place-items: center; }
+  .brand img { width: 26px; height: 26px; }
+  .card { background: #f5f0e8; border-radius: 22px; padding: 44px 40px 38px; box-shadow: 0 30px 80px rgba(12, 46, 42, 0.16), 0 0 0 1px rgba(0, 0, 0, 0.05); }
+  .badge { width: 64px; height: 64px; margin: 0 auto 22px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: ${accent}; box-shadow: 0 10px 30px ${tone === "gold" ? "rgba(184, 145, 62, 0.35)" : "rgba(15, 118, 110, 0.35)"}; }
+  .badge svg { width: 30px; height: 30px; }
+  .eyebrow { display: inline-flex; align-items: center; gap: 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: ${accent}; margin-bottom: 12px; }
+  .eyebrow::before, .eyebrow::after { content: ""; width: 22px; height: 1.5px; background: currentColor; }
+  h1 { font-family: 'Playfair Display', Georgia, serif; font-size: 40px; font-weight: 800; line-height: 1.1; letter-spacing: -0.01em; margin: 0 0 14px; }
+  p.body { font-size: 16px; line-height: 1.7; color: #555; margin: 0 auto; max-width: 400px; }
+  ul { list-style: none; padding: 22px 0 0; margin: 26px 0 0; border-top: 1px solid rgba(0, 0, 0, 0.1); text-align: left; display: grid; gap: 12px; }
+  li { display: flex; gap: 10px; font-size: 15px; font-weight: 600; line-height: 1.45; }
+  li svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 3px; color: #0F766E; }
+  li span { font-weight: 400; color: #666; }
+  .cta { display: inline-flex; align-items: center; justify-content: center; margin-top: 28px; padding: 12px 28px; border-radius: 999px; font-weight: 600; font-size: 15px; text-decoration: none; color: #fff; background: #0F766E; transition: background 0.2s ease, transform 0.2s ease; }
+  .cta:hover { background: #0B5C56; transform: translateY(-2px); }
+  .foot { margin-top: 22px; font-size: 13px; color: #7a7a7a; }
+</style></head>
+<body><div class="wrap">
+  <a class="brand" href="https://haritagalog.com"><i><img src="https://haritagalog.com/assets/favicon.svg" alt=""></i>Hari</a>
+  <div class="card">
+    <div class="badge">${icon === "back" ? back : check}</div>
+    <div class="eyebrow">${eyebrow}</div>
+    <h1>${heading}</h1>
+    <p class="body">${body}</p>
+    ${steps.length ? `<ul>${steps.map(([t, d]) => `<li>${check}<div>${t}${d ? ` <span>${d}</span>` : ""}</div></li>`).join("")}</ul>` : ""}
+    ${cta ? `<a class="cta" href="${cta.href}">${cta.label}</a>` : ""}
+  </div>
+  <p class="foot">You can close this tab.</p>
+</div></body></html>`;
+}
+
+// Which plan a finished checkout bought (null when unknown); never slows the page by more than a few seconds.
+async function checkoutPlan(sessionId) {
+  if (!stripe || typeof sessionId !== "string" || !/^cs_[A-Za-z0-9_]+$/.test(sessionId)) return null;
+  try {
+    const session = await Promise.race([
+      stripe.checkout.sessions.retrieve(sessionId, { expand: ["subscription"] }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000)),
+    ]);
+    const price = session.subscription?.items?.data?.[0]?.price?.id;
+    if (!price) return null;
+    return price === (process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH") ? "payg" : "pre";
+  } catch (_) {
+    return null;
+  }
+}
+
+app.get("/checkout-success", async (req, res) => {
+  const plan = await checkoutPlan(req.query.session_id);
+  const steps = [
+    ["Open a new tab", "to see your Hari home."],
+    ["Tap the flower", "to meet Thea, your AI tutor, and start practicing."],
+    ["Browse like normal", "and tap any Tagalog word for its meaning."],
+  ];
+  const page =
+    plan === "payg"
+      ? { title: "Hari - Pay As You Go is on", eyebrow: "Pay As You Go", heading: "You're all set.", body: "Every Premium feature is unlocked, and you only pay for what you use. Your usage is billed through Stripe.", steps, tone: "gold" }
+      : plan === "pre"
+        ? { title: "Hari - Welcome to Premium", eyebrow: "Welcome to Premium", heading: "You're all set.", body: "Hari Premium is active: unlimited reading, Thea, the natural Filipino voice and every practice tool.", steps, tone: "gold" }
+        : { title: "Hari - You're all set", eyebrow: "Payment complete", heading: "You're all set.", body: "Your plan is active. Open a new tab and Hari is ready to use.", steps };
+  res.send(checkoutPage(page));
 });
 
 app.get("/checkout-cancel", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Hari - Canceled</title>
-<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0}
-.card{text-align:center;padding:3rem;border-radius:16px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);max-width:420px}
-h1{margin-bottom:.5rem}p{color:#a0a0b0;line-height:1.6}
-.icon{font-size:3rem;margin-bottom:1rem}</style></head>
-<body><div class="card"><div class="icon">&#8617;</div><h1>Checkout canceled</h1>
-<p>No worries — nothing was charged. You can close this tab and try again whenever you're ready.</p>
-</div></body></html>`);
+  res.send(
+    checkoutPage({
+      title: "Hari - Checkout canceled",
+      eyebrow: "Checkout canceled",
+      heading: "No problem.",
+      body: "Nothing was charged. Your current plan stays exactly as it was, and you can upgrade whenever you're ready.",
+      cta: { href: "https://haritagalog.com/#scene-pricing", label: "See plans" },
+      icon: "back",
+    }),
+  );
 });
 
 app.get("/fasou/install", (req, res) => {
