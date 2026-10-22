@@ -1753,7 +1753,7 @@ app.post("/start-trial", async (req, res) => {
 
     const subParams = {
       customer: user.stripe_customer_id,
-      items: [{ price: process.env.STRIPE_PRICE_ID }],
+      items: [{ price: await premiumPriceId() }],
       trial_end: trialEndTimestamp,
       trial_settings: {
         end_behavior: {
@@ -1933,20 +1933,6 @@ app.get("/api/me/entitlements", requireAuth, async (req, res) => {
 // Returns the existing Stripe Payment Link with client_reference_id set to the
 // logged-in Hari user, so the webhook can correlate the completed checkout back
 // to this user (used as a fallback alongside metadata.userId).
-app.get("/api/billing/upgrade-link", requireAuth, (req, res) => {
-  if (!process.env.STRIPE_PAYMENT_LINK_URL) {
-    return res.status(503).json({ error: "Payment link not configured" });
-  }
-  try {
-    const paymentLink = new URL(process.env.STRIPE_PAYMENT_LINK_URL);
-    paymentLink.searchParams.set("client_reference_id", String(req.userId));
-    res.json({ url: paymentLink.toString() });
-  } catch (err) {
-    console.error("/api/billing/upgrade-link error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
 // Synchronously applies a just-completed checkout's plan update instead of
 // waiting on the async Stripe webhook. The client should call this (passing
 // the session_id Stripe appended to success_url) right after checkout/
@@ -2002,6 +1988,51 @@ app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
   }
 });
 
+// Premium is $19.99/month. The price is found by checking Stripe for the one that actually costs $19.99, so a
+// stale STRIPE_PRICE_ID (the old $7.49 price) can't sneak back into checkout. Order: an explicit
+// STRIPE_PREMIUM_PRICE_ID, the $19.99 Payment Link's price, the configured Payment Link's price, STRIPE_PRICE_ID.
+const PREMIUM_AMOUNT_CENTS = 1999;
+const PREMIUM_PAYMENT_LINK = "https://buy.stripe.com/dRmdR907Dd7z8fR6u5ejK02";
+let premiumPriceCache = null;
+
+async function paymentLinkPrice(url) {
+  if (!url) return null;
+  const wanted = url.split("?")[0];
+  for await (const link of stripe.paymentLinks.list({ limit: 100 })) {
+    if (link.url === wanted) {
+      const items = await stripe.paymentLinks.listLineItems(link.id, { limit: 1 });
+      return items.data[0]?.price?.id || null;
+    }
+  }
+  return null;
+}
+
+async function premiumPriceId() {
+  if (premiumPriceCache) return premiumPriceCache;
+  const candidates = [
+    async () => process.env.STRIPE_PREMIUM_PRICE_ID,
+    () => paymentLinkPrice(PREMIUM_PAYMENT_LINK),
+    () => paymentLinkPrice(process.env.STRIPE_PAYMENT_LINK_URL),
+    async () => process.env.STRIPE_PRICE_ID,
+  ];
+  for (const get of candidates) {
+    try {
+      const id = await get();
+      if (!id) continue;
+      const price = await stripe.prices.retrieve(id);
+      if (price.active && price.unit_amount === PREMIUM_AMOUNT_CENTS) {
+        premiumPriceCache = id;
+        console.log(`[billing] Premium price: ${id} ($${(price.unit_amount / 100).toFixed(2)}/${price.recurring?.interval || "once"})`);
+        return id;
+      }
+      console.warn(`[billing] skipping price ${id}: ${price.unit_amount} cents, active=${price.active}`);
+    } catch (e) {
+      console.warn("[billing] price lookup failed:", e.message);
+    }
+  }
+  throw Object.assign(new Error("Premium price ($19.99) not found in Stripe"), { status: 503 });
+}
+
 // Every checkout needs a Stripe customer; older accounts (and some sign-in paths) never got one.
 async function ensureStripeCustomer(user) {
   if (user.stripe_customer_id) return user.stripe_customer_id;
@@ -2023,7 +2054,7 @@ const checkoutReturnUrls = () => {
  */
 async function createPlanCheckout(user, plan, replaces = null) {
   const customer = await ensureStripeCustomer(user);
-  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : process.env.STRIPE_PRICE_ID;
+  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : await premiumPriceId();
   if (!price) throw Object.assign(new Error(`${plan === "payg" ? "PAYG" : "Premium"} price not configured`), { status: 503 });
   const metadata = { userId: user.id.toString(), ...(replaces ? { replaces } : {}) };
   return stripe.checkout.sessions.create({
@@ -2058,7 +2089,7 @@ const sendBillingError = (res, label, err) => {
 };
 
 // Premium checkout for a free user. The extension (including versions already in the store) calls this path.
-app.get("/billing/upgrade-link", requireAuth, async (req, res) => {
+async function handleUpgradeLink(req, res) {
   try {
     if (!stripe) return res.status(503).json({ error: "Payment system not configured" });
     const user = await getUserById(req.userId);
@@ -2070,7 +2101,9 @@ app.get("/billing/upgrade-link", requireAuth, async (req, res) => {
   } catch (err) {
     sendBillingError(res, "/billing/upgrade-link", err);
   }
-});
+}
+app.get("/billing/upgrade-link", requireAuth, handleUpgradeLink);
+app.get("/api/billing/upgrade-link", requireAuth, handleUpgradeLink); // older path, same $19.99 checkout
 
 app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
   try {
@@ -2112,7 +2145,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: user.stripe_customer_id,
-      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      line_items: [{ price: await premiumPriceId(), quantity: 1 }],
       subscription_data: {
         trial_end: trialEndTimestamp,
         metadata: { userId: user.id.toString() },
