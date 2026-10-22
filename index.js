@@ -482,7 +482,9 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             console.error("checkout.session.completed: affiliate detection error (non-fatal):", affErr.message);
           }
 
-          if (subscription.status === "active" && previousSubscriptionId && previousSubscriptionId !== subscription.id) {
+          if (["active", "trialing"].includes(subscription.status)) await cancelReplacedSubscription(session, subscription.id);
+
+          if (subscription.status === "active" && previousSubscriptionId && previousSubscriptionId !== subscription.id && previousSubscriptionId !== (session.metadata && session.metadata.replaces)) {
             try {
               await cancelStripeSubscriptionWithFinalUsage(previousSubscriptionId);
               console.log(`Canceled old sub ${previousSubscriptionId} after upgrade for user=${userId}`);
@@ -2000,6 +2002,76 @@ app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
   }
 });
 
+// Every checkout needs a Stripe customer; older accounts (and some sign-in paths) never got one.
+async function ensureStripeCustomer(user) {
+  if (user.stripe_customer_id) return user.stripe_customer_id;
+  const customer = await stripe.customers.create({ email: user.email, metadata: { userId: user.id.toString() } });
+  await updateUserStripeCustomerId(user.id, customer.id);
+  user.stripe_customer_id = customer.id;
+  return customer.id;
+}
+
+const checkoutReturnUrls = () => {
+  const base = process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com";
+  return { success_url: `${base}/checkout-success?session_id={CHECKOUT_SESSION_ID}`, cancel_url: `${base}/checkout-cancel` };
+};
+
+/**
+ * A Stripe Checkout session for Premium (`pre`) or PAYG. `replaces` is the subscription it takes over from:
+ * it's cancelled only after this checkout completes (webhook / verify-session), never up front, so backing
+ * out of checkout never leaves someone without their current plan.
+ */
+async function createPlanCheckout(user, plan, replaces = null) {
+  const customer = await ensureStripeCustomer(user);
+  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : process.env.STRIPE_PRICE_ID;
+  if (!price) throw Object.assign(new Error(`${plan === "payg" ? "PAYG" : "Premium"} price not configured`), { status: 503 });
+  const metadata = { userId: user.id.toString(), ...(replaces ? { replaces } : {}) };
+  return stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer,
+    client_reference_id: user.id.toString(),
+    line_items: [plan === "payg" ? { price } : { price, quantity: 1 }],
+    subscription_data: { metadata },
+    ...checkoutReturnUrls(),
+    allow_promotion_codes: true,
+    metadata,
+  });
+}
+
+/** After a switch completes: cancel the subscription the checkout replaced (if it isn't the new one). */
+async function cancelReplacedSubscription(session, newSubscriptionId) {
+  const replaces = session && session.metadata && session.metadata.replaces;
+  if (!replaces || replaces === newSubscriptionId) return;
+  try {
+    await cancelStripeSubscriptionWithFinalUsage(replaces);
+    console.log(`Canceled replaced sub ${replaces} (new ${newSubscriptionId})`);
+  } catch (e) {
+    console.error(`Failed to cancel replaced sub ${replaces}:`, e.message);
+  }
+}
+
+const sendBillingError = (res, label, err) => {
+  console.error(`${label} error:`, err);
+  if (err.status) return res.status(err.status).json({ error: err.message });
+  if (err.type && String(err.type).startsWith("Stripe")) return res.status(402).json({ error: err.message });
+  res.status(500).json({ error: "Internal server error" });
+};
+
+// Premium checkout for a free user. The extension (including versions already in the store) calls this path.
+app.get("/billing/upgrade-link", requireAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: "Payment system not configured" });
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.plan_status === "pre" || user.plan_status === "active") return res.status(400).json({ error: "You're already on Premium." });
+    // PAYG -> Premium is a switch: the PAYG subscription is cancelled once Premium checkout completes
+    const session = await createPlanCheckout(user, "pre", user.plan_status === "payg" ? user.subscription_id : null);
+    res.json({ url: session.url, checkoutUrl: session.url });
+  } catch (err) {
+    sendBillingError(res, "/billing/upgrade-link", err);
+  }
+});
+
 app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
   try {
     if (!stripe) {
@@ -2007,31 +2079,16 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
     }
 
     const user = await getUserById(req.userId);
-    if (!user || !user.stripe_customer_id) {
-      return res.status(400).json({ error: "Missing Stripe customer" });
-    }
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     if (["active", "pre", "payg"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: user.stripe_customer_id,
-      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-      subscription_data: {
-        metadata: { userId: user.id.toString() },
-      },
-      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
-      allow_promotion_codes: true,
-      metadata: { userId: user.id.toString() },
-    });
-
-    res.json({ checkoutUrl: session.url });
+    const session = await createPlanCheckout(user, "pre");
+    res.json({ checkoutUrl: session.url, url: session.url });
   } catch (err) {
-    console.error("Checkout session error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendBillingError(res, "Checkout session", err);
   }
 });
 
@@ -2136,6 +2193,8 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       }
     }
 
+    if (["active", "trialing"].includes(subscription.status)) await cancelReplacedSubscription(session, subscription.id);
+
     const updatedUser = await getUserById(req.userId);
 
     res.json({
@@ -2161,36 +2220,16 @@ app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) 
     }
 
     const user = await getUserById(req.userId);
-    if (!user || !user.stripe_customer_id) {
-      return res.status(400).json({ error: "Missing Stripe customer" });
-    }
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     if (["pre", "active", "payg"].includes(user.plan_status)) {
       return res.status(400).json({ error: "Already on a paid plan. Use switch-plan to change." });
     }
 
-    const paygPriceId = process.env.STRIPE_PAYG_PRICE_ID || (req.body && req.body.priceId);
-    if (!paygPriceId || typeof paygPriceId !== "string" || !paygPriceId.startsWith("price_")) {
-      return res.status(503).json({ error: "PAYG price not configured" });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: user.stripe_customer_id,
-      line_items: [{ price: paygPriceId }],
-      subscription_data: {
-        metadata: { userId: user.id.toString() },
-      },
-      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
-      allow_promotion_codes: true,
-      metadata: { userId: user.id.toString() },
-    });
-
-    res.json({ checkoutUrl: session.url });
+    const session = await createPlanCheckout(user, "payg");
+    res.json({ checkoutUrl: session.url, url: session.url });
   } catch (err) {
-    console.error("PAYG checkout session error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendBillingError(res, "PAYG checkout session", err);
   }
 });
 
@@ -2206,9 +2245,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
     }
 
     const user = await getUserById(req.userId);
-    if (!user || !user.stripe_customer_id) {
-      return res.status(400).json({ error: "Missing Stripe customer" });
-    }
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     if (user.plan_status === targetPlan) {
       return res.status(400).json({ error: `Already on ${targetPlan} plan` });
@@ -2218,49 +2255,17 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "No active subscription to switch from. Subscribe first." });
     }
 
-    const subscriptionId = user.subscription_id;
-    if (subscriptionId) {
-      try {
-        await cancelStripeSubscriptionWithFinalUsage(subscriptionId);
-      } catch (e) {
-        console.error("Failed to cancel old subscription during switch:", e.message);
-      }
-    } else {
+    // the current subscription keeps running until the new checkout completes (then the webhook cancels it)
+    let replaces = user.subscription_id;
+    if (!replaces) {
       const subRow = await getLatestSubscriptionForUser(req.userId);
-      if (subRow && subRow.stripe_subscription_id) {
-        try {
-          await cancelStripeSubscriptionWithFinalUsage(subRow.stripe_subscription_id);
-        } catch (e) {
-          console.error("Failed to cancel old subscription during switch:", e.message);
-        }
-      }
+      replaces = subRow && subRow.stripe_subscription_id ? subRow.stripe_subscription_id : null;
     }
+    const session = await createPlanCheckout(user, targetPlan, replaces);
 
-    const priceId = targetPlan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID : process.env.STRIPE_PRICE_ID;
-    const lineItems = targetPlan === "payg"
-      ? [{ price: priceId }]
-      : [{ price: priceId, quantity: 1 }];
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: user.stripe_customer_id,
-      line_items: lineItems,
-      subscription_data: {
-        metadata: { userId: user.id.toString() },
-      },
-      success_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.BACKEND_URL || "https://haribackend-mitj.onrender.com"}/checkout-cancel`,
-      allow_promotion_codes: true,
-      metadata: { userId: user.id.toString() },
-    });
-
-    res.json({ checkoutUrl: session.url });
+    res.json({ checkoutUrl: session.url, url: session.url });
   } catch (err) {
-    console.error("/billing/switch-plan error:", err);
-    if (err.type && err.type.startsWith("Stripe")) {
-      return res.status(402).json({ error: err.message });
-    }
-    res.status(500).json({ error: "Internal server error" });
+    sendBillingError(res, "/billing/switch-plan", err);
   }
 });
 
