@@ -75,6 +75,21 @@ class AudioCache {
   }
 }
 
+// Everyday Tagalog that Scribe should listen for first when a learner speaks (keyterm prompting).
+// Kept to 100 or fewer: past that ElevenLabs bills every clip as at least 20 seconds.
+const TAGALOG_KEYTERMS = [
+  "ako", "ikaw", "ka", "ko", "mo", "kita", "siya", "tayo", "kami", "kayo", "sila",
+  "na", "pa", "ba", "po", "opo", "oo", "hindi", "lang", "din", "rin", "naman", "talaga",
+  "kasi", "pero", "tapos", "sige", "ano", "bakit", "saan", "nasaan", "kailan", "sino", "paano",
+  "gusto", "ayaw", "kailangan", "puwede", "meron", "wala", "ngayon", "kanina", "bukas",
+  "kahapon", "mamaya", "gutom", "pagod", "busog", "inaantok", "masaya", "malungkot", "masarap",
+  "maganda", "mabuti", "okay lang", "kumain", "kakain", "uminom", "matulog", "umuwi", "uuwi",
+  "pumunta", "trabaho", "bahay", "pamilya", "kaibigan", "salamat", "salamat po", "walang anuman",
+  "kumusta", "kumusta ka", "kumain ka na ba", "gutom na ako", "pagod na ako", "busog na ako",
+  "mahal kita", "ingat ka", "tara na", "kain na tayo", "dito", "diyan", "doon", "grabe", "sobra",
+  "medyo", "ganun", "ganito", "alam ko", "hindi ko alam", "sige po", "oo naman", "Tagalog", "Taglish",
+];
+
 // ---------------------------------------------------------------------------
 // LLM (Azure OpenAI, same deployment the dictionary uses)
 // ---------------------------------------------------------------------------
@@ -110,24 +125,41 @@ function squashLetters(t) {
  * and punctuation fixed, plus at most a few single letters the transcriber dropped ("nako" ->
  * "na ako", "dyan" -> "diyan"). Two added letters in a row would be a new word ("na", "po"), so
  * that is rejected. Returns "" when nothing changed or the reading doesn't pass.
+ * Spoken messages are the transcriber's guess, which often writes Tagalog as English sound-alikes
+ * ("Good Tom nako" for "Gutom na ako"), so for those a close-sounding reading is accepted too.
  */
-function tidyTranscript(latest, cleaned) {
+function tidyTranscript(latest, cleaned, { spoken = false } = {}) {
   const text = String(cleaned || "").replace(/\s+/g, " ").trim();
   if (!text || text === String(latest).trim()) return "";
   const said = squashLetters(latest);
   const read = squashLetters(text);
   if (!said) return "";
+  if (keepsLetters(said, read)) return text;
+  if (!spoken) return "";
+  // only the words that changed are compared: "Good Tom nako" -> "Gutom na ako" sounds the same (0.64),
+  // "I want to practice my" -> "gusto kong magpractice ng" is a translation (0.41), an added "po" is 0
+  const a = normWords(latest).map(squashLetters);
+  const b = normWords(text).map(squashLetters);
+  while (a.length && b.length && a[0] === b[0]) { a.shift(); b.shift(); }
+  while (a.length && b.length && a[a.length - 1] === b[b.length - 1]) { a.pop(); b.pop(); }
+  const x = a.join("");
+  const y = b.join("");
+  if (!x || !y) return "";
+  return 1 - levenshtein(x, y) / Math.max(x.length, y.length) >= 0.55 ? text : "";
+}
+
+/** True when `read` is `said` with only a few single letters put back (see tidyTranscript). */
+function keepsLetters(said, read) {
   let i = 0;
   let added = 0;
   let lastAdded = -2;
   for (let j = 0; j < read.length; j++) {
     if (i < said.length && read[j] === said[i]) { i++; continue; }
-    if (lastAdded === j - 1) return "";
+    if (lastAdded === j - 1) return false;
     lastAdded = j;
     added++;
   }
-  if (i < said.length) return "";
-  return added <= Math.max(1, Math.floor(said.length / 8)) ? text : "";
+  return i === said.length && added <= Math.max(1, Math.floor(said.length / 8));
 }
 
 /** Drops corrections that don't quote the learner's latest message (the model sometimes repeats old ones). */
@@ -166,7 +198,8 @@ Use your full knowledge of how Tagalog works (enclitics and their order, like "n
 - ako, ka, ko, mo, kita, siya, na, pa, ba, po, lang, din, rin, naman are their own words. "nako" after another word ("Pagod nako") is "na ako"; it is the exclamation "Nako!" only when it is a reaction on its own.
 - Put back a letter the speaker clearly said but the transcriber dropped ("dyan" = "diyan").
 - Real words stay whole ("nakakapagod", "pinakamasarap", "kumain").
-- Do NOT fix grammar or word choice, and never add, drop or swap words: if they said it wrong, write it the wrong way they said it. English stays as it is.
+- Speech recognition often writes Tagalog as English words that sound the same: "Good Tom nako" = "Gutom na ako", "Mahal key ta" = "Mahal kita", "Salah mat po" = "Salamat po". When the English words make no sense in the conversation but a Tagalog phrase sounds the same, write the Tagalog. Never translate: English or Taglish that makes sense stays exactly as it is, even in a Tagalog lesson.
+- Do NOT fix grammar or word choice, and never add, drop or swap words: if they said it wrong, write it the wrong way they said it.
 Return JSON: { "words": string (their message with each word written properly), "understood": string (in English, what they meant) }`;
 
 /** Reads the learner's latest message as a native speaker would. Never throws: falls back to the raw text. */
@@ -177,7 +210,7 @@ async function readLearnerMessage(history, spoken) {
   const inChars = Math.ceil(LISTENER_SYSTEM.length / 4 + user.length);
   try {
     const { data, outChars } = await llmJson(LISTENER_SYSTEM, user, { maxTokens: 300, temperature: 0 });
-    return { text: tidyTranscript(latest, data.words), understood: clampStr(data.understood, 300), inChars, outChars };
+    return { text: tidyTranscript(latest, data.words, { spoken }), understood: clampStr(data.understood, 300), inChars, outChars };
   } catch (err) {
     console.error("[premium] tutor listener error:", err.response?.data || err.message);
     return { text: "", understood: "", inChars: 0, outChars: 0 };
@@ -954,16 +987,26 @@ function mountPremium(app, deps) {
       // and the Creator plan includes 100 hours a month. Azure stays as the backup.
       if (process.env.ELEVENLABS_API_KEY) {
         try {
-          const form = new FormData();
-          form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
-          if (lang !== "auto") form.append("language_code", lang === "en-US" ? "en" : "fil");
-          form.append("tag_audio_events", "false");
-          form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
-          const r = await fetch(`${ELEVEN_API}/v1/speech-to-text`, {
-            method: "POST",
-            headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
-            body: form,
-          });
+          const scribe = (withTerms) => {
+            const form = new FormData();
+            form.append("model_id", process.env.ELEVENLABS_STT_MODEL || "scribe_v2");
+            if (lang !== "auto") form.append("language_code", lang === "en-US" ? "en" : "fil");
+            // Tagalog first, English second: bias toward everyday Tagalog unless the learner chose English
+            if (withTerms) for (const term of TAGALOG_KEYTERMS) form.append("keyterms", term);
+            form.append("tag_audio_events", "false");
+            form.append("file", new Blob([audio], { type: "audio/wav" }), "speech.wav");
+            return fetch(`${ELEVEN_API}/v1/speech-to-text`, {
+              method: "POST",
+              headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
+              body: form,
+            });
+          };
+          let r = await scribe(lang !== "en-US");
+          // if Scribe ever rejects the keyterm list, plain Scribe still beats falling back to Azure
+          if (!r.ok && lang !== "en-US" && (r.status === 400 || r.status === 422)) {
+            console.error("[premium-stt] Scribe rejected keyterms, retrying without:", (await r.text()).slice(0, 300));
+            r = await scribe(false);
+          }
           if (!r.ok) {
             const detail = await r.text();
             throw new Error(`scribe_${r.status}: ${detail.slice(0, 300)}${elevenHint(r.status, detail)}`);
