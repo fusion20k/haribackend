@@ -99,6 +99,11 @@ function normWords(t) {
   return String(t || "").toLowerCase().replace(/[^\p{L}\p{N}\s'-]/gu, " ").split(/\s+/).filter(Boolean);
 }
 
+/** Letters only, lowercase, without accents: "Pagodako" and "pagod ako" come out the same. */
+function squashLetters(t) {
+  return String(t || "").normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
 /** Drops corrections that don't quote the learner's latest message (the model sometimes repeats old ones). */
 function correctionsFor(latest, list) {
   if (!Array.isArray(list)) return [];
@@ -111,7 +116,7 @@ function correctionsFor(latest, list) {
       const hits = words.filter((w) => said.has(w)).length;
       return hits / words.length >= 0.6;
     })
-    .filter((c) => normWords(c.original).join(" ") !== normWords(c.corrected).join(" "))
+    .filter((c) => squashLetters(c.original) !== squashLetters(c.corrected))
     .slice(0, 5)
     .map((c) => ({ original: String(c.original), corrected: String(c.corrected), explanation: String(c.explanation || "") }));
 }
@@ -124,6 +129,36 @@ const TAGALOG_EXPERT =
   "When describing natural phrasing, say \"a native speaker\" or \"natives\", never \"a Filipino\" or \"Filipinos\" " +
   "(for example \"here is how a native speaker would say it\"). " +
   "Respond with valid JSON only, matching the requested shape exactly.";
+
+/** System prompt for Thea, the AI tutor (exported so it can be tried against the model offline). */
+function tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken }) {
+  return `${TAGALOG_EXPERT}
+
+You are Thea, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
+${mode === "roleplay"
+    ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic.`
+    : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
+Talk the way people do out loud: usually one to three short sentences per reply, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
+Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
+Match your Tagalog to this level: ${levelGuide(level)}
+${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
+${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
+How to read the learner's latest message: it often comes from speech recognition or quick typing.${spoken ? " This one was spoken and written down by speech recognition, so its spelling and spacing are the transcriber's, not the learner's." : ""} Words run together ("pagodako" = "pagod ako", "gutomna" = "gutom na"), missing spaces, hyphens or accent marks, capital letters and punctuation are NOT mistakes: read them as the words the learner meant and never correct them. First work out what they meant and write it in "understood", then reply to that.
+Only correct real Tagalog mistakes: a wrong word, wrong verb form or tense, a wrong marker (ng/nang/sa/ang), or word order a native speaker wouldn't use. Odd or funny content is not a mistake. A correction must keep the learner's meaning: the same person (ako stays ako and never becomes ka), the same tense unless the tense was the mistake, and words like na, pa, ba and po stay unless they are the mistake. If you are not sure, don't correct.
+Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
+If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a native speaker would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
+
+Return JSON:
+{
+  "reply": string (your next line, in Tagalog/Taglish appropriate to their level),
+  "replyEnglish": string (English translation of reply),
+  "understood": string (in English, what the learner meant by their latest message),
+  "corrections": [{ "original": string (exact words from the latest message), "corrected": string, "explanation": string (short, English) }],
+  "tagalogVersion": { "tagalog": string, "note": string (short English note on a key word or pattern, or "") } (or { "tagalog": "", "note": "" } if the message was Tagalog),
+  "tip": string (optional one-sentence grammar or culture tip in English, or ""),
+  "suggestedReplies": [string] (2-3 short Tagalog things the learner could say next)
+}`;
+}
 
 // ---------------------------------------------------------------------------
 // Voice providers. PREMIUM_TTS_PROVIDER picks the first choice (azure | elevenlabs | google);
@@ -929,30 +964,11 @@ function mountPremium(app, deps) {
       return { role: m.role === "assistant" ? "assistant" : "user", content };
     });
     if (!history.length || history[history.length - 1].role !== "user") throw new Error("messages must end with a user turn");
+    // the extension marks messages it got from the microphone
+    const sent = Array.isArray(req.body.messages) ? req.body.messages : [];
+    const spoken = sent.length > 0 && sent[sent.length - 1]?.spoken === true;
 
-    const system = `${TAGALOG_EXPERT}
-
-You are Thea, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
-${mode === "roleplay"
-    ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic.`
-    : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
-Talk the way people do out loud: usually one to three short sentences per reply, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
-Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
-Match your Tagalog to this level: ${levelGuide(level)}
-${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
-${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
-Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
-If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a native speaker would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
-
-Return JSON:
-{
-  "reply": string (your next line, in Tagalog/Taglish appropriate to their level),
-  "replyEnglish": string (English translation of reply),
-  "corrections": [{ "original": string (exact words from the latest message), "corrected": string, "explanation": string (short, English) }],
-  "tagalogVersion": { "tagalog": string, "note": string (short English note on a key word or pattern, or "") } (or { "tagalog": "", "note": "" } if the message was Tagalog),
-  "tip": string (optional one-sentence grammar or culture tip in English, or ""),
-  "suggestedReplies": [string] (2-3 short Tagalog things the learner could say next)
-}`;
+    const system = tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken });
     const inChars = system.length / 4 + history.reduce((n, m) => n + m.content.length, 0);
     return {
       system, user: null, history, maxTokens: 700, temperature: 0.8, inChars: Math.ceil(inChars),
@@ -1314,4 +1330,4 @@ Return JSON:
 
 }
 
-module.exports = { mountPremium, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
+module.exports = { mountPremium, tutorSystem, correctionsFor, llmJson, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
