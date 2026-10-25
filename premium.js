@@ -217,33 +217,50 @@ async function readLearnerMessage(history, spoken) {
   }
 }
 
+/**
+ * Thea's reaction followed by her one follow-up question. Any question already in the reaction is
+ * dropped first, so the learner never gets two questions in a row.
+ */
+function withQuestion(reply, question) {
+  const q = String(question || "").trim();
+  let a = String(reply || "").trim();
+  if (!q) return a;
+  a = (a.match(/[^.!?]+[.!?]*/g) || []).filter((part) => !part.trim().endsWith("?")).join("").trim();
+  return a ? `${a} ${q}` : q;
+}
+
 /** System prompt for Thea, the AI tutor (exported so it can be tried against the model offline). */
 function tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken, understood }) {
   return `${TAGALOG_EXPERT}
 
 You are Thea, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
 ${mode === "roleplay"
-    ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic.`
-    : "Have a natural conversation that helps them practice. Ask one follow-up question each turn to keep them talking."}
-Talk the way people do out loud: usually one to three short sentences per reply, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
+    ? `You are role-playing this situation with them: "${scenario || "ordering food at a carinderia"}". Stay in character as the other person in the scene, keep the scene moving, and keep your lines short and realistic. Your "question" is what that person would naturally ask next in the scene.`
+    : "Have a natural conversation that helps them practice."}
+You lead the conversation. The learner is still learning and won't keep it going on their own, so every turn: react briefly to what they said (or answer their question), then ask exactly ONE follow-up question in "question". Never end a turn without one, and keep questions out of "reply".
+Good questions: build on what they just said or move to a nearby everyday topic (their day, food, family, work or school, plans, likes, weekend); are easy to answer at their level in a few words; and don't repeat a question you already asked. If they didn't really answer (just "Oo", "Hindi ko alam"), don't ask the same thing again: ask it more simply with two choices, or move to a new easy question. For a beginner, make it a yes/no question or give two choices ("Kape o tsaa?"), so they can answer with words from your own sentence.
+Talk the way people do out loud: the reaction is one or two short sentences, so it is easy to listen to and reply to. Go longer only when the learner asks you to explain something.
 Language mix: beginner = mostly simple Tagalog with English support; intermediate = mostly Tagalog with light Taglish; advanced = natural Tagalog/Taglish like a Manila local.
 Match your Tagalog to this level: ${levelGuide(level)}
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
 How to read the learner's latest message: it often comes from speech recognition or quick typing.${spoken ? " This one was spoken and written down by speech recognition, so its spelling and spacing are the transcriber's, not the learner's." : ""} Words run together ("pagodako" = "pagod ako", "gutomna" = "gutom na"), missing spaces, hyphens or accent marks, capital letters and punctuation are NOT mistakes: read them as the words the learner meant and never correct them. ${understood ? `A native speaker read their latest message as meaning: "${understood}". ` : ""}First work out what they meant and write it in "understood", then reply to that.
-Only correct real Tagalog mistakes: a wrong word, wrong verb form or tense, a wrong marker (ng/nang/sa/ang), or word order a native speaker wouldn't use. Odd or funny content is not a mistake. A correction must keep the learner's meaning: the same person (ako stays ako and never becomes ka), the same tense unless the tense was the mistake, and words like na, pa, ba and po stay unless they are the mistake. If you are not sure, don't correct.
+Only correct real Tagalog mistakes: a wrong word, a verb whose aspect doesn't match the time (completed "kumain" with "bukas" should be "kakain"), a wrong marker (ng/nang/sa/ang), or word order a native speaker wouldn't use. Odd or funny content is not a mistake. A correction must keep the learner's meaning: the same person (ako stays ako and never becomes ka), the same tense unless the tense was the mistake, and words like na, pa, ba and po stay unless they are the mistake. If you are not sure, don't correct.
 Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
 If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a native speaker would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
 
+Check their latest message before you write your reply, and fill the JSON in this order.
 Return JSON:
 {
-  "reply": string (your next line, in Tagalog/Taglish appropriate to their level),
-  "replyEnglish": string (English translation of reply),
   "understood": string (in English, what the learner meant by their latest message),
   "corrections": [{ "original": string (exact words from the latest message), "corrected": string, "explanation": string (short, English) }],
+  "reply": string (your short reaction, in Tagalog/Taglish appropriate to their level, without the follow-up question),
+  "replyEnglish": string (English translation of reply),
+  "question": string (your one follow-up question, in Tagalog/Taglish at their level, ending with "?"),
+  "questionEnglish": string (English translation of question),
   "tagalogVersion": { "tagalog": string, "note": string (short English note on a key word or pattern, or "") } (or { "tagalog": "", "note": "" } if the message was Tagalog),
   "tip": string (optional one-sentence grammar or culture tip in English, or ""),
-  "suggestedReplies": [string] (2-3 short Tagalog things the learner could say next)
+  "suggestedReplies": [string] (2-3 short, different Tagalog answers the learner could give to your question)
 }`;
 }
 
@@ -1082,8 +1099,9 @@ function mountPremium(app, deps) {
         return heard;
       },
       clean: (d) => ({
-        reply: String(d.reply || ""),
-        replyEnglish: String(d.replyEnglish || ""),
+        // the follow-up question comes back separately so it can't be left out; the extension shows one line
+        reply: withQuestion(d.reply, d.question),
+        replyEnglish: withQuestion(d.replyEnglish, d.questionEnglish),
         cleanText,
         // corrections may quote either the words as sent or the tidied ones
         corrections: correctionsFor(`${raw} ${cleanText}`, d.corrections),
@@ -1442,4 +1460,4 @@ Return JSON:
 
 }
 
-module.exports = { mountPremium, tutorSystem, readLearnerMessage, correctionsFor, tidyTranscript, llmJson, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
+module.exports = { mountPremium, tutorSystem, withQuestion, readLearnerMessage, correctionsFor, tidyTranscript, llmJson, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
