@@ -104,6 +104,32 @@ function squashLetters(t) {
   return String(t || "").normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
+/**
+ * Accepts a native speaker's reading of the learner's message only when it keeps what they said:
+ * the same letters in the same order, with words split or joined and spacing, accents, capitals
+ * and punctuation fixed, plus at most a few single letters the transcriber dropped ("nako" ->
+ * "na ako", "dyan" -> "diyan"). Two added letters in a row would be a new word ("na", "po"), so
+ * that is rejected. Returns "" when nothing changed or the reading doesn't pass.
+ */
+function tidyTranscript(latest, cleaned) {
+  const text = String(cleaned || "").replace(/\s+/g, " ").trim();
+  if (!text || text === String(latest).trim()) return "";
+  const said = squashLetters(latest);
+  const read = squashLetters(text);
+  if (!said) return "";
+  let i = 0;
+  let added = 0;
+  let lastAdded = -2;
+  for (let j = 0; j < read.length; j++) {
+    if (i < said.length && read[j] === said[i]) { i++; continue; }
+    if (lastAdded === j - 1) return "";
+    lastAdded = j;
+    added++;
+  }
+  if (i < said.length) return "";
+  return added <= Math.max(1, Math.floor(said.length / 8)) ? text : "";
+}
+
 /** Drops corrections that don't quote the learner's latest message (the model sometimes repeats old ones). */
 function correctionsFor(latest, list) {
   if (!Array.isArray(list)) return [];
@@ -130,8 +156,36 @@ const TAGALOG_EXPERT =
   "(for example \"here is how a native speaker would say it\"). " +
   "Respond with valid JSON only, matching the requested shape exactly.";
 
+// Before Thea answers, a native speaker "hears" the learner's message: speech recognition and quick
+// typing run words together ("pagodako", "nako"), and Thea should answer what was actually said.
+const LISTENER_SYSTEM = `${TAGALOG_EXPERT}
+
+You read a Tagalog learner's chat message the way a native speaker hears it, so their tutor answers exactly what they said. The message is often written down by speech recognition or typed quickly: words can be run together or split in the wrong place, letters the speaker said can be missing, and accents, capitals and punctuation are unreliable.
+Use your full knowledge of how Tagalog works (enclitics and their order, like "na ako", "ka na ba", "ko na", "mo pa", "na rin"; contractions; affixes; Taglish) and the conversation so far to decide exactly which words they said:
+- Split words that are run together: "pagodako" = "pagod ako", "gutomnaako" = "gutom na ako", "mahalkita" = "mahal kita", "kumustakana" = "kumusta ka na".
+- ako, ka, ko, mo, kita, siya, na, pa, ba, po, lang, din, rin, naman are their own words. "nako" after another word ("Pagod nako") is "na ako"; it is the exclamation "Nako!" only when it is a reaction on its own.
+- Put back a letter the speaker clearly said but the transcriber dropped ("dyan" = "diyan").
+- Real words stay whole ("nakakapagod", "pinakamasarap", "kumain").
+- Do NOT fix grammar or word choice, and never add, drop or swap words: if they said it wrong, write it the wrong way they said it. English stays as it is.
+Return JSON: { "words": string (their message with each word written properly), "understood": string (in English, what they meant) }`;
+
+/** Reads the learner's latest message as a native speaker would. Never throws: falls back to the raw text. */
+async function readLearnerMessage(history, spoken) {
+  const latest = history[history.length - 1].content;
+  const before = history.slice(-5, -1).map((m) => `${m.role === "assistant" ? "Tutor" : "Learner"}: ${m.content}`).join("\n");
+  const user = `${before ? `Conversation so far:\n${before}\n\n` : ""}Latest learner message${spoken ? " (spoken, written down by speech recognition)" : ""}:\n${latest}`;
+  const inChars = Math.ceil(LISTENER_SYSTEM.length / 4 + user.length);
+  try {
+    const { data, outChars } = await llmJson(LISTENER_SYSTEM, user, { maxTokens: 300, temperature: 0 });
+    return { text: tidyTranscript(latest, data.words), understood: clampStr(data.understood, 300), inChars, outChars };
+  } catch (err) {
+    console.error("[premium] tutor listener error:", err.response?.data || err.message);
+    return { text: "", understood: "", inChars: 0, outChars: 0 };
+  }
+}
+
 /** System prompt for Thea, the AI tutor (exported so it can be tried against the model offline). */
-function tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken }) {
+function tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken, understood }) {
   return `${TAGALOG_EXPERT}
 
 You are Thea, Hari's warm, encouraging Tagalog tutor. The learner is ${level}.
@@ -143,7 +197,7 @@ Language mix: beginner = mostly simple Tagalog with English support; intermediat
 Match your Tagalog to this level: ${levelGuide(level)}
 ${savedWords.length ? `Naturally reuse some of the learner's saved words when it fits: ${savedWords.join(", ")}.` : ""}
 ${mistakes.length ? `They have recently struggled with: ${mistakes.join("; ")}. Gently create chances to practice these.` : ""}
-How to read the learner's latest message: it often comes from speech recognition or quick typing.${spoken ? " This one was spoken and written down by speech recognition, so its spelling and spacing are the transcriber's, not the learner's." : ""} Words run together ("pagodako" = "pagod ako", "gutomna" = "gutom na"), missing spaces, hyphens or accent marks, capital letters and punctuation are NOT mistakes: read them as the words the learner meant and never correct them. First work out what they meant and write it in "understood", then reply to that.
+How to read the learner's latest message: it often comes from speech recognition or quick typing.${spoken ? " This one was spoken and written down by speech recognition, so its spelling and spacing are the transcriber's, not the learner's." : ""} Words run together ("pagodako" = "pagod ako", "gutomna" = "gutom na"), missing spaces, hyphens or accent marks, capital letters and punctuation are NOT mistakes: read them as the words the learner meant and never correct them. ${understood ? `A native speaker read their latest message as meaning: "${understood}". ` : ""}First work out what they meant and write it in "understood", then reply to that.
 Only correct real Tagalog mistakes: a wrong word, wrong verb form or tense, a wrong marker (ng/nang/sa/ang), or word order a native speaker wouldn't use. Odd or funny content is not a mistake. A correction must keep the learner's meaning: the same person (ako stays ako and never becomes ka), the same tense unless the tense was the mistake, and words like na, pa, ba and po stay unless they are the mistake. If you are not sure, don't correct.
 Corrections are ONLY about the learner's latest message. Each "original" must quote words that actually appear in that latest message. Never repeat corrections from earlier turns, and never correct English. If the latest message has no Tagalog mistakes, return an empty corrections list.
 If the learner's latest message is mostly English (for example they didn't know how to say it in Tagalog), fill "tagalogVersion" with how a native speaker would naturally say that same message in Tagalog/Taglish at their level, so they learn to say it themselves next time. Otherwise leave it empty.
@@ -794,10 +848,12 @@ function mountPremium(app, deps) {
       }
       try {
         if (!(await reserveChars(req, res, spec.inChars))) return;
+        // optional first step that adjusts the spec (Thea reads the learner's message before answering)
+        const pre = spec.prepare ? await spec.prepare() : { inChars: 0, outChars: 0 };
         const { data, outChars } = await llmJson(spec.system, spec.user, {
           maxTokens: spec.maxTokens, temperature: spec.temperature, history: spec.history,
         });
-        await settleChars(req, spec.inChars, outChars, kind);
+        await settleChars(req, spec.inChars, outChars + pre.inChars + pre.outChars, kind);
         logTranslationUsage(req.userId, [kind], [false], kind, "en", "tl", "llm");
         res.json(spec.clean ? spec.clean(data) : data);
       } catch (err) {
@@ -968,14 +1024,26 @@ function mountPremium(app, deps) {
     const sent = Array.isArray(req.body.messages) ? req.body.messages : [];
     const spoken = sent.length > 0 && sent[sent.length - 1]?.spoken === true;
 
+    const raw = history[history.length - 1].content;
     const system = tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken });
     const inChars = system.length / 4 + history.reduce((n, m) => n + m.content.length, 0);
-    return {
+    let cleanText = "";
+    const spec = {
       system, user: null, history, maxTokens: 700, temperature: 0.8, inChars: Math.ceil(inChars),
+      // a native speaker reads the message first; Thea then answers the words as they were meant
+      prepare: async () => {
+        const heard = await readLearnerMessage(history, spoken);
+        cleanText = heard.text;
+        if (cleanText) history[history.length - 1] = { role: "user", content: cleanText };
+        spec.system = tutorSystem({ level, mode, scenario, savedWords, mistakes, spoken, understood: heard.understood });
+        return heard;
+      },
       clean: (d) => ({
         reply: String(d.reply || ""),
         replyEnglish: String(d.replyEnglish || ""),
-        corrections: correctionsFor(history[history.length - 1].content, d.corrections),
+        cleanText,
+        // corrections may quote either the words as sent or the tidied ones
+        corrections: correctionsFor(`${raw} ${cleanText}`, d.corrections),
         // the model is asked for { tagalog, note } but sometimes answers with just the string
         tagalogVersion: typeof d.tagalogVersion === "string" && d.tagalogVersion.trim()
           ? { tagalog: d.tagalogVersion.trim(), note: "" }
@@ -986,6 +1054,7 @@ function mountPremium(app, deps) {
         suggestedReplies: Array.isArray(d.suggestedReplies) ? d.suggestedReplies.slice(0, 3).map(String) : [],
       }),
     };
+    return spec;
   }));
 
   // --- 4. Practice: generate Sentence Builder / Listening exercises -------------------------
@@ -1330,4 +1399,4 @@ Return JSON:
 
 }
 
-module.exports = { mountPremium, tutorSystem, correctionsFor, llmJson, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
+module.exports = { mountPremium, tutorSystem, readLearnerMessage, correctionsFor, tidyTranscript, llmJson, synthesize, TTS_PROVIDERS, PREMIUM_PLANS, PREMIUM_VOICES, scoreFromTranscript, scoreFromAzure, parseFeed, isTagalogText };
