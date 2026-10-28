@@ -333,7 +333,7 @@ async function azureDictionaryLookup(words, sourceLang, targetLang) {
   );
 }
 
-async function llmDictionary(word, english, context) {
+async function llmDictionary(word, english, context, phrase = null) {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_KEY;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
@@ -347,7 +347,7 @@ async function llmDictionary(word, english, context) {
         },
         {
           role: "user",
-          content: `Given the Tagalog word "${word}" (English: "${english}", context: "${context}"), provide a dictionary entry as JSON with exactly these fields:\n{\n  "tagalog": string,\n  "pronunciation": string (syllable-broken, e.g. "ma-gan-da"),\n  "partOfSpeech": string (in English, e.g. "noun", "verb", "adjective"),\n  "englishTranslation": string (in English),\n  "example": { "tl": string (Tagalog sentence), "en": string (English translation) },\n  "culturalNotes": string (in English),\n  "wordBreakdown": [{ "tagalog": string, "english": string (in English), "pos": string (in English, e.g. "noun", "verb", "particle") }]\n}`,
+          content: `${phrase ? `The Tagalog word "${word}" is one word of the Tagalog phrase "${phrase.tl}"${phrase.en ? ` (English: "${phrase.en}")` : ""}, context: "${context}". Explain only this single word as it is used there (its own meaning, not the whole phrase), and give` : `Given the Tagalog word "${word}" (English: "${english}", context: "${context}"), provide`} a dictionary entry as JSON with exactly these fields:\n{\n  "tagalog": string,\n  "pronunciation": string (syllable-broken, e.g. "ma-gan-da"),\n  "partOfSpeech": string (in English, e.g. "noun", "verb", "adjective"),\n  "englishTranslation": string (in English),\n  "example": { "tl": string (Tagalog sentence), "en": string (English translation) },\n  "culturalNotes": string (in English),\n  "wordBreakdown": [{ "tagalog": string, "english": string (in English), "pos": string (in English, e.g. "noun", "verb", "particle") }]\n}`,
         },
       ],
       response_format: { type: "json_object" },
@@ -2948,15 +2948,21 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       return res.status(402).json({ error: "no_access" });
     }
 
-    const { word, english, context } = req.body;
+    const { word, context } = req.body;
+    const english = typeof req.body.english === "string" ? req.body.english : "";
+    // a single word picked out of a translated phrase or sentence (learning mode), explained in that phrase
+    const rawPhrase = req.body.phrase && typeof req.body.phrase === "object" ? req.body.phrase : null;
+    const phrase = rawPhrase && typeof rawPhrase.tl === "string" && rawPhrase.tl.trim()
+      ? { tl: rawPhrase.tl.trim().slice(0, 600), en: typeof rawPhrase.en === "string" ? rawPhrase.en.trim().slice(0, 600) : "" }
+      : null;
 
-    if (!word || typeof word !== "string" || word.trim() === "" ||
-        !english || typeof english !== "string" || english.trim() === "") {
+    if (!word || typeof word !== "string" || word.trim() === "" || (english.trim() === "" && !phrase)) {
       return res.status(400).json({ error: "word and english are required" });
     }
 
     const contextStr = typeof context === "string" ? context : "";
-    const totalChars = word.trim().length + english.trim().length + contextStr.trim().length;
+    const totalChars = word.trim().length + english.trim().length + contextStr.trim().length +
+      (phrase ? phrase.tl.length + phrase.en.length : 0);
 
     const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
     const usageRow = await getUsage();
@@ -2997,7 +3003,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
 
     let entry;
     try {
-      entry = await llmDictionary(word.trim(), english.trim(), contextStr.trim());
+      entry = await llmDictionary(word.trim(), english.trim(), contextStr.trim(), phrase);
     } catch (llmErr) {
       console.error("[dictionary] LLM error:", llmErr.message);
       return res.status(500).json({ error: "dictionary_unavailable" });
