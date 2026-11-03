@@ -2058,12 +2058,16 @@ app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
   }
 });
 
-// Premium is $19.99/month. The price is found by checking Stripe for the one that actually costs $19.99, so a
-// stale STRIPE_PRICE_ID (the old $7.49 price) can't sneak back into checkout. Order: an explicit
-// STRIPE_PREMIUM_PRICE_ID, the $19.99 Payment Link's price, the configured Payment Link's price, STRIPE_PRICE_ID.
-const PREMIUM_AMOUNT_CENTS = 1999;
+// Premium is $7.99/month. The price is found by checking Stripe for the one that actually costs $7.99, so a
+// stale price can't sneak back into checkout. Order: an explicit STRIPE_PREMIUM_PRICE_ID, the Payment Links'
+// prices, STRIPE_PRICE_ID, then any active $7.99 monthly price in the account. Until a $7.99 price exists,
+// checkout keeps working on the previous $19.99 one (re-checked every 10 minutes), so deploying this before
+// creating the price in Stripe breaks nothing.
+const PREMIUM_AMOUNT_CENTS = 799;
+const PREVIOUS_PREMIUM_CENTS = 1999;
 const PREMIUM_PAYMENT_LINK = "https://buy.stripe.com/dRmdR907Dd7z8fR6u5ejK02";
 let premiumPriceCache = null;
+let previousPriceUntil = 0;
 
 async function paymentLinkPrice(url) {
   if (!url) return null;
@@ -2078,29 +2082,51 @@ async function paymentLinkPrice(url) {
 }
 
 async function premiumPriceId() {
-  if (premiumPriceCache) return premiumPriceCache;
+  if (premiumPriceCache && (premiumPriceCache.amount === PREMIUM_AMOUNT_CENTS || Date.now() < previousPriceUntil)) return premiumPriceCache.id;
   const candidates = [
     async () => process.env.STRIPE_PREMIUM_PRICE_ID,
     () => paymentLinkPrice(PREMIUM_PAYMENT_LINK),
     () => paymentLinkPrice(process.env.STRIPE_PAYMENT_LINK_URL),
     async () => process.env.STRIPE_PRICE_ID,
   ];
+  const found = {};
   for (const get of candidates) {
     try {
       const id = await get();
       if (!id) continue;
       const price = await stripe.prices.retrieve(id);
-      if (price.active && price.unit_amount === PREMIUM_AMOUNT_CENTS) {
-        premiumPriceCache = id;
-        console.log(`[billing] Premium price: ${id} ($${(price.unit_amount / 100).toFixed(2)}/${price.recurring?.interval || "once"})`);
-        return id;
+      if (price.active && [PREMIUM_AMOUNT_CENTS, PREVIOUS_PREMIUM_CENTS].includes(price.unit_amount)) {
+        found[price.unit_amount] = found[price.unit_amount] || price;
+      } else {
+        console.warn(`[billing] skipping price ${id}: ${price.unit_amount} cents, active=${price.active}`);
       }
-      console.warn(`[billing] skipping price ${id}: ${price.unit_amount} cents, active=${price.active}`);
     } catch (e) {
       console.warn("[billing] price lookup failed:", e.message);
     }
   }
-  throw Object.assign(new Error("Premium price ($19.99) not found in Stripe"), { status: 503 });
+  // a $7.99 monthly price made in the dashboard is picked up without setting anything
+  if (!found[PREMIUM_AMOUNT_CENTS]) {
+    try {
+      for await (const price of stripe.prices.list({ active: true, type: "recurring", limit: 100 })) {
+        if (price.unit_amount === PREMIUM_AMOUNT_CENTS && price.currency === "usd" && price.recurring?.interval === "month") {
+          found[PREMIUM_AMOUNT_CENTS] = price;
+          break;
+        }
+      }
+    } catch (e) {
+      console.warn("[billing] price search failed:", e.message);
+    }
+  }
+  const price = found[PREMIUM_AMOUNT_CENTS] || found[PREVIOUS_PREMIUM_CENTS];
+  if (!price) throw Object.assign(new Error("Premium price ($7.99) not found in Stripe"), { status: 503 });
+  premiumPriceCache = { id: price.id, amount: price.unit_amount };
+  if (price.unit_amount !== PREMIUM_AMOUNT_CENTS) {
+    previousPriceUntil = Date.now() + 10 * 60 * 1000;
+    console.warn(`[billing] no $7.99 price in Stripe yet; Premium checkout uses the previous price ${price.id} ($${(price.unit_amount / 100).toFixed(2)})`);
+  } else {
+    console.log(`[billing] Premium price: ${price.id} ($${(price.unit_amount / 100).toFixed(2)}/${price.recurring?.interval || "once"})`);
+  }
+  return price.id;
 }
 
 // Every checkout needs a Stripe customer; older accounts (and some sign-in paths) never got one.
@@ -2173,7 +2199,7 @@ async function handleUpgradeLink(req, res) {
   }
 }
 app.get("/billing/upgrade-link", requireAuth, handleUpgradeLink);
-app.get("/api/billing/upgrade-link", requireAuth, handleUpgradeLink); // older path, same $19.99 checkout
+app.get("/api/billing/upgrade-link", requireAuth, handleUpgradeLink); // older path, same Premium checkout
 
 app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
   try {

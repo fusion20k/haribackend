@@ -768,6 +768,44 @@ function mountPremium(app, deps) {
       .catch((err) => console.error("[premium-tts] cache table:", err.message));
   }
 
+  // Premium's natural voice (Aisyah, ElevenLabs) is the one costly part of the plan, so Premium gets a
+  // monthly allowance of freshly made voice: PREMIUM_VOICE_CHARS characters (default 40,000, about 40
+  // minutes of Thea talking). Clips already in the caches don't count. Past it, Premium speaks with
+  // Azure's Filipino voice until the 1st of next month. Pay As You Go pays per use and admins are exempt.
+  const VOICE_ALLOWANCE = parseInt(process.env.PREMIUM_VOICE_CHARS) || 40000;
+  let voiceUsageReady = false;
+  if (pool) {
+    pool.query(`CREATE TABLE IF NOT EXISTS premium_voice_usage (
+        user_id INTEGER NOT NULL,
+        month TEXT NOT NULL,
+        chars INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, month)
+      )`)
+      .then(() => { voiceUsageReady = true; })
+      .catch((err) => console.error("[premium-tts] voice usage table:", err.message));
+  }
+  const voiceMonth = () => new Date().toISOString().slice(0, 7);
+
+  async function voiceAllowanceLeft(userId) {
+    if (!voiceUsageReady) return VOICE_ALLOWANCE;
+    try {
+      const r = await pool.query("SELECT chars FROM premium_voice_usage WHERE user_id = $1 AND month = $2", [userId, voiceMonth()]);
+      return VOICE_ALLOWANCE - (r.rowCount ? r.rows[0].chars : 0);
+    } catch (err) {
+      console.error("[premium-tts] voice usage read:", err.message);
+      return VOICE_ALLOWANCE; // never take the voice away because of a database hiccup
+    }
+  }
+
+  function noteVoiceUse(userId, chars) {
+    if (!voiceUsageReady) return;
+    pool.query(
+      `INSERT INTO premium_voice_usage (user_id, month, chars) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, month) DO UPDATE SET chars = premium_voice_usage.chars + EXCLUDED.chars`,
+      [userId, voiceMonth(), chars],
+    ).catch((err) => console.error("[premium-tts] voice usage write:", err.message));
+  }
+
   async function dbCacheGet(key) {
     if (!dbCacheReady) return null;
     try {
@@ -943,28 +981,43 @@ function mountPremium(app, deps) {
     const gender = picked ? picked.gender : (req.body.gender === "male" ? "male" : "female");
     // Admins can still force a provider for side-by-side voice evaluation.
     const adminForced = req.premiumUser.plan_status === "active" && TTS_PROVIDERS[req.body.provider] ? req.body.provider : null;
-    const forced = adminForced || (picked ? picked.provider : null);
-    const intended = forced || defaultTtsProvider();
+    let forced = adminForced || (picked ? picked.provider : null);
+    let intended = forced || defaultTtsProvider();
 
     // The key names the voice actually wanted, so audio from a temporary fallback is never
     // stored under it. ElevenLabs uses one voice for everyone, so gender doesn't split its cache.
-    const voiceKey = choice || (intended === "elevenlabs" ? "aisyah" : `${intended}:${gender}`);
-    const cacheKey = crypto.createHash("sha1").update(["v2", voiceKey, style, rate, text].join("|")).digest("hex");
+    const keyFor = (voiceKey) => crypto.createHash("sha1").update(["v2", voiceKey, style, rate, text].join("|")).digest("hex");
+    let cacheKey = keyFor(choice || (intended === "elevenlabs" ? "aisyah" : `${intended}:${gender}`));
+    let voiceCapped = false;
     const send = (audio, provider) => {
       res.set("Content-Type", "audio/mpeg");
       res.set("X-Hari-Voice", provider);
+      if (voiceCapped) res.set("X-Hari-Voice-Limit", "reached");
       res.send(audio);
     };
-    const memHit = audioCache.get(cacheKey);
-    if (memHit) {
+    const cached = async (key) => {
+      const memHit = audioCache.get(key);
+      if (memHit) return memHit;
+      const dbHit = text.length <= DB_CACHE_MAX_TEXT ? await dbCacheGet(key) : null;
+      if (dbHit) audioCache.set(key, dbHit);
+      return dbHit;
+    };
+    const hit = await cached(cacheKey);
+    if (hit) {
       await billCachedPayg(req, text.length, "tts-cached");
-      return send(memHit.audio, memHit.provider);
+      return send(hit.audio, hit.provider);
     }
-    const dbHit = text.length <= DB_CACHE_MAX_TEXT ? await dbCacheGet(cacheKey) : null;
-    if (dbHit) {
-      audioCache.set(cacheKey, dbHit);
-      await billCachedPayg(req, text.length, "tts-cached");
-      return send(dbHit.audio, dbHit.provider);
+
+    // Premium past its monthly natural-voice allowance: anything already cached above still plays in
+    // Aisyah's voice (it costs nothing); new audio is Azure's Filipino voice until next month, cached
+    // under Azure's own key so it never stands in for Aisyah.
+    const metered = intended === "elevenlabs" && !adminForced && req.premiumUser.plan_status === "pre";
+    if (metered && (await voiceAllowanceLeft(req.userId)) < text.length) {
+      forced = intended = "azure";
+      voiceCapped = true;
+      cacheKey = keyFor(`azure:${gender}`);
+      const azureHit = await cached(cacheKey);
+      if (azureHit) return send(azureHit.audio, azureHit.provider);
     }
 
     try {
@@ -976,9 +1029,11 @@ function mountPremium(app, deps) {
         if (text.length <= DB_CACHE_MAX_TEXT) dbCachePut(cacheKey, provider, audio);
       }
       await settleChars(req, weighted, 0, "tts");
+      if (metered && provider === "elevenlabs") noteVoiceUse(req.userId, text.length);
       logTranslationUsage(req.userId, [text], [false], "tts", "fil", "fil", "tts");
       res.set("Content-Type", "audio/mpeg");
       res.set("X-Hari-Voice", provider);
+      if (voiceCapped) res.set("X-Hari-Voice-Limit", "reached");
       res.send(audio);
     } catch (err) {
       console.error("[premium-tts] error:", err.message);
