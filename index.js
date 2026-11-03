@@ -18,6 +18,8 @@ const adminPool = new Pool({
   max: 5,
 });
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
+// the PAYG price: checkout, the webhook and verify-session must agree on it, or a PAYG buyer reads as Premium
+const PAYG_PRICE_ID = process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH";
 const paymentsCache = {};
 const axios = require("axios");
 const FREE_PLAN_LIMIT = 50000; // also in db.js
@@ -242,7 +244,7 @@ async function cancelStripeSubscriptionWithFinalUsage(subscriptionId) {
   try {
     const sub = await stripe.subscriptions.retrieve(subscriptionId);
     isPayg = sub.items?.data?.some(
-      (item) => item.price?.id === process.env.STRIPE_PAYG_PRICE_ID
+      (item) => item.price?.id === PAYG_PRICE_ID
     );
     await stripe.subscriptions.cancel(
       subscriptionId,
@@ -264,7 +266,7 @@ async function cancelStripeSubscriptionWithFinalUsage(subscriptionId) {
 async function applySubscriptionPlanUpdate(userId, subscription) {
   await createSubscription(userId, subscription.id, subscription.status, getPeriodEnd(subscription));
 
-  const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+  const isPayg = subscription.items.data[0]?.price?.id === PAYG_PRICE_ID;
 
   if (isPayg && subscription.status === "active") {
     const stripeItemId = subscription.items.data[0].id;
@@ -525,7 +527,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
 
         const subRow = await getSubscriptionByStripeId(subscription.id);
         if (subRow) {
-          const isPayg = subscription.items.data[0]?.price?.id === process.env.STRIPE_PAYG_PRICE_ID;
+          const isPayg = subscription.items.data[0]?.price?.id === PAYG_PRICE_ID;
 
           if (subscription.status === "trialing") {
             const prevAttrs = event.data.previous_attributes || {};
@@ -679,7 +681,7 @@ async function checkoutPlan(sessionId) {
     ]);
     const price = session.subscription?.items?.data?.[0]?.price?.id;
     if (!price) return null;
-    return price === (process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH") ? "payg" : "pre";
+    return price === PAYG_PRICE_ID ? "payg" : "pre";
   } catch (_) {
     return null;
   }
@@ -2152,7 +2154,7 @@ const checkoutReturnUrls = () => {
  */
 async function createPlanCheckout(user, plan, replaces = null, interval = "month") {
   const customer = await ensureStripeCustomer(user);
-  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : await premiumPriceId(interval);
+  const price = plan === "payg" ? PAYG_PRICE_ID : await premiumPriceId(interval);
   if (!price) throw Object.assign(new Error(`${plan === "payg" ? "PAYG" : "Premium"} price not configured`), { status: 503 });
   const metadata = { userId: user.id.toString(), ...(replaces ? { replaces } : {}) };
   return stripe.checkout.sessions.create({
@@ -2317,8 +2319,7 @@ app.post("/billing/verify-session", requireAuth, async (req, res) => {
       console.error("verify-session: createSubscription error (non-fatal):", dbErr.message);
     }
 
-    const paygPriceId = process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH";
-    const isPayg = subscription.items?.data[0]?.price?.id === paygPriceId;
+    const isPayg = subscription.items?.data[0]?.price?.id === PAYG_PRICE_ID;
 
     if (subscription.status === "trialing") {
       await updateUserTrialStart(req.userId, subscription.id);
