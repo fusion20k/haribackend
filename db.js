@@ -19,7 +19,7 @@ const pool = new Pool({
   max: 10,
 });
 
-const FREE_PLAN_LIMIT = 15000;
+const FREE_PLAN_LIMIT = 50000; // also in index.js
 
 function simpleHash(str) {
   return crypto.createHash("sha256").update(str).digest("hex").slice(0, 16);
@@ -548,9 +548,9 @@ async function initDatabase() {
       UPDATE users
       SET trial_chars_limit = ${FREE_PLAN_LIMIT}
       WHERE plan_status = 'free'
-        AND trial_chars_limit = 25000
+        AND trial_chars_limit IN (15000, 25000)
     `);
-    console.log("Migrated existing free users from 25000 to FREE_PLAN_LIMIT chars");
+    console.log("Migrated existing free users from 15000/25000 to FREE_PLAN_LIMIT chars");
 
     // --- Partner referral funnel tables ---
 

@@ -20,7 +20,7 @@ const adminPool = new Pool({
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
 const paymentsCache = {};
 const axios = require("axios");
-const FREE_PLAN_LIMIT = 15000;
+const FREE_PLAN_LIMIT = 50000; // also in db.js
 const {
   initDatabase,
   findTranslationsByKeys,
