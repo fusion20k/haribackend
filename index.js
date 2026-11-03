@@ -84,6 +84,7 @@ const {
 } = require("./db");
 const { mountGrowth, recordSignupSource, sourceFromToken } = require("./growth");
 const { mountPremium } = require("./premium");
+const { mountMessages } = require("./messages");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
@@ -400,6 +401,7 @@ if (process.env.DATABASE_URL) {
     requireAuth, stripe, getUserById, resetUserCharsIfNeeded, atomicCheckAndIncrementChars,
     incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage, pool, meterPaygChars,
   });
+  mountMessages(app, { pool, requireAuth, getUserById });
 }
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
