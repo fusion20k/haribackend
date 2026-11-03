@@ -622,53 +622,65 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Checkout result pages, in the same look as haritagalog.com (warm beige, Playfair + Inter, teal and gold).
-function checkoutPage({ title, eyebrow, heading, body, steps = [], cta = null, tone = "teal", icon = "check" }) {
-  const accent = tone === "gold" ? "#b8913e" : "#0F766E";
-  const check = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
-  const back = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>`;
+// Pages the backend shows (checkout result, checkout canceled, uninstalled), in haritagalog.com's look:
+// Hari charcoal, cream type, the amber sunset fill, and Archivo set wide and heavy for headlines.
+function checkoutPage({ title, eyebrow, heading, body, steps = [], cta = null, icon = "check", foot = "You can close this tab." }) {
+  const icons = {
+    check: `<polyline points="20 6 9 17 4 12"></polyline>`,
+    back: `<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>`,
+    bye: `<path d="M18 6L6 18"/><path d="M6 6l12 12"/>`,
+  };
+  const glyph = (d, w = 3) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>
+<meta name="robots" content="noindex">
 <link rel="icon" type="image/svg+xml" href="https://haritagalog.com/assets/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,400..900&display=swap" rel="stylesheet">
 <style>
+  :root { --navy: #141819; --card: #1F2526; --cream: #F1ECE2; --text-2: rgba(241, 236, 226, 0.72); --text-3: rgba(241, 236, 226, 0.5);
+    --line: rgba(241, 236, 226, 0.14); --peach: #F4BA4F; --fill: linear-gradient(100deg, #F4BA4F 0%, #E58B3A 55%, #C9632F 100%); --on-fill: #1B120A;
+    color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 20px;
-    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif; color: #1a1a1a;
-    background: radial-gradient(ellipse 90% 75% at 50% 50%, transparent 50%, rgba(0, 0, 0, 0.14) 100%), #e2d8c9; }
-  .wrap { width: 100%; max-width: 520px; text-align: center; }
-  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; font-size: 20px; color: #1a1a1a; text-decoration: none; margin-bottom: 34px; }
-  .brand i { width: 38px; height: 38px; border-radius: 50%; background: #0F766E; display: grid; place-items: center; }
-  .brand img { width: 26px; height: 26px; }
-  .card { background: #f5f0e8; border-radius: 22px; padding: 44px 40px 38px; box-shadow: 0 30px 80px rgba(12, 46, 42, 0.16), 0 0 0 1px rgba(0, 0, 0, 0.05); }
-  .badge { width: 64px; height: 64px; margin: 0 auto 22px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: ${accent}; box-shadow: 0 10px 30px ${tone === "gold" ? "rgba(184, 145, 62, 0.35)" : "rgba(15, 118, 110, 0.35)"}; }
-  .badge svg { width: 30px; height: 30px; }
-  .eyebrow { display: inline-flex; align-items: center; gap: 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: ${accent}; margin-bottom: 12px; }
-  .eyebrow::before, .eyebrow::after { content: ""; width: 22px; height: 1.5px; background: currentColor; }
-  h1 { font-family: 'Playfair Display', Georgia, serif; font-size: 40px; font-weight: 800; line-height: 1.1; letter-spacing: -0.01em; margin: 0 0 14px; }
-  p.body { font-size: 16px; line-height: 1.7; color: #555; margin: 0 auto; max-width: 400px; }
-  ul { list-style: none; padding: 22px 0 0; margin: 26px 0 0; border-top: 1px solid rgba(0, 0, 0, 0.1); text-align: left; display: grid; gap: 12px; }
-  li { display: flex; gap: 10px; font-size: 15px; font-weight: 600; line-height: 1.45; }
-  li svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 3px; color: #0F766E; }
-  li span { font-weight: 400; color: #666; }
-  .cta { display: inline-flex; align-items: center; justify-content: center; margin-top: 28px; padding: 12px 28px; border-radius: 999px; font-weight: 600; font-size: 15px; text-decoration: none; color: #fff; background: #0F766E; transition: background 0.2s ease, transform 0.2s ease; }
-  .cta:hover { background: #0B5C56; transform: translateY(-2px); }
-  .foot { margin-top: 22px; font-size: 13px; color: #7a7a7a; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 32px 18px;
+    font-family: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--cream); -webkit-font-smoothing: antialiased;
+    background: radial-gradient(120% 70% at 50% 0%, rgba(229, 139, 58, 0.24) 0%, rgba(229, 139, 58, 0) 60%), var(--navy); }
+  .wrap { width: 100%; max-width: 540px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; margin-bottom: 26px; color: var(--cream); text-decoration: none;
+    font-size: 18px; font-weight: 800; font-stretch: 120%; letter-spacing: 0.02em; }
+  .brand img { width: 30px; height: 30px; border-radius: 8px; }
+  .card { padding: 40px 36px 34px; border: 1px solid var(--line); border-radius: 20px; background: var(--card); box-shadow: 0 30px 70px rgba(0, 0, 0, 0.45); }
+  .badge { width: 56px; height: 56px; margin-bottom: 24px; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--on-fill);
+    box-shadow: 0 12px 30px rgba(229, 139, 58, 0.35); }
+  .badge svg { width: 26px; height: 26px; }
+  .eyebrow { margin: 0 0 12px; font-size: 12px; font-weight: 700; font-stretch: 115%; letter-spacing: 0.18em; text-transform: uppercase; color: var(--peach); }
+  h1 { margin: 0 0 14px; font-size: clamp(34px, 9vw, 46px); font-weight: 900; font-stretch: 122%; line-height: 0.98; letter-spacing: -0.01em; text-transform: uppercase; }
+  p.body { margin: 0; font-size: 16px; line-height: 1.65; color: var(--text-2); }
+  ol { list-style: none; counter-reset: step; display: grid; gap: 14px; margin: 26px 0 0; padding: 24px 0 0; border-top: 1px solid var(--line); }
+  li { counter-increment: step; display: grid; grid-template-columns: 30px 1fr; gap: 12px; align-items: baseline; font-size: 15px; font-weight: 700; line-height: 1.45; }
+  li::before { content: "0" counter(step); font-size: 13px; font-weight: 800; font-stretch: 115%; color: var(--peach); }
+  li span { font-weight: 400; color: var(--text-2); }
+  .cta { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; margin-top: 28px; padding: 0 26px; border-radius: 4px;
+    background: var(--fill); color: var(--on-fill); font-size: 13px; font-weight: 700; font-stretch: 112%; letter-spacing: 0.06em; text-transform: uppercase;
+    text-decoration: none; transition: transform 0.15s ease, filter 0.15s ease; }
+  .cta:hover { transform: translateY(-2px); filter: brightness(1.08); }
+  .cta:focus-visible, .brand:focus-visible { outline: 2px solid var(--peach); outline-offset: 3px; }
+  .foot { margin: 20px 0 0; font-size: 13px; color: var(--text-3); text-align: center; }
+  @media (max-width: 480px) { .card { padding: 32px 22px 28px; } }
 </style></head>
-<body><div class="wrap">
-  <a class="brand" href="https://haritagalog.com"><i><img src="https://haritagalog.com/assets/favicon.svg" alt=""></i>Hari</a>
+<body><main class="wrap">
+  <a class="brand" href="https://haritagalog.com"><img src="https://haritagalog.com/assets/hari-eagle.svg" alt="">Hari</a>
   <div class="card">
-    <div class="badge">${icon === "back" ? back : check}</div>
-    <div class="eyebrow">${eyebrow}</div>
+    <div class="badge">${glyph(icons[icon] || icons.check, icon === "back" ? 2.6 : 3)}</div>
+    <p class="eyebrow">${eyebrow}</p>
     <h1>${heading}</h1>
     <p class="body">${body}</p>
-    ${steps.length ? `<ul>${steps.map(([t, d]) => `<li>${check}<div>${t}${d ? ` <span>${d}</span>` : ""}</div></li>`).join("")}</ul>` : ""}
-    ${cta ? `<a class="cta" href="${cta.href}">${cta.label}</a>` : ""}
+    ${steps.length ? `<ol>${steps.map(([t, d]) => `<li><div>${t}${d ? ` <span>${d}</span>` : ""}</div></li>`).join("")}</ol>` : ""}
+    ${cta ? `<a class="cta" href="${cta.href}"${cta.newTab ? ' target="_blank" rel="noopener"' : ""}>${cta.label}</a>` : ""}
   </div>
-  <p class="foot">You can close this tab.</p>
-</div></body></html>`;
+  ${foot ? `<p class="foot">${foot}</p>` : ""}
+</main></body></html>`;
 }
 
 // Which plan a finished checkout bought (null when unknown); never slows the page by more than a few seconds.
@@ -696,9 +708,9 @@ app.get("/checkout-success", async (req, res) => {
   ];
   const page =
     plan === "payg"
-      ? { title: "Hari - Pay As You Go is on", eyebrow: "Pay As You Go", heading: "You're all set.", body: "Every Premium feature is unlocked, and you only pay for what you use. Your usage is billed through Stripe.", steps, tone: "gold" }
+      ? { title: "Hari - Pay As You Go is on", eyebrow: "Pay As You Go", heading: "You're all set.", body: "Every Premium feature is unlocked, and you only pay for what you use. Your usage is billed through Stripe.", steps }
       : plan === "pre"
-        ? { title: "Hari - Welcome to Premium", eyebrow: "Welcome to Premium", heading: "You're all set.", body: "Hari Premium is active: unlimited reading, Thea, the natural Filipino voice and every practice tool.", steps, tone: "gold" }
+        ? { title: "Hari - Welcome to Premium", eyebrow: "Welcome to Premium", heading: "You're all set.", body: "Hari Premium is active: unlimited reading, Thea, the natural Filipino voice and every practice tool.", steps }
         : { title: "Hari - You're all set", eyebrow: "Payment complete", heading: "You're all set.", body: "Your plan is active. Open a new tab and Hari is ready to use.", steps };
   res.send(checkoutPage(page));
 });
@@ -1907,23 +1919,17 @@ app.get("/extension/uninstalled", async (req, res) => {
   } catch (err) {
     console.error("/extension/uninstalled error (non-fatal):", err.message);
   }
-  res.status(200).send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hari Removed</title>
-<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(180deg,#f8f7f5 0%,#ede7dc 100%);color:#1a1a1a}
-.card{text-align:center;padding:3.5rem 2.5rem;border-radius:24px;background:#fff;border:1px solid rgba(0,0,0,0.07);box-shadow:0 20px 60px rgba(0,0,0,0.06);max-width:520px;width:100%;margin:1rem;display:flex;flex-direction:column;align-items:center;gap:1.25rem}
-.icon{width:56px;height:56px;border-radius:50%;background:rgba(15,118,110,0.1);display:flex;align-items:center;justify-content:center;margin-bottom:0.5rem}
-.icon svg{width:28px;height:28px;color:#0F766E}
-h1{font-size:1.75rem;font-weight:800;line-height:1.2;letter-spacing:-0.03em;color:#1a1a1a;margin:0}
-p{font-size:1rem;font-weight:500;line-height:1.65;color:#555;max-width:400px;margin:0}
-.btn{display:inline-block;padding:12px 28px;border-radius:8px;background:#0F766E;color:#fff;text-decoration:none;font-weight:600;font-size:1rem;transition:background 0.2s}
-.btn:hover{background:#0d6b63}
-@media(max-width:600px){.card{padding:2.5rem 1.5rem;border-radius:18px;gap:1rem}h1{font-size:1.4rem}p{font-size:0.925rem}}</style></head>
-<body><div class="card">
-<div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></div>
-<h1>Hari has been removed</h1>
-<p>You've uninstalled Hari from Chrome. Your translations, dictionary lookups, and saved words are still safe — just reinstall whenever you're ready to pick up where you left off.</p>
-<a class="btn" href="https://chromewebstore.google.com/detail/hari" target="_blank">Reinstall Hari</a>
-</div></body></html>`);
+  res.status(200).send(
+    checkoutPage({
+      title: "Hari - Removed",
+      eyebrow: "Hari was removed",
+      heading: "Paalam for now.",
+      body: "Hari is no longer in your browser. Your account and saved words are kept, so if you add Hari again and sign in, you pick up right where you left off.",
+      cta: { href: "https://haritagalog.com/go/chrome/", label: "Add Hari again", newTab: true },
+      icon: "bye",
+      foot: "",
+    }),
+  );
 });
 
 async function buildMeResponse(user) {
