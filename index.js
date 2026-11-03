@@ -2058,16 +2058,17 @@ app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
   }
 });
 
-// Premium is $7.99/month. The price is found by checking Stripe for the one that actually costs $7.99, so a
-// stale price can't sneak back into checkout. Order: an explicit STRIPE_PREMIUM_PRICE_ID, the Payment Links'
-// prices, STRIPE_PRICE_ID, then any active $7.99 monthly price in the account. Until a $7.99 price exists,
-// checkout keeps working on the previous $19.99 one (re-checked every 10 minutes), so deploying this before
-// creating the price in Stripe breaks nothing.
-const PREMIUM_AMOUNT_CENTS = 799;
-const PREVIOUS_PREMIUM_CENTS = 1999;
+// Premium is $7.49 a month or $59.99 a year. Each price is found by checking Stripe for an active USD
+// recurring price with exactly that amount and period, newest first, so an old or stale price can't sneak
+// back into checkout. An explicit STRIPE_PREMIUM_PRICE_ID / STRIPE_PREMIUM_YEARLY_PRICE_ID wins when it
+// matches. Until a $7.49 monthly price exists, monthly checkout keeps using the previous one ($7.99, then
+// $19.99), re-checked every 10 minutes, so deploying this before the Stripe change breaks nothing.
+const PREMIUM_PRICES = {
+  month: { cents: 749, previous: [799, 1999], env: "STRIPE_PREMIUM_PRICE_ID", label: "$7.49 a month" },
+  year: { cents: 5999, previous: [], env: "STRIPE_PREMIUM_YEARLY_PRICE_ID", label: "$59.99 a year" },
+};
 const PREMIUM_PAYMENT_LINK = "https://buy.stripe.com/dRmdR907Dd7z8fR6u5ejK02";
-let premiumPriceCache = null;
-let previousPriceUntil = 0;
+const premiumPriceCache = {};
 
 async function paymentLinkPrice(url) {
   if (!url) return null;
@@ -2081,53 +2082,54 @@ async function paymentLinkPrice(url) {
   return null;
 }
 
-async function premiumPriceId() {
-  if (premiumPriceCache && (premiumPriceCache.amount === PREMIUM_AMOUNT_CENTS || Date.now() < previousPriceUntil)) return premiumPriceCache.id;
-  const candidates = [
-    async () => process.env.STRIPE_PREMIUM_PRICE_ID,
-    () => paymentLinkPrice(PREMIUM_PAYMENT_LINK),
-    () => paymentLinkPrice(process.env.STRIPE_PAYMENT_LINK_URL),
-    async () => process.env.STRIPE_PRICE_ID,
+const isPremiumPrice = (price, interval, cents) =>
+  price && price.active && price.unit_amount === cents && price.currency === "usd" && price.recurring?.interval === interval && (price.recurring.interval_count || 1) === 1;
+
+async function premiumPriceId(interval = "month") {
+  const want = PREMIUM_PRICES[interval];
+  if (!want) throw Object.assign(new Error("Unknown billing period"), { status: 400 });
+  const hit = premiumPriceCache[interval];
+  if (hit && (hit.current || Date.now() < hit.until)) return hit.id;
+
+  // every active recurring USD price in the account, plus the configured ones (which may be on another product)
+  const prices = [];
+  try {
+    for await (const price of stripe.prices.list({ active: true, type: "recurring", limit: 100 })) prices.push(price);
+  } catch (e) {
+    console.warn("[billing] price search failed:", e.message);
+  }
+  const explicit = [
+    async () => process.env[want.env],
+    ...(interval === "month"
+      ? [() => paymentLinkPrice(PREMIUM_PAYMENT_LINK), () => paymentLinkPrice(process.env.STRIPE_PAYMENT_LINK_URL), async () => process.env.STRIPE_PRICE_ID]
+      : []),
   ];
-  const found = {};
-  for (const get of candidates) {
+  let preferred = null;
+  for (const get of explicit) {
     try {
       const id = await get();
       if (!id) continue;
-      const price = await stripe.prices.retrieve(id);
-      if (price.active && [PREMIUM_AMOUNT_CENTS, PREVIOUS_PREMIUM_CENTS].includes(price.unit_amount)) {
-        found[price.unit_amount] = found[price.unit_amount] || price;
-      } else {
-        console.warn(`[billing] skipping price ${id}: ${price.unit_amount} cents, active=${price.active}`);
-      }
+      const price = prices.find((p) => p.id === id) || (await stripe.prices.retrieve(id));
+      if (!prices.some((p) => p.id === price.id)) prices.push(price);
+      if (!preferred && id === process.env[want.env] && isPremiumPrice(price, interval, want.cents)) preferred = price;
     } catch (e) {
       console.warn("[billing] price lookup failed:", e.message);
     }
   }
-  // a $7.99 monthly price made in the dashboard is picked up without setting anything
-  if (!found[PREMIUM_AMOUNT_CENTS]) {
-    try {
-      for await (const price of stripe.prices.list({ active: true, type: "recurring", limit: 100 })) {
-        if (price.unit_amount === PREMIUM_AMOUNT_CENTS && price.currency === "usd" && price.recurring?.interval === "month") {
-          found[PREMIUM_AMOUNT_CENTS] = price;
-          break;
-        }
-      }
-    } catch (e) {
-      console.warn("[billing] price search failed:", e.message);
-    }
-  }
-  const price = found[PREMIUM_AMOUNT_CENTS] || found[PREVIOUS_PREMIUM_CENTS];
-  if (!price) throw Object.assign(new Error("Premium price ($7.99) not found in Stripe"), { status: 503 });
-  premiumPriceCache = { id: price.id, amount: price.unit_amount };
-  if (price.unit_amount !== PREMIUM_AMOUNT_CENTS) {
-    previousPriceUntil = Date.now() + 10 * 60 * 1000;
-    console.warn(`[billing] no $7.99 price in Stripe yet; Premium checkout uses the previous price ${price.id} ($${(price.unit_amount / 100).toFixed(2)})`);
-  } else {
-    console.log(`[billing] Premium price: ${price.id} ($${(price.unit_amount / 100).toFixed(2)}/${price.recurring?.interval || "once"})`);
-  }
+  const newest = (cents) => prices.filter((p) => isPremiumPrice(p, interval, cents)).sort((x, y) => y.created - x.created)[0];
+  let price = preferred || newest(want.cents);
+  const current = !!price;
+  for (const cents of want.previous) price = price || newest(cents);
+  if (!price) throw Object.assign(new Error(`Premium price (${want.label}) not found in Stripe`), { status: 503 });
+
+  premiumPriceCache[interval] = { id: price.id, current, until: Date.now() + 10 * 60 * 1000 };
+  if (current) console.log(`[billing] Premium ${interval}ly price: ${price.id} ($${(price.unit_amount / 100).toFixed(2)})`);
+  else console.warn(`[billing] no ${want.label} price in Stripe yet; Premium checkout uses ${price.id} ($${(price.unit_amount / 100).toFixed(2)}) for now`);
   return price.id;
 }
+
+/** "year" when the request asks for yearly billing (query ?interval=year or body { interval: "year" }), else "month". */
+const billingInterval = (req) => ((req.query && req.query.interval) || (req.body && req.body.interval)) === "year" ? "year" : "month";
 
 // Every checkout needs a Stripe customer; older accounts (and some sign-in paths) never got one.
 async function ensureStripeCustomer(user) {
@@ -2148,9 +2150,9 @@ const checkoutReturnUrls = () => {
  * it's cancelled only after this checkout completes (webhook / verify-session), never up front, so backing
  * out of checkout never leaves someone without their current plan.
  */
-async function createPlanCheckout(user, plan, replaces = null) {
+async function createPlanCheckout(user, plan, replaces = null, interval = "month") {
   const customer = await ensureStripeCustomer(user);
-  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : await premiumPriceId();
+  const price = plan === "payg" ? process.env.STRIPE_PAYG_PRICE_ID || "price_1TKW2wDKBlUi0cQL7JtrM4lH" : await premiumPriceId(interval);
   if (!price) throw Object.assign(new Error(`${plan === "payg" ? "PAYG" : "Premium"} price not configured`), { status: 503 });
   const metadata = { userId: user.id.toString(), ...(replaces ? { replaces } : {}) };
   return stripe.checkout.sessions.create({
@@ -2184,15 +2186,25 @@ const sendBillingError = (res, label, err) => {
   res.status(500).json({ error: "Internal server error" });
 };
 
-// Premium checkout for a free user. The extension (including versions already in the store) calls this path.
+// Premium checkout. The extension (including versions already in the store) calls this path; ?interval=year
+// asks for yearly billing. Monthly Premium can move to yearly here too.
 async function handleUpgradeLink(req, res) {
   try {
     if (!stripe) return res.status(503).json({ error: "Payment system not configured" });
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.plan_status === "pre" || user.plan_status === "active") return res.status(400).json({ error: "You're already on Premium." });
-    // PAYG -> Premium is a switch: the PAYG subscription is cancelled once Premium checkout completes
-    const session = await createPlanCheckout(user, "pre", user.plan_status === "payg" ? user.subscription_id : null);
+    const interval = billingInterval(req);
+    let replaces = user.plan_status === "payg" ? user.subscription_id : null;
+    if (user.plan_status === "active") return res.status(400).json({ error: "You're already on Premium." });
+    if (user.plan_status === "pre") {
+      // monthly -> yearly is a switch: the monthly subscription is cancelled once the yearly checkout completes
+      const sub = interval === "year" && user.subscription_id ? await stripe.subscriptions.retrieve(user.subscription_id).catch(() => null) : null;
+      const onYearly = sub && sub.items.data.some((i) => i.price && i.price.recurring && i.price.recurring.interval === "year");
+      if (interval !== "year" || !sub || onYearly) return res.status(400).json({ error: onYearly ? "You're already on yearly Premium." : "You're already on Premium." });
+      replaces = sub.id;
+    }
+    // PAYG -> Premium is a switch too: the PAYG subscription is cancelled once Premium checkout completes
+    const session = await createPlanCheckout(user, "pre", replaces, interval);
     res.json({ url: session.url, checkoutUrl: session.url });
   } catch (err) {
     sendBillingError(res, "/billing/upgrade-link", err);
@@ -2214,7 +2226,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
-    const session = await createPlanCheckout(user, "pre");
+    const session = await createPlanCheckout(user, "pre", null, billingInterval(req));
     res.json({ checkoutUrl: session.url, url: session.url });
   } catch (err) {
     sendBillingError(res, "Checkout session", err);
@@ -2390,7 +2402,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
       const subRow = await getLatestSubscriptionForUser(req.userId);
       replaces = subRow && subRow.stripe_subscription_id ? subRow.stripe_subscription_id : null;
     }
-    const session = await createPlanCheckout(user, targetPlan, replaces);
+    const session = await createPlanCheckout(user, targetPlan, replaces, billingInterval(req));
 
     res.json({ checkoutUrl: session.url, url: session.url });
   } catch (err) {
