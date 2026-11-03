@@ -858,7 +858,7 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const plan = req.query.plan || null;
     const offset = (page - 1) * limit;
-    const validPlans = ["free", "pre", "active", "payg", "canceled"];
+    const validPlans = ["free", "pre", "active", "payg", "exc", "canceled"];
     const planFilter = plan && validPlans.includes(plan) ? plan : null;
     const validSortColumns = ["created_at", "plan_status", "email", "id", "trial_chars_used", "trial_chars_limit"];
     const sortBy = validSortColumns.includes(req.query.sortBy) ? req.query.sortBy : "created_at";
@@ -1801,7 +1801,7 @@ app.post("/start-trial", async (req, res) => {
       isNewUser = true;
     }
 
-    if (["pre", "active", "payg"].includes(user.plan_status) || !!user.subscription_id) {
+    if (["pre", "active", "payg", "exc"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -2198,6 +2198,7 @@ async function handleUpgradeLink(req, res) {
     const interval = billingInterval(req);
     let replaces = user.plan_status === "payg" ? user.subscription_id : null;
     if (user.plan_status === "active") return res.status(400).json({ error: "You're already on Premium." });
+    if (user.plan_status === "exc") return res.status(400).json({ error: "Premium is included on your account." });
     if (user.plan_status === "pre") {
       // monthly -> yearly is a switch: the monthly subscription is cancelled once the yearly checkout completes
       const sub = interval === "year" && user.subscription_id ? await stripe.subscriptions.retrieve(user.subscription_id).catch(() => null) : null;
@@ -2224,7 +2225,7 @@ app.post("/billing/create-checkout-session", requireAuth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    if (["active", "pre", "payg"].includes(user.plan_status) || !!user.subscription_id) {
+    if (["active", "pre", "payg", "exc"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Subscription already active" });
     }
 
@@ -2246,7 +2247,7 @@ app.post("/billing/create-trial-checkout-session", requireAuth, async (req, res)
       return res.status(400).json({ error: "Missing Stripe customer" });
     }
 
-    if (["pre", "active", "payg"].includes(user.plan_status) || !!user.subscription_id) {
+    if (["pre", "active", "payg", "exc"].includes(user.plan_status) || !!user.subscription_id) {
       return res.status(400).json({ error: "Trial or subscription already active" });
     }
 
@@ -2364,7 +2365,7 @@ app.post("/billing/create-payg-checkout-session", requireAuth, async (req, res) 
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    if (["pre", "active", "payg"].includes(user.plan_status)) {
+    if (["pre", "active", "payg", "exc"].includes(user.plan_status)) {
       return res.status(400).json({ error: "Already on a paid plan. Use switch-plan to change." });
     }
 
@@ -2393,6 +2394,7 @@ app.post("/billing/switch-plan", requireAuth, async (req, res) => {
       return res.status(400).json({ error: `Already on ${targetPlan} plan` });
     }
 
+    if (user.plan_status === "exc") return res.status(400).json({ error: "Premium is included on your account." });
     if (!["pre", "active", "payg"].includes(user.plan_status)) {
       return res.status(400).json({ error: "No active subscription to switch from. Subscribe first." });
     }
@@ -2424,6 +2426,10 @@ async function handleCancelSubscription(req, res) {
 
     if (user.plan_status === "free" && !user.subscription_id) {
       return res.json({ success: true, message: "Already on free plan" });
+    }
+
+    if (user.plan_status === "exc") {
+      return res.status(400).json({ error: "Premium is included on your account, so there's nothing to cancel." });
     }
 
     let subscriptionIdToCancel = user.subscription_id;
@@ -2546,7 +2552,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg"].includes(user.plan_status)
+      !["free", "active", "pre", "payg", "exc"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -2701,7 +2707,7 @@ app.post("/translate", requireAuth, async (req, res) => {
     const billableChars = cacheChars + liveChars;
 
     let translateUpdatedUser = null;
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "exc"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, billableChars);
@@ -2929,7 +2935,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       return res.json(paygResponse);
     }
 
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "exc"].includes(user.plan_status)) {
       const resp = {
         translations,
         trial_chars_used: translateUpdatedUser ? translateUpdatedUser.trial_chars_used : null,
@@ -2982,7 +2988,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     if (
       user &&
       user.plan_status &&
-      !["free", "active", "pre", "payg"].includes(user.plan_status)
+      !["free", "active", "pre", "payg", "exc"].includes(user.plan_status)
     ) {
       return res.status(402).json({ error: "no_access" });
     }
@@ -3017,7 +3023,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     let dictUpdatedUser = null;
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "exc"].includes(user.plan_status)) {
       const reset = await resetUserCharsIfNeeded(req.userId);
       if (reset) { user = await getUserById(req.userId); }
       const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, totalChars);
@@ -3080,7 +3086,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       return res.json(paygResponse);
     }
 
-    if (user && ["free", "pre"].includes(user.plan_status)) {
+    if (user && ["free", "pre", "exc"].includes(user.plan_status)) {
       const resp = {
         ...entry,
         trial_chars_used: dictUpdatedUser ? dictUpdatedUser.trial_chars_used : null,
@@ -3182,7 +3188,7 @@ app.post("/tts", requireAuth, async (req, res) => {
   }
 
   let ttsUpdatedUser = null;
-  if (user && ["free", "pre"].includes(user.plan_status)) {
+  if (user && ["free", "pre", "exc"].includes(user.plan_status)) {
     const reset = await resetUserCharsIfNeeded(req.userId);
     if (reset) { user = await getUserById(req.userId); }
     const { allowed, user: au } = await atomicCheckAndIncrementChars(req.userId, weightedChars);

@@ -331,6 +331,47 @@ async function initDatabase() {
     `);
     console.log("Migrated fasou users to free plan (fasou plan status retired)");
 
+    // 'exc': Premium given by hand, no Stripe (set plan_status = 'exc' in Supabase). The trigger fills in
+    // the rest: access, Premium's monthly characters and a reset date. Setting the account back to 'free'
+    // puts the free limit back.
+    try {
+      await client.query(`
+        CREATE OR REPLACE FUNCTION hari_exc_plan() RETURNS trigger AS $$
+        BEGIN
+          IF NEW.plan_status = 'exc' AND (TG_OP = 'INSERT' OR OLD.plan_status IS DISTINCT FROM 'exc') THEN
+            NEW.has_access := TRUE;
+            NEW.trial_chars_limit := 1000000;
+            NEW.trial_chars_used := 0;
+            NEW.chars_used_at_payg_start := 0;
+            NEW.free_chars_reset_date := (NOW() + INTERVAL '30 days')::DATE;
+          ELSIF TG_OP = 'UPDATE' AND OLD.plan_status = 'exc' AND NEW.plan_status = 'free' THEN
+            NEW.has_access := TRUE;
+            NEW.trial_chars_limit := ${FREE_PLAN_LIMIT};
+            NEW.trial_chars_used := 0;
+            NEW.free_chars_reset_date := (NOW() + INTERVAL '30 days')::DATE;
+          END IF;
+          RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql
+      `);
+      await client.query(`DROP TRIGGER IF EXISTS hari_exc_plan ON users`);
+      await client.query(`
+        CREATE TRIGGER hari_exc_plan BEFORE INSERT OR UPDATE OF plan_status ON users
+        FOR EACH ROW EXECUTE FUNCTION hari_exc_plan()
+      `);
+      await client.query(`
+        UPDATE users
+        SET has_access = TRUE,
+            trial_chars_limit = 1000000,
+            free_chars_reset_date = COALESCE(free_chars_reset_date, (NOW() + INTERVAL '30 days')::DATE)
+        WHERE plan_status = 'exc' AND (has_access IS NOT TRUE OR trial_chars_limit IS DISTINCT FROM 1000000 OR free_chars_reset_date IS NULL)
+      `);
+      console.log("exc plan: trigger ready");
+    } catch (excErr) {
+      // never blocks startup; the plan still works once the trigger exists
+      console.error("exc plan: trigger setup failed:", excErr.message);
+    }
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,

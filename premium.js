@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const express = require("express");
 const axios = require("axios");
 
-const PREMIUM_PLANS = ["pre", "payg", "active"];
+const PREMIUM_PLANS = ["pre", "payg", "active", "exc"]; // exc: Premium given by hand, no billing
 const jsonBody = express.json({ limit: "200kb" });
 
 // ---------------------------------------------------------------------------
@@ -887,7 +887,7 @@ function mountPremium(app, deps) {
       return false;
     }
     const user = req.premiumUser;
-    if (user.plan_status === "pre") {
+    if (user.plan_status === "pre" || user.plan_status === "exc") {
       const { allowed } = await atomicCheckAndIncrementChars(req.userId, chars);
       if (!allowed) {
         res.status(402).json({
@@ -906,7 +906,7 @@ function mountPremium(app, deps) {
     const total = reservedChars + extraChars;
     try {
       await incrementUsage(total);
-      if (user.plan_status === "pre" && extraChars > 0) {
+      if ((user.plan_status === "pre" || user.plan_status === "exc") && extraChars > 0) {
         await incrementUserTrialChars(req.userId, extraChars);
       }
       if (user.plan_status === "payg") {
@@ -1011,7 +1011,7 @@ function mountPremium(app, deps) {
     // Premium past its monthly natural-voice allowance: anything already cached above still plays in
     // Aisyah's voice (it costs nothing); new audio is Azure's Filipino voice until next month, cached
     // under Azure's own key so it never stands in for Aisyah.
-    const metered = intended === "elevenlabs" && !adminForced && req.premiumUser.plan_status === "pre";
+    const metered = intended === "elevenlabs" && !adminForced && ["pre", "exc"].includes(req.premiumUser.plan_status);
     if (metered && (await voiceAllowanceLeft(req.userId)) < text.length) {
       forced = intended = "azure";
       voiceCapped = true;
