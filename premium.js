@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const express = require("express");
 const axios = require("axios");
 
+const { recordUsage } = require("./usage");
 const PREMIUM_PLANS = ["pre", "payg", "active", "exc"]; // exc: Premium given by hand, no billing
 const jsonBody = express.json({ limit: "200kb" });
 
@@ -903,11 +904,12 @@ function mountPremium(app, deps) {
   /**
    * After a successful call: global usage, extra Premium chars, and PAYG Stripe metering.
    * unbilledChars: provider work that counts toward the global cap but isn't charged to the person
-   * (see billChars in llmRoute).
+   * (see billIn and billOut in llmRoute).
    */
   async function settleChars(req, reservedChars, extraChars, kind, unbilledChars = 0) {
     const user = req.premiumUser;
     const total = reservedChars + extraChars;
+    recordUsage(pool, req.userId, kind, total);
     try {
       await incrementUsage(total + unbilledChars);
       if ((user.plan_status === "pre" || user.plan_status === "exc") && extraChars > 0) {
@@ -927,12 +929,14 @@ function mountPremium(app, deps) {
   /** PAYG: a result served from cache is still a use of the feature, billed at its plain length. */
   async function billCachedPayg(req, chars, kind) {
     if (req.premiumUser && req.premiumUser.plan_status === "payg" && chars > 0) await settleChars(req, chars, 0, kind);
+    else recordUsage(pool, req.userId, kind, 0); // still a use of the feature, for the usage stats
   }
 
   /**
    * Shared wrapper for every LLM-backed route. build(req) returns { system, user, history?, maxTokens?, inChars, clean(data) }.
-   * With billChars, the person is charged exactly that many characters (the text they asked about, as
-   * reading a page is) and the prompt and reply only count toward the global cap.
+   * Characters are charged like reading a page: billIn is the text the person sent (charged up front)
+   * and billOut(result) the Tagalog they get back to read. English explanations, the instructions, the
+   * conversation history and the JSON around it aren't charged; they only count toward the global cap.
    */
   function llmRoute(kind, build) {
     return async (req, res) => {
@@ -943,18 +947,19 @@ function mountPremium(app, deps) {
         return res.status(400).json({ error: err.message || "invalid_request" });
       }
       try {
-        const billed = spec.billChars != null;
-        if (!(await reserveChars(req, res, billed ? spec.billChars : spec.inChars))) return;
+        const billIn = Math.max(0, Math.round(spec.billIn || 0));
+        if (!(await reserveChars(req, res, billIn))) return;
         // optional first step that adjusts the spec (Thea reads the learner's message before answering)
         const pre = spec.prepare ? await spec.prepare() : { inChars: 0, outChars: 0 };
         const { data, outChars } = await llmJson(spec.system, spec.user, {
           maxTokens: spec.maxTokens, temperature: spec.temperature, history: spec.history,
         });
-        const work = outChars + pre.inChars + pre.outChars;
-        if (billed) await settleChars(req, spec.billChars, 0, kind, spec.inChars + work);
-        else await settleChars(req, spec.inChars, work, kind);
+        const out = spec.clean ? spec.clean(data) : data;
+        const billOut = spec.billOut ? Math.max(0, Math.round(spec.billOut(out) || 0)) : 0;
+        const work = spec.inChars + outChars + pre.inChars + pre.outChars;
+        await settleChars(req, billIn, billOut, kind, Math.max(0, work - billIn - billOut));
         logTranslationUsage(req.userId, [kind], [false], kind, "en", "tl", "llm");
-        res.json(spec.clean ? spec.clean(data) : data);
+        res.json(out);
       } catch (err) {
         console.error(`[premium] ${kind} error:`, err.response?.data || err.message);
         res.status(500).json({ error: `${kind}_unavailable` });
@@ -1033,13 +1038,13 @@ function mountPremium(app, deps) {
 
     try {
       const weighted = text.length * (TTS_WEIGHT[intended] || 2);
-      if (!(await reserveChars(req, res, weighted))) return;
+      if (!(await reserveChars(req, res, text.length))) return;
       const { audio, provider } = await synthesize(text, { gender, style, rate, azureVoice: picked && picked.azureVoice }, forced);
       if (provider === intended) {
         audioCache.set(cacheKey, { audio, provider });
         if (text.length <= DB_CACHE_MAX_TEXT) dbCachePut(cacheKey, provider, audio);
       }
-      await settleChars(req, weighted, 0, "tts");
+      await settleChars(req, text.length, 0, "tts", weighted - text.length);
       if (metered && provider === "elevenlabs") noteVoiceUse(req.userId, text.length);
       logTranslationUsage(req.userId, [text], [false], "tts", "fil", "fil", "tts");
       res.set("Content-Type", "audio/mpeg");
@@ -1096,7 +1101,7 @@ function mountPremium(app, deps) {
           }
           const data = await r.json();
           const text = String(data.text || "").replace(/\s+/g, " ").trim();
-          await settleChars(req, reserved, text.length, "stt");
+          await settleChars(req, reserved, 0, "stt", text.length);
           logTranslationUsage(req.userId, ["stt"], [false], "stt", lang, lang, "stt");
           return res.json({ text, status: "Success", engine: "elevenlabs" });
         } catch (err) {
@@ -1121,7 +1126,7 @@ function mountPremium(app, deps) {
       if (!response.ok) throw new Error(`azure_stt_${response.status}: ${await response.text()}`);
       const data = await response.json();
       const text = data.RecognitionStatus === "Success" ? String(data.DisplayText || "").trim() : "";
-      await settleChars(req, reserved, text.length, "stt");
+      await settleChars(req, reserved, 0, "stt", text.length);
       logTranslationUsage(req.userId, ["stt"], [false], "stt", language, language, "stt");
       res.json({ text, status: data.RecognitionStatus || "Unknown" });
     } catch (err) {
@@ -1156,6 +1161,8 @@ function mountPremium(app, deps) {
     let cleanText = "";
     const spec = {
       system, user: null, history, maxTokens: 700, temperature: 0.8, inChars: Math.ceil(inChars),
+      billIn: raw.length,
+      billOut: (o) => String(o.reply || "").length,
       // a native speaker reads the message first; Thea then answers the words as they were meant
       prepare: async () => {
         const heard = await readLearnerMessage(history, spoken);
@@ -1214,6 +1221,8 @@ ${shapes[type]}`;
       : "Use common high-frequency vocabulary.";
     return {
       system, user, maxTokens: 1400, temperature: 0.9, inChars: Math.ceil(system.length / 4 + user.length),
+      billOut: (o) => o.exercises.reduce((n, e) => n + String(e.tagalog || "").length
+        + (Array.isArray(e.lines) ? e.lines.reduce((m, l) => m + String((l && l.tagalog) || "").length, 0) : 0), 0),
       clean: (d) => {
         let exercises = Array.isArray(d.exercises) ? d.exercises.filter((e) => e && typeof e === "object") : [];
         // keep Sentence Builder lengths inside the level's range when the model drifts (if any fit)
@@ -1250,6 +1259,8 @@ Return JSON:
     const user = `Exercise: ${prompt}\nReference answer: ${expected || "(none)"}\nLearner answer: ${answer}`;
     return {
       system, user, maxTokens: 800, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
+      billIn: answer.length,
+      billOut: (o) => o.corrected.length + o.moreNatural.reduce((n, m) => n + String((m && m.tagalog) || "").length, 0),
       clean: (d) => ({
         verdict: ["correct", "almost", "incorrect"].includes(d.verdict) ? d.verdict : "incorrect",
         summary: String(d.summary || ""),
@@ -1279,7 +1290,11 @@ Return JSON:
   "culture": string (one short cultural note in English, or "")
 }`;
     const user = `Say this: "${text}"${context ? `\nContext: ${context}` : ""}`;
-    return { system, user, maxTokens: 900, temperature: 0.5, inChars: Math.ceil(system.length / 4 + user.length) };
+    return {
+      system, user, maxTokens: 900, temperature: 0.5, inChars: Math.ceil(system.length / 4 + user.length),
+      billIn: text.length,
+      billOut: (o) => [o.casual, o.taglish, o.respectful, o.formal].reduce((n, v) => n + String((v && v.tagalog) || "").length, 0),
+    };
   }));
 
   // --- 5. Video subtitles: translate caption lines in a batch -------------------------------
@@ -1298,7 +1313,7 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
       system, user, maxTokens: 3600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
       // subtitles count like reading a page: the caption text, not the prompt or the reply (which repeats
       // every line in Tagalog and English with a note, five or six times the captions)
-      billChars: lines.reduce((n, l) => n + l.text.length, 0),
+      billIn: lines.reduce((n, l) => n + l.text.length, 0),
       clean: (d) => ({ lines: Array.isArray(d.lines) ? d.lines : [] }),
     };
   }));
@@ -1429,6 +1444,7 @@ Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use t
     const user = JSON.stringify({ line: text, words });
     return {
       system, user, maxTokens: Math.min(2600, 400 + words.length * 90), temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
+      billIn: text.length,
       clean: (d) => {
         const out = {
           meaning: clampStr(d.meaning, 400),
@@ -1488,7 +1504,7 @@ Stress changes meaning in Tagalog (BU-kas "open" vs bu-KAS "tomorrow"), so use t
   const lookupKey = (req) => `${clampStr(req.body.word, 60).toLowerCase()}|${clampStr(req.body.context, 160).toLowerCase()}`;
   app.post("/premium/lookup", ...guard, llmLimiter, (req, res, next) => {
     const hit = lookupCache.get(lookupKey(req));
-    if (hit) return billCachedPayg(req, clampStr(req.body.word, 60).length + clampStr(req.body.context, 400).length, "lookup-cached").then(() => res.json(hit));
+    if (hit) return billCachedPayg(req, clampStr(req.body.word, 60).length, "lookup-cached").then(() => res.json(hit));
     next();
   }, llmRoute("lookup", (req) => {
     const word = clampStr(req.body.word, 60);
@@ -1510,6 +1526,8 @@ Return JSON:
     const user = JSON.stringify({ word, sentence: context });
     return {
       system, user, maxTokens: 500, temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
+      billIn: word.length,
+      billOut: (o) => String((o.example && o.example.tl) || "").length,
       clean: (d) => {
         const out = {
           word,

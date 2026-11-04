@@ -85,6 +85,7 @@ const {
 const { mountGrowth, recordSignupSource, sourceFromToken } = require("./growth");
 const { mountPremium } = require("./premium");
 const { mountMessages } = require("./messages");
+const { recordUsage, mountUsageAnalytics } = require("./usage");
 const { logTranslationUsage, getOverallStats, getStatsByDomain, getMonthlyUsage } = require("./analytics");
 const { normalizeSegment, validateSegment, cleanSegment, isTranslatable, isMultiWord, reattachDecorations, isEchoedTranslation, isValidTranslation } = require("./segmentation");
 
@@ -402,6 +403,7 @@ if (process.env.DATABASE_URL) {
     incrementUserTrialChars, insertPendingMeterEvent, getUsage, incrementUsage, logTranslationUsage, pool, meterPaygChars,
   });
   mountMessages(app, { pool, requireAuth, getUserById });
+  mountUsageAnalytics(app, { pool, requireAuth, getUserById });
 }
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -2910,6 +2912,7 @@ app.post("/translate", requireAuth, async (req, res) => {
       );
     }
 
+    recordUsage(pool, req.userId, "translate", billableChars);
     logTranslationUsage(
       req.userId,
       normalizedTexts,
@@ -2952,8 +2955,8 @@ app.post("/translate", requireAuth, async (req, res) => {
       if (user.plan_status === "free") {
         const used = translateUpdatedUser ? translateUpdatedUser.trial_chars_used : 0;
         if (used >= FREE_PLAN_LIMIT) resp.quota_warning = "100";
-        else if (used >= 13500) resp.quota_warning = "90";
-        else if (used >= 12000) resp.quota_warning = "80";
+        else if (used >= FREE_PLAN_LIMIT * 0.9) resp.quota_warning = "90";
+        else if (used >= FREE_PLAN_LIMIT * 0.8) resp.quota_warning = "80";
       }
       return res.json(resp);
     }
@@ -3014,8 +3017,8 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     const contextStr = typeof context === "string" ? context : "";
-    const totalChars = word.trim().length + english.trim().length + contextStr.trim().length +
-      (phrase ? phrase.tl.length + phrase.en.length : 0);
+    // a lookup counts the word looked up, not the sentence or phrase around it
+    const totalChars = word.trim().length;
 
     const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
     const usageRow = await getUsage();
@@ -3063,6 +3066,7 @@ app.post("/dictionary", requireAuth, async (req, res) => {
     }
 
     await incrementUsage(totalChars);
+    recordUsage(pool, req.userId, "dictionary", totalChars);
     logTranslationUsage(
       req.userId,
       [word.trim()],
@@ -3103,8 +3107,8 @@ app.post("/dictionary", requireAuth, async (req, res) => {
       if (user.plan_status === "free") {
         const used = dictUpdatedUser ? dictUpdatedUser.trial_chars_used : 0;
         if (used >= FREE_PLAN_LIMIT) resp.quota_warning = "100";
-        else if (used >= 13500) resp.quota_warning = "90";
-        else if (used >= 12000) resp.quota_warning = "80";
+        else if (used >= FREE_PLAN_LIMIT * 0.9) resp.quota_warning = "90";
+        else if (used >= FREE_PLAN_LIMIT * 0.8) resp.quota_warning = "80";
       }
       return res.json(resp);
     }
@@ -3180,7 +3184,7 @@ app.post("/tts", requireAuth, async (req, res) => {
   }
 
   const ttsChars = text.length;
-  const weightedChars = ttsChars * 2;
+  const weightedChars = ttsChars; // voice counts as its text, like reading
 
   const QUOTA = parseInt(process.env.MONTHLY_CHAR_LIMIT) || 10_000_000;
   const usageRow = await getUsage();
@@ -3249,6 +3253,7 @@ app.post("/tts", requireAuth, async (req, res) => {
     }
 
     await incrementUsage(ttsChars);
+    recordUsage(pool, req.userId, "free-tts", weightedChars);
     logTranslationUsage(
       req.userId,
       [text],
