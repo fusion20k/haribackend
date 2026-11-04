@@ -900,12 +900,16 @@ function mountPremium(app, deps) {
     return true;
   }
 
-  /** After a successful call: global usage, extra Premium chars, and PAYG Stripe metering. */
-  async function settleChars(req, reservedChars, extraChars, kind) {
+  /**
+   * After a successful call: global usage, extra Premium chars, and PAYG Stripe metering.
+   * unbilledChars: provider work that counts toward the global cap but isn't charged to the person
+   * (see billChars in llmRoute).
+   */
+  async function settleChars(req, reservedChars, extraChars, kind, unbilledChars = 0) {
     const user = req.premiumUser;
     const total = reservedChars + extraChars;
     try {
-      await incrementUsage(total);
+      await incrementUsage(total + unbilledChars);
       if ((user.plan_status === "pre" || user.plan_status === "exc") && extraChars > 0) {
         await incrementUserTrialChars(req.userId, extraChars);
       }
@@ -925,7 +929,11 @@ function mountPremium(app, deps) {
     if (req.premiumUser && req.premiumUser.plan_status === "payg" && chars > 0) await settleChars(req, chars, 0, kind);
   }
 
-  /** Shared wrapper for every LLM-backed route. build(req) returns { system, user, history?, maxTokens?, inChars, clean(data) }. */
+  /**
+   * Shared wrapper for every LLM-backed route. build(req) returns { system, user, history?, maxTokens?, inChars, clean(data) }.
+   * With billChars, the person is charged exactly that many characters (the text they asked about, as
+   * reading a page is) and the prompt and reply only count toward the global cap.
+   */
   function llmRoute(kind, build) {
     return async (req, res) => {
       let spec;
@@ -935,13 +943,16 @@ function mountPremium(app, deps) {
         return res.status(400).json({ error: err.message || "invalid_request" });
       }
       try {
-        if (!(await reserveChars(req, res, spec.inChars))) return;
+        const billed = spec.billChars != null;
+        if (!(await reserveChars(req, res, billed ? spec.billChars : spec.inChars))) return;
         // optional first step that adjusts the spec (Thea reads the learner's message before answering)
         const pre = spec.prepare ? await spec.prepare() : { inChars: 0, outChars: 0 };
         const { data, outChars } = await llmJson(spec.system, spec.user, {
           maxTokens: spec.maxTokens, temperature: spec.temperature, history: spec.history,
         });
-        await settleChars(req, spec.inChars, outChars + pre.inChars + pre.outChars, kind);
+        const work = outChars + pre.inChars + pre.outChars;
+        if (billed) await settleChars(req, spec.billChars, 0, kind, spec.inChars + work);
+        else await settleChars(req, spec.inChars, work, kind);
         logTranslationUsage(req.userId, [kind], [false], kind, "en", "tl", "llm");
         res.json(spec.clean ? spec.clean(data) : data);
       } catch (err) {
@@ -1285,6 +1296,9 @@ Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": str
     const user = JSON.stringify(lines);
     return {
       system, user, maxTokens: 3600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
+      // subtitles count like reading a page: the caption text, not the prompt or the reply (which repeats
+      // every line in Tagalog and English with a note, five or six times the captions)
+      billChars: lines.reduce((n, l) => n + l.text.length, 0),
       clean: (d) => ({ lines: Array.isArray(d.lines) ? d.lines : [] }),
     };
   }));
