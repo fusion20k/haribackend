@@ -4,6 +4,8 @@
 //
 //   GET /admin-plan/usage?days=30          totals, by feature, the people using the most, by day
 //   GET /admin-plan/usage/user/:id?days=30 one person: their plan and allowance, by feature, by day
+// "By day" splits each day's characters by feature. Anyone in the database can be looked up, not only
+// people with usage in the period (the list of accounts comes from /messages/recipients).
 const FEATURES = {
   reading: "Reading pages",
   lookup: "Word lookups",
@@ -82,6 +84,19 @@ function mountUsageAnalytics(app, { pool, requireAuth, getUserById }) {
   }
 
   const daysOf = (req) => Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
+  // rows of (day, feature, chars, uses) into one entry per day, with each feature's characters that day
+  const byDay = (rows) => {
+    const days = new Map();
+    for (const r of rows) {
+      const key = r.day instanceof Date ? r.day.toISOString().slice(0, 10) : String(r.day).slice(0, 10);
+      const d = days.get(key) || { day: key, chars: 0, uses: 0, features: {} };
+      d.chars += n(r.chars);
+      d.uses += n(r.uses);
+      d.features[r.feature] = (d.features[r.feature] || 0) + n(r.chars);
+      days.set(key, d);
+    }
+    return [...days.values()];
+  };
   const label = (f) => FEATURES[f] || f;
   const n = (v) => Number(v) || 0;
 
@@ -98,8 +113,8 @@ function mountUsageAnalytics(app, { pool, requireAuth, getUserById }) {
                     FROM usage_daily d JOIN users u ON u.id = d.user_id
                     WHERE d.day >= ${since} GROUP BY u.id, u.email, u.plan_status
                     ORDER BY SUM(d.chars) DESC LIMIT 200`, [days]),
-        pool.query(`SELECT day, SUM(chars) AS chars, SUM(uses) AS uses FROM usage_daily
-                    WHERE day >= ${since} GROUP BY day ORDER BY day`, [days]),
+        pool.query(`SELECT day, feature, SUM(chars) AS chars, SUM(uses) AS uses FROM usage_daily
+                    WHERE day >= ${since} GROUP BY day, feature ORDER BY day`, [days]),
         pool.query(`SELECT COALESCE(SUM(chars), 0) AS chars, COALESCE(SUM(uses), 0) AS uses, COUNT(DISTINCT user_id) AS people
                     FROM usage_daily WHERE day >= ${since}`, [days]),
       ]);
@@ -108,7 +123,7 @@ function mountUsageAnalytics(app, { pool, requireAuth, getUserById }) {
         totals: { chars: n(totals.rows[0].chars), uses: n(totals.rows[0].uses), people: n(totals.rows[0].people) },
         byFeature: byFeature.rows.map((r) => ({ feature: r.feature, label: label(r.feature), chars: n(r.chars), uses: n(r.uses), people: n(r.people) })),
         people: people.rows.map((r) => ({ id: r.id, email: r.email, plan: r.plan_status || "free", chars: n(r.chars), uses: n(r.uses), topFeature: label(r.top_feature) })),
-        daily: daily.rows.map((r) => ({ day: r.day, chars: n(r.chars), uses: n(r.uses) })),
+        daily: byDay(daily.rows),
       });
     } catch (err) {
       console.error("[usage] overview failed:", err.message);
@@ -128,8 +143,8 @@ function mountUsageAnalytics(app, { pool, requireAuth, getUserById }) {
       const [byFeature, daily] = await Promise.all([
         pool.query(`SELECT feature, SUM(chars) AS chars, SUM(uses) AS uses FROM usage_daily
                     WHERE user_id = $1 AND day >= ${since} GROUP BY feature ORDER BY SUM(chars) DESC`, [id, days]),
-        pool.query(`SELECT day, SUM(chars) AS chars, SUM(uses) AS uses FROM usage_daily
-                    WHERE user_id = $1 AND day >= ${since} GROUP BY day ORDER BY day`, [id, days]),
+        pool.query(`SELECT day, feature, SUM(chars) AS chars, SUM(uses) AS uses FROM usage_daily
+                    WHERE user_id = $1 AND day >= ${since} GROUP BY day, feature ORDER BY day`, [id, days]),
       ]);
       res.json({
         days,
@@ -143,7 +158,7 @@ function mountUsageAnalytics(app, { pool, requireAuth, getUserById }) {
           joined: user.created_at || null,
         },
         byFeature: byFeature.rows.map((r) => ({ feature: r.feature, label: label(r.feature), chars: n(r.chars), uses: n(r.uses) })),
-        daily: daily.rows.map((r) => ({ day: r.day, chars: n(r.chars), uses: n(r.uses) })),
+        daily: byDay(daily.rows),
       });
     } catch (err) {
       console.error("[usage] person failed:", err.message);

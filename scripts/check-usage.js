@@ -9,10 +9,10 @@ const pool = {
   async query(sql, params) {
     if (/^\s*CREATE/.test(sql)) return { rows: [] };
     if (/WHERE user_id = \$1/.test(sql) && /GROUP BY feature/.test(sql)) return { rows: [{ feature: "subtitles", chars: "70000", uses: "90" }, { feature: "tutor", chars: "10000", uses: "40" }] };
-    if (/WHERE user_id = \$1/.test(sql)) return { rows: [{ day: "2026-11-03", chars: "80000", uses: "130" }] };
+    if (/WHERE user_id = \$1/.test(sql)) return { rows: [{ day: "2026-11-03", feature: "subtitles", chars: "70000", uses: "90" }, { day: "2026-11-03", feature: "tutor", chars: "10000", uses: "40" }] };
     if (/GROUP BY feature/.test(sql)) return { rows: [{ feature: "subtitles", chars: "70000", uses: "90", people: "1" }, { feature: "reading", chars: "30000", uses: "400", people: "5" }] };
     if (/JOIN users/.test(sql)) return { rows: [{ id: 2, email: "ana@example.com", plan_status: "exc", chars: "80000", uses: "130", top_feature: "subtitles" }] };
-    if (/GROUP BY day/.test(sql)) return { rows: [{ day: "2026-11-03", chars: "100000", uses: "490" }] };
+    if (/GROUP BY day/.test(sql)) return { rows: [{ day: new Date("2026-11-03T00:00:00Z"), feature: "subtitles", chars: "70000", uses: "90" }, { day: new Date("2026-11-03T00:00:00Z"), feature: "reading", chars: "30000", uses: "400" }] };
     return { rows: [{ chars: "100000", uses: "490", people: "5" }] };
   },
 };
@@ -34,8 +34,10 @@ const server = app.listen(0, async () => {
   r = await get("/admin-plan/usage?days=7", 1);
   ok("the admin plan gets totals, features, people and days", r.status === 200 && r.data.days === 7 && r.data.totals.chars === 100000
     && r.data.byFeature[0].label === "YouTube subtitles" && r.data.people[0].topFeature === "YouTube subtitles" && r.data.daily.length === 1, JSON.stringify(r.data).slice(0, 200));
+  ok("each day is split by feature", r.data.daily[0].day === "2026-11-03" && r.data.daily[0].chars === 100000 && r.data.daily[0].features.subtitles === 70000 && r.data.daily[0].features.reading === 30000, JSON.stringify(r.data.daily));
   r = await get("/admin-plan/usage/user/2", 1);
   ok("one person's stats: plan, allowance and features", r.status === 200 && r.data.user.email === "ana@example.com" && r.data.user.used === 80000 && r.data.user.limit === 1000000 && r.data.byFeature[0].chars === 70000, JSON.stringify(r.data).slice(0, 200));
+  ok("one person's days are split by feature too", r.data.daily[0].features.tutor === 10000 && r.data.daily[0].chars === 80000, JSON.stringify(r.data.daily));
   r = await get("/admin-plan/usage/user/99", 1);
   ok("someone who doesn't exist is a 404", r.status === 404);
   console.log(fails ? `\n${fails} failed` : "\nall passed");
