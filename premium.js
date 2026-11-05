@@ -1306,8 +1306,9 @@ Return JSON:
     if (!lines.length) throw new Error("lines are required");
     const level = normLevel(req.body.level);
     const system = `${TAGALOG_EXPERT}
-You are subtitling a video for a ${level} Tagalog learner (${levelGuide(level)}). Keep the Tagalog at that level where you can without changing the meaning. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors. Always also give English.
-Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string (short English note on slang/idiom/grammar worth knowing, or "") }] }`;
+You are subtitling a video for a ${level} Tagalog learner (${levelGuide(level)}). Keep the Tagalog at that level where you can without changing the meaning. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors and give its English.
+Keep the answer short so it comes back fast: "en" is "" when the caption is already English (it is shown as is), and "note" is "" unless the line has slang, an idiom or grammar genuinely worth knowing.
+Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string }] } with every id given, in order.`;
     const user = JSON.stringify(lines);
     return {
       system, user, maxTokens: 3600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
