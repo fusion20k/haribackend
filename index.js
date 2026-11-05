@@ -2075,10 +2075,23 @@ app.get("/api/billing/checkout-verify", requireAuth, async (req, res) => {
 // back into checkout. An explicit STRIPE_PREMIUM_PRICE_ID / STRIPE_PREMIUM_YEARLY_PRICE_ID wins when it
 // matches. Until a $7.49 monthly price exists, monthly checkout keeps using the previous one ($7.99, then
 // $19.99), re-checked every 10 minutes, so deploying this before the Stripe change breaks nothing.
-const PREMIUM_PRICES = {
-  month: { cents: 749, previous: [799, 1999], env: "STRIPE_PREMIUM_PRICE_ID", label: "$7.49 a month" },
-  year: { cents: 5999, previous: [], env: "STRIPE_PREMIUM_YEARLY_PRICE_ID", label: "$59.99 a year" },
+// Founding-member prices until the end of Black Friday (Nov 27, 2026, midnight Pacific), then the
+// regular prices. Anyone who subscribes keeps the price they signed up at: a Stripe subscription
+// keeps its price, so founding members stay at $7.49 / $59.99. If the regular prices haven't been
+// created in Stripe yet when the founding offer ends, checkout keeps using the founding ones (with a
+// warning in the log) rather than failing. The extension and the website show the same switch.
+const FOUNDING_ENDS = Date.parse("2026-11-28T08:00:00Z");
+const PREMIUM_PRICE_PLANS = {
+  founding: {
+    month: { cents: 749, previous: [799, 1999], env: "STRIPE_PREMIUM_PRICE_ID", label: "$7.49 a month" },
+    year: { cents: 5999, previous: [], env: "STRIPE_PREMIUM_YEARLY_PRICE_ID", label: "$59.99 a year" },
+  },
+  regular: {
+    month: { cents: 1199, previous: [749], env: "STRIPE_PREMIUM_REGULAR_PRICE_ID", label: "$11.99 a month" },
+    year: { cents: 8999, previous: [5999], env: "STRIPE_PREMIUM_REGULAR_YEARLY_PRICE_ID", label: "$89.99 a year" },
+  },
 };
+const premiumPricePlan = () => (Date.now() < FOUNDING_ENDS ? "founding" : "regular");
 const PREMIUM_PAYMENT_LINK = "https://buy.stripe.com/dRmdR907Dd7z8fR6u5ejK02";
 const premiumPriceCache = {};
 
@@ -2098,9 +2111,11 @@ const isPremiumPrice = (price, interval, cents) =>
   price && price.active && price.unit_amount === cents && price.currency === "usd" && price.recurring?.interval === interval && (price.recurring.interval_count || 1) === 1;
 
 async function premiumPriceId(interval = "month") {
-  const want = PREMIUM_PRICES[interval];
+  const plan = premiumPricePlan();
+  const want = PREMIUM_PRICE_PLANS[plan][interval];
   if (!want) throw Object.assign(new Error("Unknown billing period"), { status: 400 });
-  const hit = premiumPriceCache[interval];
+  const slot = `${plan}:${interval}`;
+  const hit = premiumPriceCache[slot];
   if (hit && (hit.current || Date.now() < hit.until)) return hit.id;
 
   // every active recurring USD price in the account, plus the configured ones (which may be on another product)
@@ -2112,7 +2127,8 @@ async function premiumPriceId(interval = "month") {
   }
   const explicit = [
     async () => process.env[want.env],
-    ...(interval === "month"
+    // the old payment links point at the founding monthly price
+    ...(interval === "month" && plan === "founding"
       ? [() => paymentLinkPrice(PREMIUM_PAYMENT_LINK), () => paymentLinkPrice(process.env.STRIPE_PAYMENT_LINK_URL), async () => process.env.STRIPE_PRICE_ID]
       : []),
   ];
@@ -2134,7 +2150,7 @@ async function premiumPriceId(interval = "month") {
   for (const cents of want.previous) price = price || newest(cents);
   if (!price) throw Object.assign(new Error(`Premium price (${want.label}) not found in Stripe`), { status: 503 });
 
-  premiumPriceCache[interval] = { id: price.id, current, until: Date.now() + 10 * 60 * 1000 };
+  premiumPriceCache[slot] = { id: price.id, current, until: Date.now() + 10 * 60 * 1000 };
   if (current) console.log(`[billing] Premium ${interval}ly price: ${price.id} ($${(price.unit_amount / 100).toFixed(2)})`);
   else console.warn(`[billing] no ${want.label} price in Stripe yet; Premium checkout uses ${price.id} ($${(price.unit_amount / 100).toFixed(2)}) for now`);
   return price.id;
