@@ -1305,13 +1305,16 @@ Return JSON:
     });
     if (!lines.length) throw new Error("lines are required");
     const level = normLevel(req.body.level);
+    const before = clampStr(req.body.context?.before, 300);
+    const after = clampStr(req.body.context?.after, 300);
     const system = `${TAGALOG_EXPERT}
 You are subtitling a video for a ${level} Tagalog learner (${levelGuide(level)}). Keep the Tagalog at that level where you can without changing the meaning. For each caption line: if it is English, give a natural spoken Tagalog/Taglish version (how a native speaker would say it on screen); if it is Tagalog, keep it and clean up obvious caption errors and give its English.
+The lines are consecutive pieces of speech, cut wherever the speaker paused, so a line can be half a sentence. Each line is shown while exactly those words are spoken: translate every line so it says what is said in that line, and only that. Never move words to a neighboring line, never drop or summarize words, never add anything that isn't said. "before" and "after" are the lines around these ones, only to help you understand; don't translate them.
 Keep the answer short so it comes back fast: "en" is "" when the caption is already English (it is shown as is), and "note" is "" unless the line has slang, an idiom or grammar genuinely worth knowing.
 Return JSON: { "lines": [{ "id": string, "tl": string, "en": string, "note": string }] } with every id given, in order.`;
-    const user = JSON.stringify(lines);
+    const user = JSON.stringify({ before, lines, after });
     return {
-      system, user, maxTokens: 3600, temperature: 0.3, inChars: Math.ceil(system.length / 4 + user.length),
+      system, user, maxTokens: 3600, temperature: 0.2, inChars: Math.ceil(system.length / 4 + user.length),
       // subtitles count like reading a page: the caption text, not the prompt or the reply (which repeats
       // every line in Tagalog and English with a note, five or six times the captions)
       billIn: lines.reduce((n, l) => n + l.text.length, 0),

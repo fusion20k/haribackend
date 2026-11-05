@@ -11,7 +11,7 @@ process.env.AZURE_OPENAI_DEPLOYMENT = "d";
 
 // the model: answers shaped like the real ones, by what the instructions ask for
 const REPLIES = {
-  subtitles: (u) => ({ lines: JSON.parse(u).map((l) => ({ id: l.id, tl: "Pupunta kami sa palengke ngayon", en: l.text, note: "A short note about a phrase in this line." })) }),
+  subtitles: (u) => ({ lines: JSON.parse(u).lines.map((l) => ({ id: l.id, tl: "Pupunta kami sa palengke ngayon", en: l.text, note: "A short note about a phrase in this line." })) }),
   practice: () => ({ exercises: [1, 2, 3].map(() => ({ english: "I am going to the market.", tagalog: "Pupunta ako sa palengke.", tiles: ["Pupunta", "ako", "sa", "palengke"], distractors: ["kami"], hint: "Start with the verb." })) }),
   explain: () => ({ verdict: "almost", summary: "So close, just the word order.", mistakes: [{ part: "Ako pumunta", type: "grammar", explanation: "The verb usually comes first in Tagalog." }], corrected: "Pumunta ako sa palengke.", moreNatural: [{ tagalog: "Nagpunta ako sa palengke.", note: "Also common." }], rule: "Verb first." }),
   sayit: () => ({ casual: { tagalog: "Gutom na ako.", note: "With friends." }, taglish: { tagalog: "Gutom na me.", note: "Texting." }, respectful: { tagalog: "Gutom na po ako.", note: "To elders." }, formal: { tagalog: "Ako ay nagugutom na.", note: "Writing." }, literal: { tagalog: "Ako ay gutom.", whyUnnatural: "Stiff." }, breakdown: [{ tagalog: "gutom", english: "hungry" }], culture: "Food is how Filipinos show care." }),
